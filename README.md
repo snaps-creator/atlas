@@ -1,6 +1,6 @@
 # Атлас
 
-Существующее Windows-приложение на React, TypeScript, Tauri 2, Rust и Mihomo.
+Существующее Windows-приложение Atlas Beta v1 на React, TypeScript, Tauri 2, Rust и Mihomo.
 Подробный статус реализации и подтверждённых проверок: [STATUS.md](STATUS.md).
 
 ## Сборка
@@ -15,9 +15,11 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run tauri build
 ```
 
-Установщик: `src-tauri/target/release/bundle/nsis/Atlas_0.1.0_x64-setup.exe`.
+Установщик: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.1_x64-setup.exe`.
 Ядро и локальная GeoIP-база включены в проект. Контрольные суммы находятся в `src-tauri/resources`.
 Дистрибутив не подписан издательским сертификатом.
+
+Автоматические обновления поставляются через подписанные GitHub Releases. Инструкция для выпуска новой версии: [UPDATES.md](UPDATES.md).
 
 ## Подключение
 

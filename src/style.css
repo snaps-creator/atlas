@@ -957,6 +957,44 @@ td small {
   background: transparent;
   padding: 0;
 }
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  border: 1px solid #9bc8f5;
+  border-radius: 10px;
+  background: var(--wash);
+}
+.update-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+.update-copy p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.update-progress {
+  width: min(360px, 55vw);
+  height: 5px;
+  margin-top: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line);
+}
+.update-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--link);
+  transition: width 180ms ease;
+}
 .footnote {
   font-size: 11px !important;
   color: var(--muted);

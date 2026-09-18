@@ -181,7 +181,7 @@ pub fn download(raw: &str, connected: bool) -> Result<Vec<Value>, String> {
         .map_err(|_| "Ошибка HTTPS клиента")?;
     let mut response = client
         .get(u)
-        .header("User-Agent", "Atlas/0.1 mihomo")
+        .header("User-Agent", "Atlas/1.0-beta.1 mihomo")
         .send()
         .map_err(|_| {
             "Не удалось загрузить подписку: проверьте сеть и TLS. Предыдущая версия сохранена."

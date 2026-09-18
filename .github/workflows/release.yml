@@ -1,0 +1,69 @@
+name: Publish Atlas update
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: atlas-release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Test backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Ensure the version has not been released
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          git ls-remote --exit-code --tags origin "refs/tags/v$version" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Version $version already has a GitHub Release. Bump the application version before merging into main."
+          }
+          if ($LASTEXITCODE -ne 2) {
+            throw "Could not check whether tag v$version already exists."
+          }
+
+      - name: Build and publish signed update
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Atlas Beta v1
+          releaseBody: Автоматическое обновление Atlas Beta v1.
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true

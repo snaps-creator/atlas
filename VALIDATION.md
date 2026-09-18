@@ -15,7 +15,7 @@
 
 ## Установщик
 
-`src-tauri/target/release/bundle/nsis/Atlas_0.1.0_x64-setup.exe`
+`src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.1_x64-setup.exe`
 Размер: 39 557 269 байт.
 SHA-256: `7FEF216CB26393E278A0894D1A7B1CCE057ADDA049720BFB2DFF6EC297E8D538`
 

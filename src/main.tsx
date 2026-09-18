@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
+import { check } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   ArrowDown,
@@ -40,6 +41,9 @@ import { ActiveServer } from "./ActiveServer";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
 import { latencyLabel, testPool, type Latency } from "./latency";
+type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
+type UpdateStatus = "idle" | "downloading" | "installing" | "error";
+const APP_VERSION_LABEL = "Beta v1";
 const nav = [
   ["Dashboard", LayoutDashboard],
   ["Servers", Server],
@@ -90,6 +94,12 @@ function App() {
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [logLevel, setLogLevel] = useState("ALL");
   const [sortLatency, setSortLatency] = useState(false);
+  const updateCheckStarted = useRef(false);
+  const [availableUpdate, setAvailableUpdate] =
+    useState<AvailableUpdate | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateError, setUpdateError] = useState("");
   const refresh = useCallback(async () => {
     try {
       setData(await request<Snapshot>("snapshot"));
@@ -104,6 +114,18 @@ function App() {
     }, 2500);
     return () => clearInterval(timer);
   }, [refresh]);
+  useEffect(() => {
+    if (!native || updateCheckStarted.current) return;
+    updateCheckStarted.current = true;
+    void check()
+      .then((update) => {
+        if (update) setAvailableUpdate(update);
+      })
+      .catch((reason) => {
+        // Update checks must never delay or block the main application.
+        console.warn("Не удалось проверить обновления Atlas", reason);
+      });
+  }, []);
   useEffect(() => {
     if (data) document.documentElement.dataset.theme = data.settings.theme;
   }, [data?.settings.theme]);
@@ -154,6 +176,34 @@ function App() {
   }
   function run(f: () => Promise<unknown>) {
     void f().catch(() => {});
+  }
+  async function installUpdate() {
+    if (!availableUpdate || updateStatus === "downloading") return;
+    setUpdateStatus("downloading");
+    setUpdateProgress(0);
+    setUpdateError("");
+    let downloaded = 0;
+    let total = 0;
+    try {
+      await availableUpdate.download((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          if (total > 0)
+            setUpdateProgress(Math.min(100, Math.round((downloaded / total) * 100)));
+        } else if (event.event === "Finished") {
+          setUpdateProgress(100);
+          setUpdateStatus("installing");
+        }
+      });
+      setUpdateStatus("installing");
+      if (data?.running || data?.guardActive) await request("disconnect");
+      await availableUpdate.install({ restartAfterInstall: true });
+    } catch (reason) {
+      setUpdateStatus("error");
+      setUpdateError(`Не удалось установить обновление: ${String(reason)}`);
+    }
   }
   const s = data?.settings;
   const servers = s?.subscriptions.flatMap((v) => v.servers) ?? [];
@@ -277,7 +327,7 @@ function App() {
             </span>
           </div>
           <div className="version">
-            Атлас для Windows <span>v0.1.0</span>
+            Атлас для Windows <span>{APP_VERSION_LABEL}</span>
           </div>
         </div>
       </aside>
@@ -292,6 +342,40 @@ function App() {
           </span>
         </header>
         <main>
+          {availableUpdate && (
+            <section className="update-banner" aria-live="polite">
+              <div className="update-copy">
+                <Download size={18} />
+                <div>
+                  <strong>Доступно обновление Atlas {availableUpdate.version}</strong>
+                  <p>
+                    {updateStatus === "downloading"
+                      ? `Загрузка: ${updateProgress}%`
+                      : updateStatus === "installing"
+                        ? "Установка обновления…"
+                        : updateError || "Можно скачать и установить новую версию."}
+                  </p>
+                  {(updateStatus === "downloading" || updateStatus === "installing") && (
+                    <div className="update-progress" aria-label={`Загрузка ${updateProgress}%`}>
+                      <span style={{ width: `${updateProgress}%` }} />
+                    </div>
+                  )}
+                </div>
+              </div>
+              <button
+                className="primary"
+                disabled={updateStatus === "downloading" || updateStatus === "installing"}
+                onClick={() => void installUpdate()}
+              >
+                {updateStatus === "downloading" || updateStatus === "installing" ? (
+                  <LoaderCircle className="spin" size={16} />
+                ) : (
+                  <Download size={16} />
+                )}
+                {updateStatus === "error" ? "Повторить" : "Обновить"}
+              </button>
+            </section>
+          )}
           <RuleChecks
             settings={s}
             connected={connected}
@@ -1240,7 +1324,7 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Об этой сборке</h2>
-                    <p>Atlas 0.1.0 · Mihomo 1.19.31 · React + Tauri + Rust</p>
+                    <p>Atlas {APP_VERSION_LABEL} · Mihomo 1.19.31 · React + Tauri + Rust</p>
                   </section>
                 </>
               )}

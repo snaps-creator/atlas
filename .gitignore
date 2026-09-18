@@ -49,6 +49,7 @@ Desktop.ini
 *.local
 *.local.*
 *.key
+*.key.pub
 *.pfx
 *.p12
 *.pem
