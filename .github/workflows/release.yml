@@ -45,12 +45,12 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          git ls-remote --exit-code --tags origin "refs/tags/v$version" | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            throw "Version $version already has a GitHub Release. Bump the application version before merging into main."
-          }
-          if ($LASTEXITCODE -ne 2) {
+          $existingTag = git ls-remote --tags origin "refs/tags/v$version"
+          if ($LASTEXITCODE -ne 0) {
             throw "Could not check whether tag v$version already exists."
+          }
+          if ($existingTag) {
+            throw "Version $version already has a GitHub Release. Bump the application version before merging into main."
           }
 
       - name: Build and publish signed update
