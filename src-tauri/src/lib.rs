@@ -12,6 +12,7 @@ mod network_guard;
 mod portable;
 mod rule_probe;
 mod rules;
+mod service;
 mod storage;
 mod subscriptions;
 mod windows;
@@ -637,4 +638,8 @@ pub fn run() {
 
 pub fn network_helper(parent: u32, pipe: &str) -> Result<(), String> {
     broker::serve(parent, pipe)
+}
+
+pub fn network_service() -> Result<(), String> {
+    service::run()
 }

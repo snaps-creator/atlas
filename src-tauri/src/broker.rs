@@ -1,5 +1,5 @@
-//! Per-session elevated broker. The UI owns a local-only named pipe; both ends
-//! check peer PIDs. No shell, arbitrary executable, arbitrary YAML or file API.
+//! Privileged network broker. Installed builds use an SCM-managed service;
+//! portable/dev builds retain the per-session UAC helper as a safe fallback.
 use crate::{core::Core, model::Settings, network_guard};
 use serde_json::{json, Value};
 use std::{
@@ -21,6 +21,7 @@ use windows_sys::Win32::{
     UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
 };
 const LIMIT: usize = 16 * 1024 * 1024;
+const SERVICE_PIPE: &str = r"\\.\pipe\Atlas-Network-Service";
 const EMBEDDED_CORE: &[u8] = include_bytes!("../resources/mihomo.exe");
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -86,6 +87,45 @@ pub struct Broker {
 }
 impl Broker {
     pub fn launch() -> Result<Self, String> {
+        if let Ok(service) = Self::connect_service() {
+            return Ok(service);
+        }
+        Self::launch_elevated()
+    }
+    fn connect_service() -> Result<Self, String> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(SERVICE_PIPE)
+            {
+                let mut server_pid = 0;
+                unsafe {
+                    if GetNamedPipeServerProcessId(file.as_raw_handle(), &mut server_pid) == 0 {
+                        return Err("Нельзя подтвердить сетевую службу".into());
+                    }
+                }
+                verify_process_image(
+                    server_pid,
+                    &std::env::current_exe().map_err(|e| e.to_string())?,
+                )?;
+                let hello = receive(&mut file, Duration::from_secs(10))?;
+                if hello["ready"] != true {
+                    return Err("Сетевая служба не готова".into());
+                }
+                return Ok(Self {
+                    pipe: Mutex::new(file),
+                    process: 0,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err("Системная служба Atlas недоступна".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    fn launch_elevated() -> Result<Self, String> {
         unsafe {
             let pipe_name = format!(r"\\.\pipe\Atlas-{}", uuid::Uuid::new_v4().simple());
             let pipe = CreateNamedPipeW(
@@ -162,7 +202,23 @@ impl Broker {
         }
     }
     pub fn alive(&self) -> bool {
-        unsafe { WaitForSingleObject(self.process as _, 0) == WAIT_TIMEOUT }
+        if self.process != 0 {
+            return unsafe { WaitForSingleObject(self.process as _, 0) == WAIT_TIMEOUT };
+        }
+        let Ok(file) = self.pipe.lock() else {
+            return false;
+        };
+        let mut available = 0;
+        unsafe {
+            PeekNamedPipe(
+                file.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            ) != 0
+        }
     }
     pub fn call(&self, op: &str, payload: Value) -> Result<Value, String> {
         let mut file = self
@@ -180,9 +236,31 @@ impl Broker {
 }
 impl Drop for Broker {
     fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.process as _);
+        if self.process != 0 {
+            unsafe {
+                CloseHandle(self.process as _);
+            }
         }
+    }
+}
+fn verify_process_image(pid: u32, expected: &std::path::Path) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err("Процесс сетевой службы недоступен".into());
+    }
+    let mut path = vec![0u16; 32768];
+    let mut size = path.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut size) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        return Err("Нельзя проверить процесс сетевой службы".into());
+    }
+    let actual = PathBuf::from(String::from_utf16_lossy(&path[..size as usize]));
+    match (actual.canonicalize(), expected.canonicalize()) {
+        (Ok(actual), Ok(expected)) if actual == expected => Ok(()),
+        _ => Err("Подключена посторонняя сетевая служба".into()),
     }
 }
 fn secure_directory() -> Result<PathBuf, String> {
@@ -312,26 +390,15 @@ pub fn serve(parent: u32, pipe_name: &str) -> Result<(), String> {
     if parent_handle.is_null() {
         return Err("Родительский процесс недоступен".into());
     }
-    let mut parent_path = vec![0u16; 32768];
-    let mut size = parent_path.len() as u32;
-    unsafe {
-        if QueryFullProcessImageNameW(parent_handle, 0, parent_path.as_mut_ptr(), &mut size) == 0 {
-            CloseHandle(parent_handle);
-            return Err("Нельзя проверить родительский процесс".into());
-        }
-    }
-    let parent_exe = PathBuf::from(String::from_utf16_lossy(&parent_path[..size as usize]));
-    if parent_exe.canonicalize().ok()
-        != std::env::current_exe()
-            .ok()
-            .and_then(|p| p.canonicalize().ok())
+    if let Err(error) =
+        verify_process_image(parent, &std::env::current_exe().map_err(|e| e.to_string())?)
     {
         unsafe {
             CloseHandle(parent_handle);
         }
-        return Err("Родительский процесс не является Атласом".into());
+        return Err(error);
     }
-    let mut pipe = std::fs::OpenOptions::new()
+    let pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(pipe_name)
@@ -345,6 +412,10 @@ pub fn serve(parent: u32, pipe_name: &str) -> Result<(), String> {
             return Err("Не удалось подтвердить интерфейс Атласа".into());
         }
     }
+    run_channel(pipe, Some(parent_handle))
+}
+
+fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), String> {
     let directory = secure_directory()?;
     let mut core = Core::privileged(directory.join("mihomo.exe"), directory.clone());
     send(&mut pipe, &json!({"ready":true}))?;
@@ -352,8 +423,13 @@ pub fn serve(parent: u32, pipe_name: &str) -> Result<(), String> {
     let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
     loop {
-        if unsafe { WaitForSingleObject(parent_handle, 0) } == WAIT_OBJECT_0 {
+        if parent_handle.is_none() && crate::service::is_stopping() {
             break;
+        }
+        if let Some(parent) = parent_handle {
+            if unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0 {
+                break;
+            }
         }
         let mut available = 0;
         if unsafe {
@@ -457,8 +533,10 @@ pub fn serve(parent: u32, pipe_name: &str) -> Result<(), String> {
     core.stop()?;
     drop(core);
     drop(guard);
-    unsafe {
-        CloseHandle(parent_handle);
+    if let Some(parent) = parent_handle {
+        unsafe {
+            CloseHandle(parent);
+        }
     } // Dynamic WFP session is released after the core closes its adapter.
       // Directory was generated here with an administrator-only DACL, never supplied by IPC.
     if directory.parent()
@@ -467,6 +545,78 @@ pub fn serve(parent: u32, pipe_name: &str) -> Result<(), String> {
             .as_deref()
     {
         let _ = std::fs::remove_dir_all(&directory);
+    }
+    Ok(())
+}
+
+pub fn serve_service() -> Result<(), String> {
+    while !crate::service::is_stopping() {
+        let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)");
+        let mut descriptor = std::ptr::null_mut();
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(error("Защита канала сетевой службы"));
+            }
+            let mut attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let handle = CreateNamedPipeW(
+                wide(SERVICE_PIPE).as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                65536,
+                65536,
+                0,
+                &mut attributes,
+            );
+            LocalFree(descriptor);
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(error("Не удалось открыть канал сетевой службы"));
+            }
+            let mut connected = false;
+            while !crate::service::is_stopping() {
+                if ConnectNamedPipe(handle, std::ptr::null_mut()) != 0
+                    || GetLastError() == ERROR_PIPE_CONNECTED
+                {
+                    connected = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            if !connected {
+                CloseHandle(handle);
+                break;
+            }
+            let mut client_pid = 0;
+            if GetNamedPipeClientProcessId(handle, &mut client_pid) == 0
+                || verify_process_image(
+                    client_pid,
+                    &std::env::current_exe().map_err(|e| e.to_string())?,
+                )
+                .is_err()
+            {
+                DisconnectNamedPipe(handle);
+                CloseHandle(handle);
+                continue;
+            }
+            let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+            if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
+                DisconnectNamedPipe(handle);
+                CloseHandle(handle);
+                continue;
+            }
+            let file = File::from_raw_handle(handle);
+            let _ = run_channel(file, None);
+        }
     }
     Ok(())
 }
