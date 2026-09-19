@@ -8,6 +8,20 @@ fn main() {
             1
         });
     }
+    if args.get(1).is_some_and(|s| s == "--install-service") {
+        std::process::exit(if atlas::install_network_service().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
+    if args.get(1).is_some_and(|s| s == "--uninstall-service") {
+        std::process::exit(if atlas::uninstall_network_service().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
     if args.get(1).is_some_and(|s| s == "--network-helper") {
         let result = args
             .get(2)

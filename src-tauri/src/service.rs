@@ -1,11 +1,18 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use windows_sys::Win32::{
-    Foundation::NO_ERROR,
+    Foundation::{
+        GetLastError, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
+        ERROR_SERVICE_EXISTS, NO_ERROR,
+    },
     System::Services::{
-        RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_SHUTDOWN,
-        SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
-        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+        ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
+        OpenSCManagerW, OpenServiceW, RegisterServiceCtrlHandlerExW, SetServiceStatus,
+        StartServiceCtrlDispatcherW, StartServiceW, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
+        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+        SERVICE_CHANGE_CONFIG, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
+        SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
+        SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+        SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     },
 };
 
@@ -93,4 +100,121 @@ pub fn run() -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn windows_error(action: &str) -> String {
+    format!("{action}: код Windows {}", unsafe { GetLastError() })
+}
+
+pub fn install() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let command = wide(&format!(
+        "\"{}\" --network-service",
+        executable.to_string_lossy()
+    ));
+    let name = wide(NAME);
+    let display_name = wide("Atlas Network Service");
+    unsafe {
+        let manager = OpenSCManagerW(
+            std::ptr::null(),
+            std::ptr::null(),
+            SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE,
+        );
+        if manager.is_null() {
+            return Err(windows_error("Не удалось открыть диспетчер служб"));
+        }
+        let mut service = CreateServiceW(
+            manager,
+            name.as_ptr(),
+            display_name.as_ptr(),
+            SERVICE_ALL_ACCESS,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            command.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        if service.is_null() && GetLastError() == ERROR_SERVICE_EXISTS {
+            service = OpenServiceW(
+                manager,
+                name.as_ptr(),
+                SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS,
+            );
+            if !service.is_null()
+                && ChangeServiceConfigW(
+                    service,
+                    SERVICE_WIN32_OWN_PROCESS,
+                    SERVICE_AUTO_START,
+                    SERVICE_ERROR_NORMAL,
+                    command.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    display_name.as_ptr(),
+                ) == 0
+            {
+                let message = windows_error("Не удалось обновить сетевую службу Atlas");
+                CloseServiceHandle(service);
+                CloseServiceHandle(manager);
+                return Err(message);
+            }
+        }
+        if service.is_null() {
+            let message = windows_error("Не удалось создать сетевую службу Atlas");
+            CloseServiceHandle(manager);
+            return Err(message);
+        }
+        if StartServiceW(service, 0, std::ptr::null()) == 0
+            && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING
+        {
+            let message = windows_error("Не удалось запустить сетевую службу Atlas");
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+            return Err(message);
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    Ok(())
+}
+
+pub fn uninstall() -> Result<(), String> {
+    let name = wide(NAME);
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return Err(windows_error("Не удалось открыть диспетчер служб"));
+        }
+        let service = OpenServiceW(
+            manager,
+            name.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS | 0x0001_0000,
+        );
+        if service.is_null() {
+            let missing = GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST;
+            CloseServiceHandle(manager);
+            return if missing {
+                Ok(())
+            } else {
+                Err(windows_error("Не удалось открыть сетевую службу Atlas"))
+            };
+        }
+        let mut status: SERVICE_STATUS = std::mem::zeroed();
+        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
+        if DeleteService(service) == 0 && GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST {
+            let message = windows_error("Не удалось удалить сетевую службу Atlas");
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+            return Err(message);
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    Ok(())
 }
