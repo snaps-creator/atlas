@@ -31,6 +31,7 @@ export type Settings = {
     delaySeconds: number;
     restoreConnection: boolean;
   };
+  autoTestIntervalSeconds: number;
   theme: string;
   wasConnected: boolean;
   favorites: string[];

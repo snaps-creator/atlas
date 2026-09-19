@@ -49,6 +49,10 @@ type ProtectionStatus = {
   checkedAt: number;
 };
 const APP_VERSION_LABEL = "Beta v1";
+const autoTestIntervals = [30, 60, 120, 300, 600, 900, 1800, 3600];
+function intervalLabel(seconds: number) {
+  return seconds < 60 ? `${seconds} сек.` : `${seconds / 60} мин.`;
+}
 const nav = [
   ["Dashboard", LayoutDashboard],
   ["Servers", Server],
@@ -776,8 +780,8 @@ function App() {
                           </strong>
                           <small>
                             {n === "AUTO"
-                              ? "Тест каждые 5 минут · порог 50 мс"
-                              : "Первый доступный сервер · проверка каждые 2 минуты"}
+                              ? `Тест каждые ${intervalLabel(s?.autoTestIntervalSeconds ?? 300)} · порог 50 мс`
+                              : `Первый доступный сервер · проверка каждые ${intervalLabel(s?.autoTestIntervalSeconds ?? 300)}`}
                           </small>
                         </span>
                         {s?.selected === n && <Check size={17} />}
@@ -1282,6 +1286,33 @@ function App() {
                         <option value="system">Системная</option>
                         <option value="light">Светлая</option>
                         <option value="dark">Тёмная</option>
+                      </select>
+                    </div>
+                  </section>
+                  <section className="settings-section">
+                    <h2>Автопереключение</h2>
+                    <div className="setting-row">
+                      <div>
+                        <strong>Интервал проверки серверов</strong>
+                        <p>Как часто AUTO и FAILOVER измеряют доступность и задержку</p>
+                      </div>
+                      <select
+                        aria-label="Интервал проверки серверов"
+                        value={s.autoTestIntervalSeconds}
+                        onChange={(e) =>
+                          run(() =>
+                            save({
+                              ...s,
+                              autoTestIntervalSeconds: Number(e.target.value),
+                            }),
+                          )
+                        }
+                      >
+                        {autoTestIntervals.map((seconds) => (
+                          <option key={seconds} value={seconds}>
+                            {intervalLabel(seconds)}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </section>

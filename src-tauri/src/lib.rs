@@ -58,9 +58,11 @@ impl App {
         rules::compile(&next)?;
         if !["light", "dark", "system"].contains(&next.theme.as_str())
             || next.startup.delay_seconds > 300
+            || !(model::MIN_AUTO_TEST_INTERVAL_SECONDS..=model::MAX_AUTO_TEST_INTERVAL_SECONDS)
+                .contains(&next.auto_test_interval_seconds)
             || !["system", "tun"].contains(&next.mode.as_str())
         {
-            return Err("Некорректные настройки темы, режима или задержки".into());
+            return Err("Некорректные настройки темы, режима или интервала".into());
         }
         if next.mode != self.settings.mode && self.core.running() {
             return Err("Перед изменением режима отключите соединение".into());
