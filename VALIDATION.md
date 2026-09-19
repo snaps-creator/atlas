@@ -1,9 +1,11 @@
-# Проверки — 17 сентября 2026
+# Проверки — 19 сентября 2026
 
 ## Автоматические
 
-- `cargo test --manifest-path src-tauri/Cargo.toml --lib`: 29 passed, 0 failed.
-- `npm test`: 4 passed, 0 failed.
+- `cargo check --manifest-path src-tauri/Cargo.toml`: успешно, включая Windows Service API.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib`: 34 passed; один сетевой
+  интеграционный тест не запущен до конца, потому что работающий Atlas занимает порт 17890.
+- `npm test`: 6 passed, 0 failed.
 - `npm run tauri build`: успешно, NSIS x64.
 - `npm install`: аудит 118 пакетов, известных уязвимостей не найдено на момент выполнения.
 - Интеграционный тест запускает настоящий Mihomo и проверяет конфигурацию, переключение, откат, локальный HTTP DIRECT/BLOCK и SOCKS5 UDP-эхо. Он не доказывает работу Windows TUN.
@@ -15,13 +17,18 @@
 
 ## Установщик
 
-`src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.3_x64-setup.exe`
-Размер: 39 557 269 байт.
-SHA-256: `7FEF216CB26393E278A0894D1A7B1CCE057ADDA049720BFB2DFF6EC297E8D538`
+`src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.4_x64-setup.exe`
+Размер: 39 904 873 байт.
+SHA-256: `C5779676C00B423600F73A7457E0A025C07700E9712AE7653939EC5068D8A11B`
 
-Тихая установка завершилась с кодом 0. Установленный EXE побайтно совпадает со сборкой, кроме трёх байтов штатной метки Tauri `__TAURI_BUNDLE_TYPE_VAR_NSS` вместо `...UNK`. Новый процесс запущен, заголовок окна «Атлас».
+NSIS production-сборка завершилась успешно и проверила installer hooks. Установщик
+переведён в per-machine режим: он создаёт и запускает `AtlasNetworkService`, а при
+обновлении и удалении останавливает её. Службе настроен автоматический перезапуск.
 
 ## Не подтверждено
 
-Реальные TUN/WFP под UAC, Telegram TCP/UDP, независимые проверки браузера/Electron/PowerShell/curl/WebSocket, DNS/IPv6 packet capture, аварийная блокировка и восстановление, импорт на второй компьютер, перезагрузка, удаление с активной защитой.
+Реальная установка новой службы поверх действующего Atlas, TUN/WFP через неё,
+Telegram TCP/UDP, независимые проверки браузера/Electron/PowerShell/curl/WebSocket,
+DNS/IPv6 packet capture, аварийная блокировка и восстановление, импорт на второй
+компьютер, перезагрузка, удаление с активной защитой.
 В Windows обнаружен активный туннель Mihomo другого VPN. Его отключение не выполнялось; пользователю отправлен выбор сценария сетевой проверки.
