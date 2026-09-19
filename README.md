@@ -1,4 +1,4 @@
-# Атлас
+# Atlas
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
@@ -18,7 +18,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run tauri build
 ```
 
-Установщик: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.1_x64-setup.exe`.
+Готовый установщик для пользователя находится в корне проекта: `Atlas Beta v1 Setup.exe`.
+Исходный bundle: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.2_x64-setup.exe`.
 Ядро и локальная GeoIP-база включены в проект. Контрольные суммы находятся в `src-tauri/resources`.
 Дистрибутив не подписан издательским сертификатом.
 

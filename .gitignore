@@ -70,5 +70,8 @@ cache.db-*
 /proxy-restore.json
 /tun-guard.active
 
+# Local copy of the signed installer. The canonical downloadable artifact is in GitHub Releases.
+/Atlas Beta v1 Setup.exe
+
 # Keep package-lock.json, Cargo.lock, build configuration, icons,
 # src-tauri/resources and third_party: these are required build inputs.
