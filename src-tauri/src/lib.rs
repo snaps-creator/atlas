@@ -134,6 +134,19 @@ impl App {
         );
         Ok(())
     }
+    fn prepare_restart(&mut self) -> Result<(), String> {
+        let was_connected = self.status == "Connected" && self.core.running();
+        windows::restore(&self.core.directory.join("proxy-restore.json"))?;
+        self.core.stop()?;
+        self.status = "Disconnected".into();
+        self.settings.was_connected = was_connected;
+        self.store.save(&self.settings)?;
+        self.log(
+            "INFO",
+            "Приложение перезапускается; сетевые настройки восстановлены",
+        );
+        Ok(())
+    }
     fn dispatch(
         &mut self,
         app: &tauri::AppHandle,
@@ -513,8 +526,10 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "Открыть Атлас", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Подключить", true, None::<&str>)?;
             let disconnect = MenuItem::with_id(app, "disconnect", "Отключить", true, None::<&str>)?;
+            let restart = MenuItem::with_id(app, "restart", "Перезагрузить", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &connect, &disconnect, &quit])?;
+            let menu =
+                Menu::with_items(app, &[&show, &connect, &disconnect, &restart, &quit])?;
             let pixels: Vec<u8> = (0..32 * 32)
                 .flat_map(|i| {
                     let x = i % 32;
@@ -546,6 +561,11 @@ pub fn run() {
                                 if action == "quit" {
                                     if a.disconnect().is_ok() {
                                         handle.exit(0)
+                                    }
+                                } else if action == "restart" {
+                                    if a.prepare_restart().is_ok() {
+                                        drop(a);
+                                        handle.restart()
                                     }
                                 } else {
                                     let _ = a.dispatch(&handle, &action, Value::Null);
