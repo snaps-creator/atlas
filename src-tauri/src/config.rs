@@ -1,6 +1,11 @@
 use crate::{model::*, rules};
 use serde_json::{json, Value};
 pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
+    if !(MIN_AUTO_TEST_INTERVAL_SECONDS..=MAX_AUTO_TEST_INTERVAL_SECONDS)
+        .contains(&s.auto_test_interval_seconds)
+    {
+        return Err("Интервал проверки серверов должен быть от 30 секунд до 60 минут".into());
+    }
     let proxies = s.servers();
     if proxies.is_empty() {
         return Err("Сначала добавьте подписку с серверами".into());
@@ -39,7 +44,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     selection.extend(names.clone());
     let mut seen = std::collections::HashSet::new();
     selection.retain(|n| seen.insert(n.clone()));
-    let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"url-test","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":300,"tolerance":50,"lazy":false},{"name":"FAILOVER","type":"fallback","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":120,"lazy":false}],"rules":rules::compile(s)?});
+    let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"url-test","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"tolerance":50,"lazy":false},{"name":"FAILOVER","type":"fallback","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"lazy":false}],"rules":rules::compile(s)?});
     // Match Clash Verge's warm-connection URL latency measurement.
     doc["unified-delay"] = json!(true);
     if s.mode == "tun" {
@@ -118,6 +123,12 @@ mod tests {
             .unwrap()
             .ends_with("#ATLAS"));
         assert_eq!(tun["proxies"][0]["udp"], true);
+        assert_eq!(tun["proxy-groups"][1]["interval"], 300);
+        assert_eq!(tun["proxy-groups"][2]["interval"], 300);
+        s.auto_test_interval_seconds = 60;
+        let faster: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
+        assert_eq!(faster["proxy-groups"][1]["interval"], 60);
+        assert_eq!(faster["proxy-groups"][2]["interval"], 60);
         s.default_route = Route::Direct;
         let direct: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(

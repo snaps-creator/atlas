@@ -43,7 +43,16 @@ import "flag-icons/css/flag-icons.min.css";
 import { latencyLabel, testPool, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
+type ProtectionStatus = {
+  secure: boolean;
+  detail: string;
+  checkedAt: number;
+};
 const APP_VERSION_LABEL = "Beta v1";
+const autoTestIntervals = [30, 60, 120, 300, 600, 900, 1800, 3600];
+function intervalLabel(seconds: number) {
+  return seconds < 60 ? `${seconds} сек.` : `${seconds / 60} мин.`;
+}
 const nav = [
   ["Dashboard", LayoutDashboard],
   ["Servers", Server],
@@ -100,6 +109,12 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateProgress, setUpdateProgress] = useState(0);
   const [updateError, setUpdateError] = useState("");
+  const [protection, setProtection] = useState<ProtectionStatus>({
+    secure: false,
+    detail: "Atlas не подключён.",
+    checkedAt: 0,
+  });
+  const [activeServer, setActiveServer] = useState<string | null>(null);
   const refresh = useCallback(async () => {
     try {
       setData(await request<Snapshot>("snapshot"));
@@ -129,6 +144,56 @@ function App() {
   useEffect(() => {
     if (data) document.documentElement.dataset.theme = data.settings.theme;
   }, [data?.settings.theme]);
+  const protectionKey = data
+    ? [
+        data.running,
+        data.status,
+        data.settings.defaultRoute,
+        data.settings.selected,
+        data.settings.dns.servers.join("|"),
+        data.settings.groups
+          .filter((group) => group.enabled)
+          .map((group) => `${group.id}:${group.route}:${group.rules.length}`)
+          .join("|"),
+      ].join(";")
+    : "disconnected";
+  useEffect(() => {
+    let alive = true;
+    const inspect = async () => {
+      if (!data?.running || data.status !== "Connected") {
+        if (alive)
+          setProtection({
+            secure: false,
+            detail: "Atlas не подключён.",
+            checkedAt: Math.floor(Date.now() / 1000),
+          });
+        return;
+      }
+      if (alive)
+        setProtection({
+          secure: false,
+          detail: "Проверяем защищённый путь трафика…",
+          checkedAt: 0,
+        });
+      try {
+        const result = await request<ProtectionStatus>("protection_status");
+        if (alive) setProtection(result);
+      } catch (reason) {
+        if (alive)
+          setProtection({
+            secure: false,
+            detail: `Не удалось подтвердить защиту: ${String(reason)}`,
+            checkedAt: Math.floor(Date.now() / 1000),
+          });
+      }
+    };
+    void inspect();
+    const timer = window.setInterval(inspect, 5 * 60 * 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [protectionKey]);
   useEffect(() => {
     setQuery("");
     if (page === "DNS" && data)
@@ -282,7 +347,7 @@ function App() {
           atlas<span className="brand-dot">.</span>
         </a>
         <div className="workspace">
-          <ActiveServer connected={connected} />
+          <ActiveServer connected={connected} onChange={setActiveServer} />
           <button
             role="switch"
             aria-label="Подключение VPN"
@@ -320,10 +385,15 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="privacy">
+          <div
+            className={`privacy ${protection.secure ? "protected" : "unprotected"}`}
+            title={protection.detail}
+            aria-live="polite"
+          >
             <Shield size={15} />
             <span>
-              Ваши данные — только у вас.<small>Без облака и телеметрии</small>
+              {protection.secure ? "Данные защищены" : "Данные не защищены"}
+              <small>{protection.detail}</small>
             </span>
           </div>
           <div className="version">
@@ -710,8 +780,8 @@ function App() {
                           </strong>
                           <small>
                             {n === "AUTO"
-                              ? "Тест каждые 5 минут · порог 50 мс"
-                              : "Первый доступный сервер · проверка каждые 2 минуты"}
+                              ? `Тест каждые ${intervalLabel(s?.autoTestIntervalSeconds ?? 300)} · порог 50 мс`
+                              : `Первый доступный сервер · проверка каждые ${intervalLabel(s?.autoTestIntervalSeconds ?? 300)}`}
                           </small>
                         </span>
                         {s?.selected === n && <Check size={17} />}
@@ -735,7 +805,14 @@ function App() {
                             : 0,
                         )
                         .map((n) => (
-                          <div className="server-row" key={n.name}>
+                          <div
+                            className={`server-row ${
+                              connected && activeServer === n.name
+                                ? "connected-server"
+                                : ""
+                            }`}
+                            key={n.name}
+                          >
                             <button
                               aria-label="В избранное"
                               className="icon-button"
@@ -1209,6 +1286,33 @@ function App() {
                         <option value="system">Системная</option>
                         <option value="light">Светлая</option>
                         <option value="dark">Тёмная</option>
+                      </select>
+                    </div>
+                  </section>
+                  <section className="settings-section">
+                    <h2>Автопереключение</h2>
+                    <div className="setting-row">
+                      <div>
+                        <strong>Интервал проверки серверов</strong>
+                        <p>Как часто AUTO и FAILOVER измеряют доступность и задержку</p>
+                      </div>
+                      <select
+                        aria-label="Интервал проверки серверов"
+                        value={s.autoTestIntervalSeconds}
+                        onChange={(e) =>
+                          run(() =>
+                            save({
+                              ...s,
+                              autoTestIntervalSeconds: Number(e.target.value),
+                            }),
+                          )
+                        }
+                      >
+                        {autoTestIntervals.map((seconds) => (
+                          <option key={seconds} value={seconds}>
+                            {intervalLabel(seconds)}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </section>

@@ -254,8 +254,21 @@ nav button small {
   color: #74747b;
   line-height: 1.6;
 }
+.privacy svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.privacy.protected {
+  color: #2fa36f;
+}
+.privacy.unprotected {
+  color: #d94b55;
+}
 .privacy small {
+  display: block;
   font-size: 10px;
+  color: var(--muted);
+  line-height: 1.35;
 }
 .version {
   font-size: 10px;
@@ -663,6 +676,13 @@ nav button small {
 }
 .server-row strong {
   font-size: 12px;
+}
+.server-row.connected-server {
+  background: rgba(47, 163, 111, 0.1);
+  box-shadow: inset 3px 0 #2fa36f;
+}
+.server-row.connected-server strong {
+  color: #2fa36f;
 }
 .server-row button {
   font-size: 11px;

@@ -58,9 +58,11 @@ impl App {
         rules::compile(&next)?;
         if !["light", "dark", "system"].contains(&next.theme.as_str())
             || next.startup.delay_seconds > 300
+            || !(model::MIN_AUTO_TEST_INTERVAL_SECONDS..=model::MAX_AUTO_TEST_INTERVAL_SECONDS)
+                .contains(&next.auto_test_interval_seconds)
             || !["system", "tun"].contains(&next.mode.as_str())
         {
-            return Err("Некорректные настройки темы, режима или задержки".into());
+            return Err("Некорректные настройки темы, режима или интервала".into());
         }
         if next.mode != self.settings.mode && self.core.running() {
             return Err("Перед изменением режима отключите соединение".into());
@@ -131,6 +133,19 @@ impl App {
         self.log(
             "INFO",
             "Соединение отключено; сетевые настройки восстановлены",
+        );
+        Ok(())
+    }
+    fn prepare_restart(&mut self) -> Result<(), String> {
+        let was_connected = self.status == "Connected" && self.core.running();
+        windows::restore(&self.core.directory.join("proxy-restore.json"))?;
+        self.core.stop()?;
+        self.status = "Disconnected".into();
+        self.settings.was_connected = was_connected;
+        self.store.save(&self.settings)?;
+        self.log(
+            "INFO",
+            "Приложение перезапускается; сетевые настройки восстановлены",
         );
         Ok(())
     }
@@ -441,6 +456,24 @@ async fn request(
         .await
         .map_err(|e| e.to_string())?;
     }
+    if action == "protection_status" {
+        let (settings, client) = {
+            let mut a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            if !a.core.running() || a.status != "Connected" {
+                return Ok(json!({
+                    "secure": false,
+                    "detail": "Atlas не подключён.",
+                    "checkedAt": model::now()
+                }));
+            }
+            (a.settings.clone(), a.core.client())
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            Ok(diagnostics::protection_status(&settings, client))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     if action == "latency" {
         let name = payload
             .as_ref()
@@ -513,8 +546,10 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "Открыть Атлас", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Подключить", true, None::<&str>)?;
             let disconnect = MenuItem::with_id(app, "disconnect", "Отключить", true, None::<&str>)?;
+            let restart = MenuItem::with_id(app, "restart", "Перезагрузить", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &connect, &disconnect, &quit])?;
+            let menu =
+                Menu::with_items(app, &[&show, &connect, &disconnect, &restart, &quit])?;
             let pixels: Vec<u8> = (0..32 * 32)
                 .flat_map(|i| {
                     let x = i % 32;
@@ -546,6 +581,11 @@ pub fn run() {
                                 if action == "quit" {
                                     if a.disconnect().is_ok() {
                                         handle.exit(0)
+                                    }
+                                } else if action == "restart" {
+                                    if a.prepare_restart().is_ok() {
+                                        drop(a);
+                                        handle.restart()
                                     }
                                 } else {
                                     let _ = a.dispatch(&handle, &action, Value::Null);

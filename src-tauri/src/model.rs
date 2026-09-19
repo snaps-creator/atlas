@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const DEFAULT_AUTO_TEST_INTERVAL_SECONDS: u64 = 300;
+pub const MIN_AUTO_TEST_INTERVAL_SECONDS: u64 = 30;
+pub const MAX_AUTO_TEST_INTERVAL_SECONDS: u64 = 3600;
+
+fn default_auto_test_interval_seconds() -> u64 {
+    DEFAULT_AUTO_TEST_INTERVAL_SECONDS
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Route {
@@ -71,6 +79,8 @@ pub struct Settings {
     pub mode: String,
     pub dns: Dns,
     pub startup: Startup,
+    #[serde(default = "default_auto_test_interval_seconds")]
+    pub auto_test_interval_seconds: u64,
     pub theme: String,
     pub was_connected: bool,
     pub favorites: Vec<String>,
@@ -98,6 +108,7 @@ impl Default for Settings {
                 delay_seconds: 3,
                 restore_connection: false,
             },
+            auto_test_interval_seconds: DEFAULT_AUTO_TEST_INTERVAL_SECONDS,
             theme: "system".into(),
             was_connected: false,
             favorites: vec![],
@@ -117,4 +128,23 @@ pub fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_receive_default_auto_test_interval() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("autoTestIntervalSeconds");
+        let restored: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.auto_test_interval_seconds,
+            DEFAULT_AUTO_TEST_INTERVAL_SECONDS
+        );
+    }
 }
