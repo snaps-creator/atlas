@@ -41,7 +41,8 @@ jobs:
       - name: Test backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-      - name: Ensure the version has not been released
+      - name: Check whether the version is already released
+        id: release-version
         shell: pwsh
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
@@ -50,10 +51,14 @@ jobs:
             throw "Could not check whether tag v$version already exists."
           }
           if ($existingTag) {
-            throw "Version $version already has a GitHub Release. Bump the application version before merging into main."
+            "released=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Version $version is already published; no duplicate Release is needed."
+          } else {
+            "released=false" >> $env:GITHUB_OUTPUT
           }
 
       - name: Build and publish signed update
+        if: steps.release-version.outputs.released != 'true'
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
