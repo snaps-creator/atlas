@@ -14,10 +14,17 @@ export function resolveServer(proxies: Proxies): string | null {
   return visited.size && proxies[name] ? name : null;
 }
 
-export function ActiveServer({ connected }: { connected: boolean }) {
+export function ActiveServer({
+  connected,
+  onChange,
+}: {
+  connected: boolean;
+  onChange?: (name: string | null) => void;
+}) {
   const [value, setValue] = useState<{ name: string; delay: number | null } | null>(null);
   useEffect(() => {
     setValue(null);
+    onChange?.(null);
     if (!connected) return;
     let alive = true, pending = false, measured = "", measuredAt = 0;
     const poll = async () => {
@@ -27,22 +34,27 @@ export function ActiveServer({ connected }: { connected: boolean }) {
         const response = await request<{ proxies: Proxies }>("proxies");
         if (!alive) return;
         const name = resolveServer(response.proxies);
-        if (!name) { setValue(null); return; }
+        if (!name) { setValue(null); onChange?.(null); return; }
+        onChange?.(name);
         setValue(old => old?.name === name ? old : { name, delay: null });
         if (name !== measured || Date.now() - measuredAt >= 30000) {
-          const result = await request<Latency>("latency", { name });
-          if (!alive) return;
-          setValue({ name, delay: result.status === "ok" ? result.delay : null });
+          try {
+            const result = await request<Latency>("latency", { name });
+            if (!alive) return;
+            setValue({ name, delay: result.status === "ok" ? result.delay : null });
+          } catch {
+            if (alive) setValue({ name, delay: null });
+          }
           measured = name;
           measuredAt = Date.now();
         }
-      } catch { if (alive) setValue(null); }
+      } catch { if (alive) { setValue(null); onChange?.(null); } }
       finally { pending = false; }
     };
     void poll();
     const timer = window.setInterval(poll, 5000);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [connected]);
+  }, [connected, onChange]);
   return <div className="active-server" title={value?.name}>
     <strong>{connected ? value?.name ?? "—" : "—"}</strong>
     <small>{connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>

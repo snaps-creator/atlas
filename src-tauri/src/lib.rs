@@ -454,6 +454,24 @@ async fn request(
         .await
         .map_err(|e| e.to_string())?;
     }
+    if action == "protection_status" {
+        let (settings, client) = {
+            let mut a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            if !a.core.running() || a.status != "Connected" {
+                return Ok(json!({
+                    "secure": false,
+                    "detail": "Atlas не подключён.",
+                    "checkedAt": model::now()
+                }));
+            }
+            (a.settings.clone(), a.core.client())
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            Ok(diagnostics::protection_status(&settings, client))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     if action == "latency" {
         let name = payload
             .as_ref()

@@ -1,4 +1,7 @@
-use crate::{core::ApiClient, model::Settings};
+use crate::{
+    core::ApiClient,
+    model::{Route, Settings},
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -15,6 +18,66 @@ const IPV6_TEST_ADDRESS: &str = "[2606:4700:4700::1111]:443";
 
 fn check(name: &str, ok: Option<bool>, detail: impl Into<String>) -> Value {
     json!({"name":name,"ok":ok,"detail":detail.into()})
+}
+
+fn protection_policy_error(settings: &Settings) -> Option<&'static str> {
+    if settings.mode != "tun" || !matches!(settings.default_route, Route::Proxy) {
+        return Some("Для полной защиты включите TUN и маршрут по умолчанию через VPN.");
+    }
+    if settings.groups.iter().any(|group| {
+        group.enabled && !group.rules.is_empty() && matches!(group.route, Route::Direct)
+    }) {
+        return Some("Активное правило DIRECT разрешает трафику обходить VPN.");
+    }
+    let encrypted_dns = !settings.dns.servers.is_empty()
+        && settings.dns.servers.iter().all(|server| {
+            let endpoint = server.split('#').next().unwrap_or(server);
+            url::Url::parse(endpoint)
+                .ok()
+                .is_some_and(|url| matches!(url.scheme(), "https" | "tls"))
+        });
+    if !encrypted_dns {
+        return Some("DNS не зашифрован: используйте DNS over HTTPS или DNS over TLS.");
+    }
+    None
+}
+
+fn summarize_protection(settings: &Settings, checks: &[Value]) -> Value {
+    if let Some(detail) = protection_policy_error(settings) {
+        return json!({"secure":false,"detail":detail,"checkedAt":crate::model::now()});
+    }
+    let required = [
+        "Ядро",
+        "TUN / TCP / IPv4",
+        "TUN / IPv6",
+        "UDP через TUN",
+        "DNS / утечки",
+    ];
+    let failed = required.iter().find_map(|name| {
+        checks
+            .iter()
+            .find(|item| item["name"] == **name)
+            .filter(|item| item["ok"] != true)
+    });
+    match failed {
+        Some(item) => json!({
+            "secure":false,
+            "detail":item["detail"].as_str().unwrap_or("Защищённый путь трафика не подтверждён."),
+            "checkedAt":crate::model::now()
+        }),
+        None => json!({
+            "secure":true,
+            "detail":"IPv4, IPv6, TCP, UDP и зашифрованный DNS защищены туннелем Atlas.",
+            "checkedAt":crate::model::now()
+        }),
+    }
+}
+
+pub fn protection_status(settings: &Settings, client: ApiClient) -> Value {
+    if let Some(detail) = protection_policy_error(settings) {
+        return json!({"secure":false,"detail":detail,"checkedAt":crate::model::now()});
+    }
+    summarize_protection(settings, &run(settings, client))
 }
 
 fn tun(c: &Value) -> bool {
@@ -361,6 +424,19 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
 mod tests {
     use super::*;
 
+    fn protected_checks() -> Vec<Value> {
+        [
+            "Ядро",
+            "TUN / TCP / IPv4",
+            "TUN / IPv6",
+            "UDP через TUN",
+            "DNS / утечки",
+        ]
+        .into_iter()
+        .map(|name| check(name, Some(true), "ok"))
+        .collect()
+    }
+
     #[test]
     fn local_proxy_and_direct_are_not_tun_evidence() {
         assert!(!routed(
@@ -391,5 +467,32 @@ mod tests {
             &addresses,
             443,
         ));
+    }
+
+    #[test]
+    fn protection_requires_full_tunnel_encrypted_dns_and_real_checks() {
+        let mut settings = Settings::default();
+        settings.default_route = Route::Proxy;
+        assert_eq!(
+            summarize_protection(&settings, &protected_checks())["secure"],
+            true
+        );
+
+        settings.default_route = Route::Direct;
+        assert_eq!(
+            summarize_protection(&settings, &protected_checks())["secure"],
+            false
+        );
+        settings.default_route = Route::Proxy;
+        settings.dns.servers = vec!["1.1.1.1".into()];
+        assert_eq!(
+            summarize_protection(&settings, &protected_checks())["secure"],
+            false
+        );
+
+        settings.dns.servers = vec!["https://1.1.1.1/dns-query".into()];
+        let mut checks = protected_checks();
+        checks[3]["ok"] = json!(false);
+        assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
     }
 }
