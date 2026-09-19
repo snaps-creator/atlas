@@ -19,7 +19,7 @@ npm run tauri build
 ```
 
 Готовый установщик для пользователя находится в корне проекта: `Atlas Beta v1 Setup.exe`.
-Исходный bundle: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.2_x64-setup.exe`.
+Исходный bundle: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.3_x64-setup.exe`.
 Ядро и локальная GeoIP-база включены в проект. Контрольные суммы находятся в `src-tauri/resources`.
 Дистрибутив не подписан издательским сертификатом.
 
