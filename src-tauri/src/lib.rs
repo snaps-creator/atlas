@@ -643,3 +643,11 @@ pub fn network_helper(parent: u32, pipe: &str) -> Result<(), String> {
 pub fn network_service() -> Result<(), String> {
     service::run()
 }
+
+pub fn install_network_service() -> Result<(), String> {
+    service::install()
+}
+
+pub fn uninstall_network_service() -> Result<(), String> {
+    service::uninstall()
+}

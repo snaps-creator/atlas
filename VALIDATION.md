@@ -3,8 +3,7 @@
 ## Автоматические
 
 - `cargo check --manifest-path src-tauri/Cargo.toml`: успешно, включая Windows Service API.
-- `cargo test --manifest-path src-tauri/Cargo.toml --lib`: 34 passed; один сетевой
-  интеграционный тест не запущен до конца, потому что работающий Atlas занимает порт 17890.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib`: 35 passed, 0 failed.
 - `npm test`: 6 passed, 0 failed.
 - `npm run tauri build`: успешно, NSIS x64.
 - `npm install`: аудит 118 пакетов, известных уязвимостей не найдено на момент выполнения.
@@ -17,13 +16,14 @@
 
 ## Установщик
 
-`src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.4_x64-setup.exe`
-Размер: 39 904 873 байт.
-SHA-256: `C5779676C00B423600F73A7457E0A025C07700E9712AE7653939EC5068D8A11B`
+`src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.5_x64-setup.exe`
+Размер: 39 895 492 байт.
+SHA-256: `B7FEEA8589F95846694FB4F295B590FB6190D558F457478F93DA0985A615AE82`
 
 NSIS production-сборка завершилась успешно и проверила installer hooks. Установщик
-переведён в per-machine режим: он создаёт и запускает `AtlasNetworkService`, а при
-обновлении и удалении останавливает её. Службе настроен автоматический перезапуск.
+работает в per-machine режиме. Регистрация `AtlasNetworkService` выполняется напрямую
+через Windows Service API без хрупкой командной строки `sc.exe`; при обновлении и
+удалении служба останавливается. Службе настроен автоматический перезапуск.
 
 ## Не подтверждено
 
