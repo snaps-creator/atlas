@@ -21,13 +21,15 @@ fn check(name: &str, ok: Option<bool>, detail: impl Into<String>) -> Value {
 }
 
 fn protection_policy_error(settings: &Settings) -> Option<&'static str> {
-    if settings.mode != "tun" || !matches!(settings.default_route, Route::Proxy) {
-        return Some("Для полной защиты включите TUN и маршрут по умолчанию через VPN.");
+    if settings.mode != "tun" {
+        return Some("TUN Atlas выключен.");
     }
-    if settings.groups.iter().any(|group| {
-        group.enabled && !group.rules.is_empty() && matches!(group.route, Route::Direct)
-    }) {
-        return Some("Активное правило DIRECT разрешает трафику обходить VPN.");
+    let has_vpn_route = matches!(settings.default_route, Route::Proxy)
+        || settings.groups.iter().any(|group| {
+            group.enabled && !group.rules.is_empty() && matches!(group.route, Route::Proxy)
+        });
+    if !has_vpn_route {
+        return Some("Нет активных правил или маршрута через VPN.");
     }
     let encrypted_dns = !settings.dns.servers.is_empty()
         && settings.dns.servers.iter().all(|server| {
@@ -53,6 +55,9 @@ fn summarize_protection(settings: &Settings, checks: &[Value]) -> Value {
         "UDP через TUN",
         "DNS / утечки",
     ];
+    if required.iter().any(|name| !checks.iter().any(|item| item["name"] == **name)) {
+        return json!({"secure":false,"detail":"Проверка защиты не завершена: отсутствуют обязательные результаты.","checkedAt":crate::model::now()});
+    }
     let failed = required.iter().find_map(|name| {
         checks
             .iter()
@@ -67,7 +72,11 @@ fn summarize_protection(settings: &Settings, checks: &[Value]) -> Value {
         }),
         None => json!({
             "secure":true,
-            "detail":"IPv4, IPv6, TCP, UDP и зашифрованный DNS защищены туннелем Atlas.",
+            "detail":if matches!(settings.default_route, Route::Proxy) {
+                "Трафик и DNS защищены туннелем Atlas; правила DIRECT применяются как задано."
+            } else {
+                "Правила Atlas активны: выбранный трафик идёт через VPN, DNS защищён."
+            },
             "checkedAt":crate::model::now()
         }),
     }
@@ -97,6 +106,14 @@ fn chain_has(c: &Value, name: &str) -> bool {
 
 fn routed(c: &Value) -> bool {
     tun(c) && chain_has(c, "ATLAS") && !chain_has(c, "DIRECT") && !chain_has(c, "REJECT")
+}
+
+fn follows_route(c: &Value, route: &Route) -> bool {
+    match route {
+        Route::Proxy => routed(c),
+        Route::Direct => tun(c) && chain_has(c, "DIRECT") && !chain_has(c, "REJECT"),
+        Route::Block => rejected(c),
+    }
 }
 
 fn rejected(c: &Value) -> bool {
@@ -280,12 +297,16 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
             .ok()
             .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
             .is_some_and(|ip| ip.is_ipv6() == ipv6);
-        let confirmed = !flows.is_empty() && flows.iter().all(|connection| routed(connection));
+        let confirmed = !flows.is_empty()
+            && flows
+                .iter()
+                .all(|connection| follows_route(connection, &settings.default_route));
         let ok = Some(valid && confirmed && settings.mode == "tun");
         let detail = if valid && confirmed {
             format!(
-                "Ответ {} через наблюдаемый TUN → ATLAS. Запрос выполнен без системного прокси.",
-                response.unwrap().trim()
+                "Ответ {} через TUN по маршруту {:?}. Запрос выполнен без системного прокси.",
+                response.unwrap().trim(),
+                settings.default_route
             )
         } else if valid {
             "Ответ получен, но соединение не найдено среди TUN-потоков Atlas.".into()
@@ -358,9 +379,11 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
     });
     results.push(check(
         "UDP через TUN",
-        flow.map(|connection| udp.is_ok() && routed(connection)),
-        if udp.is_ok() && flow.is_some_and(routed) {
-            "Ответ STUN и совпадающий исходный порт подтверждают UDP через TUN → ATLAS."
+        flow.map(|connection| udp.is_ok() && follows_route(connection, &settings.default_route)),
+        if udp.is_ok()
+            && flow.is_some_and(|connection| follows_route(connection, &settings.default_route))
+        {
+            "Ответ STUN и совпадающий исходный порт подтверждают UDP через TUN по настроенному маршруту."
         } else {
             "Нет ответа STUN или подтверждения маршрута его сокета через TUN → ATLAS."
         },
@@ -448,6 +471,10 @@ mod tests {
         assert!(routed(
             &json!({"metadata":{"type":"Tun"},"chains":["node","ATLAS"]})
         ));
+        assert!(follows_route(
+            &json!({"metadata":{"type":"Tun"},"chains":["DIRECT"]}),
+            &Route::Direct
+        ));
     }
 
     #[test]
@@ -470,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn protection_requires_full_tunnel_encrypted_dns_and_real_checks() {
+    fn protection_accepts_selective_rules_with_encrypted_dns_and_real_checks() {
         let mut settings = Settings::default();
         settings.default_route = Route::Proxy;
         assert_eq!(
@@ -483,6 +510,22 @@ mod tests {
             summarize_protection(&settings, &protected_checks())["secure"],
             false
         );
+        settings.groups.push(crate::model::RuleGroup {
+            id: "proxy".into(),
+            name: "proxy".into(),
+            description: String::new(),
+            enabled: true,
+            route: Route::Proxy,
+            rules: vec![crate::model::Rule {
+                kind: "DOMAIN".into(),
+                value: "example.com".into(),
+                no_resolve: false,
+            }],
+        });
+        assert_eq!(
+            summarize_protection(&settings, &protected_checks())["secure"],
+            true
+        );
         settings.default_route = Route::Proxy;
         settings.dns.servers = vec!["1.1.1.1".into()];
         assert_eq!(
@@ -494,5 +537,20 @@ mod tests {
         let mut checks = protected_checks();
         checks[3]["ok"] = json!(false);
         assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
+    }
+
+    #[test]
+    fn missing_or_unknown_checks_never_report_protected() {
+        let mut settings = Settings::default();
+        settings.default_route = Route::Proxy;
+        assert_eq!(summarize_protection(&settings, &[])["secure"], false);
+        for index in 0..protected_checks().len() {
+            let mut checks = protected_checks();
+            checks.remove(index);
+            assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
+            let mut checks = protected_checks();
+            checks[index]["ok"] = Value::Null;
+            assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
+        }
     }
 }

@@ -9,9 +9,9 @@
     MessageBox MB_OK|MB_ICONSTOP "Не удалось установить сетевую службу Atlas."
     Abort
   ${EndIf}
-  nsExec::ExecToLog 'sc.exe failure AtlasNetworkService reset= 86400 actions= restart/5000/restart/15000/restart/30000'
+  nsExec::ExecToLog 'sc.exe failure AtlasNetworkService reset= 0 actions= ""'
   Pop $0
-  nsExec::ExecToLog 'sc.exe failureflag AtlasNetworkService 1'
+  nsExec::ExecToLog 'sc.exe failureflag AtlasNetworkService 0'
   Pop $0
 !macroend
 

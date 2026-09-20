@@ -173,6 +173,14 @@ impl Core {
                 break;
             }
             if self.api("GET", "/version", None).is_ok() {
+                if s.mode == "tun" {
+                    let config = self.api("GET", "/configs", None)?;
+                    if config["tun"]["enable"] != true {
+                        let detail = self.tun_error();
+                        self.stop()?;
+                        return Err(detail);
+                    }
+                }
                 self.api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected})))?;
                 self.commit(&path)?;
                 self.started = Some(Instant::now());
@@ -194,6 +202,19 @@ impl Core {
         std::fs::copy(path, &last).map_err(|e| e.to_string())?;
         Ok(())
     }
+    fn tun_error(&self) -> String {
+        let detail = self.logs.lock().ok().and_then(|logs| {
+            logs.iter()
+                .rev()
+                .find(|line| line.contains("Start TUN listening error"))
+                .cloned()
+        });
+        detail
+            .map(|line| format!("Не удалось создать TUN: {line}"))
+            .unwrap_or_else(|| {
+                "Ядро не создало TUN. Подключение отменено, защитные блокировки сняты.".into()
+            })
+    }
     pub fn apply(&mut self, s: &Settings) -> Result<(), String> {
         if let Some(broker) = &self.broker {
             crate::broker::validate_settings(s)?;
@@ -208,7 +229,14 @@ impl Core {
         let result = self
             .api("PUT", "/configs?force=true", Some(json!({"path":path})))
             .and_then(|_| self.api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected}))))
-            .and_then(|_| self.api("GET", "/configs", None));
+            .and_then(|_| self.api("GET", "/configs", None))
+            .and_then(|config| {
+                if s.mode == "tun" && config["tun"]["enable"] != true {
+                    Err(self.tun_error())
+                } else {
+                    Ok(config)
+                }
+            });
         if let Err(e) = result {
             if old.exists() {
                 self.api("PUT", "/configs?force=true", Some(json!({"path":old})))?;
@@ -221,15 +249,10 @@ impl Core {
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
             self.broker = None;
         }
-        if let Some(broker) = &self.broker {
-            broker.call("stop", Value::Null)?;
-            self.broker = None;
+        let mut result = Ok(());
+        if let Some(broker) = self.broker.take() {
+            result = broker.call("stop", Value::Null).map(|_| ());
             let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
-        } else if !self.elevated && self.directory.join("tun-guard.active").exists() {
-            let broker = crate::broker::Broker::launch()?;
-            broker.call("stop", Value::Null)?;
-            std::fs::remove_file(self.directory.join("tun-guard.active"))
-                .map_err(|e| e.to_string())?;
         }
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
@@ -237,12 +260,13 @@ impl Core {
         }
         self.started = None;
         self.job = None;
-        Ok(())
+        let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
+        result
     }
 }
 impl Drop for Core {
     fn drop(&mut self) {
-        // Only explicit disconnect can remove persistent fail-closed filters.
+        // Closing the IPC session releases the broker's dynamic WFP filters.
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -256,6 +280,23 @@ impl Drop for Core {
 mod integration_tests {
     use super::*;
     use crate::model::{Route, Rule, RuleGroup, Subscription};
+    #[test]
+    fn disconnected_stop_does_not_launch_a_broker_for_a_stale_marker() {
+        let directory =
+            std::env::temp_dir().join(format!("atlas-stop-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("tun-guard.active");
+        std::fs::write(&marker, b"stale").unwrap();
+        // A deliberately nonexistent executable proves stop cannot launch a core/helper.
+        let mut core = Core::new(directory.join("missing.exe"), directory.clone());
+        core.stop().unwrap();
+        core.stop().unwrap();
+        assert!(!marker.exists());
+        assert!(core.broker.is_none());
+        assert!(!core.running());
+        drop(core);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn real_core_accepts_empty_full_tunnel_and_route_exceptions() {
         let directory =
