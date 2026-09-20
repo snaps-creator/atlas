@@ -4,6 +4,7 @@ export function startUpdatePolling<T>(
   check: () => Promise<T | null>,
   onUpdate: (update: T) => void,
   onError: (error: unknown) => void,
+  events: { onStart?: () => void; onCurrent?: () => void } = {},
 ) {
   let active = true;
   let running = false;
@@ -11,10 +12,13 @@ export function startUpdatePolling<T>(
     if (!active || running) return;
     running = true;
     try {
+      events.onStart?.();
       const update = await check();
       if (active && update !== null) {
         stop(); // Keep the offered update; do not replace it while downloading.
         onUpdate(update);
+      } else if (active) {
+        events.onCurrent?.();
       }
     } catch (error) {
       if (active) onError(error);
@@ -30,5 +34,5 @@ export function startUpdatePolling<T>(
     clearTimeout(initial);
     clearInterval(interval);
   }
-  return stop;
+  return Object.assign(stop, { checkNow: inspect });
 }

@@ -65,6 +65,7 @@ const nav = [
   ["Diagnostics", Stethoscope],
   ["Logs", FileText],
   ["Settings", Settings2],
+  ["Updates", RefreshCw],
 ] as const;
 const pageNames: Record<string, string> = {
   Dashboard: "Главная",
@@ -76,13 +77,16 @@ const pageNames: Record<string, string> = {
   Diagnostics: "Диагностика",
   Logs: "Журнал",
   Settings: "Настройки",
+  Updates: "Обновления",
 };
 function App() {
   const [versionLabel, setVersionLabel] = useState("");
+  const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
     if (!native) return;
     void getVersion()
       .then(async (version) => {
+        setAppVersion(version);
         const beta = /^1\.0\.0-beta\.(\d+)$/.exec(version);
         const label = beta ? `Beta ${beta[1]}` : version;
         setVersionLabel(label);
@@ -123,6 +127,10 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateProgress, setUpdateProgress] = useState(0);
   const [updateError, setUpdateError] = useState("");
+  const checkUpdatesNow = useRef<(() => Promise<void>) | null>(null);
+  const [updateCheckStatus, setUpdateCheckStatus] = useState<"idle" | "checking" | "current" | "available" | "error">("idle");
+  const [updateCheckError, setUpdateCheckError] = useState("");
+  const [updateCheckedAt, setUpdateCheckedAt] = useState<number | null>(null);
   const [protection, setProtection] = useState<ProtectionStatus>({
     secure: false,
     detail: "Atlas не подключён.",
@@ -145,11 +153,25 @@ function App() {
   }, [refresh]);
   useEffect(() => {
     if (!native) return;
-    return startUpdatePolling(
+    const polling = startUpdatePolling(
       () => check({ timeout: 15000 }),
-      setAvailableUpdate,
-      (reason) => console.warn("Не удалось проверить обновления Atlas", reason),
+      (update) => {
+        setAvailableUpdate(update);
+        setUpdateCheckStatus("available");
+        setUpdateCheckedAt(Date.now());
+      },
+      (reason) => {
+        setUpdateCheckStatus("error");
+        setUpdateCheckError(String(reason));
+        setUpdateCheckedAt(Date.now());
+      },
+      {
+        onStart: () => { setUpdateCheckStatus("checking"); setUpdateCheckError(""); },
+        onCurrent: () => { setUpdateCheckStatus("current"); setUpdateCheckedAt(Date.now()); },
+      },
     );
+    checkUpdatesNow.current = polling.checkNow;
+    return () => { polling(); checkUpdatesNow.current = null; };
   }, []);
   useEffect(() => {
     if (data) document.documentElement.dataset.theme = data.settings.theme;
@@ -257,7 +279,7 @@ function App() {
     void f().catch(() => {});
   }
   async function installUpdate() {
-    if (!availableUpdate || updateStatus === "downloading") return;
+    if (!availableUpdate || updateStatus === "downloading" || updateStatus === "installing") return;
     setUpdateStatus("downloading");
     setUpdateProgress(0);
     setUpdateError("");
@@ -411,7 +433,17 @@ function App() {
             </span>
           </div>
           <div className="version">
-            Атлас для Windows <span>{versionLabel}</span>
+            <span>Атлас для Windows</span>
+            {availableUpdate ? (
+              <button
+                className="sidebar-update"
+                title={updateError || `Обновить до Atlas ${availableUpdate.version}`}
+                disabled={updateStatus === "downloading" || updateStatus === "installing"}
+                onClick={() => { setPage("Updates"); void installUpdate(); }}
+              >
+                {updateStatus === "downloading" ? `${updateProgress}%` : updateStatus === "installing" ? "Установка…" : "Обновить"}
+              </button>
+            ) : <span>{versionLabel}</span>}
           </div>
         </div>
       </aside>
@@ -426,7 +458,33 @@ function App() {
           </span>
         </header>
         <main>
-          {availableUpdate && (
+          {page === "Updates" && (
+            <>
+              <div className="page-heading"><h1>Обновления</h1></div>
+              <section className="settings-section update-settings">
+                <h2>Текущая версия</h2>
+                <p>{versionLabel || "Версия недоступна"}{appVersion ? ` · ${appVersion}` : ""}</p>
+                <p>Автоматическая проверка при запуске и каждые 6 часов.</p>
+                <button
+                  disabled={!native || updateCheckStatus === "checking" || !!availableUpdate}
+                  onClick={() => void checkUpdatesNow.current?.()}
+                >
+                  <RefreshCw size={16} className={updateCheckStatus === "checking" ? "spin" : undefined} />
+                  {updateCheckStatus === "checking" ? "Проверяем…" : "Проверить обновления"}
+                </button>
+                <p role="status" aria-live="polite">
+                  {updateCheckStatus === "checking" ? "Проверяем GitHub…"
+                    : updateCheckStatus === "current" ? "Установлена последняя версия."
+                    : updateCheckStatus === "available" ? `Доступна новая версия: ${availableUpdate?.version}.`
+                    : updateCheckStatus === "error" ? "Не удалось проверить обновления. Проверьте подключение к GitHub и повторите попытку."
+                    : "Проверка ещё не выполнена."}
+                </p>
+                {updateCheckError && <details className="update-error-details"><summary>Подробности ошибки</summary><p>{updateCheckError}</p></details>}
+                <p>Последняя проверка: {updateCheckedAt ? new Date(updateCheckedAt).toLocaleString("ru-RU") : "ещё не выполнялась"}</p>
+              </section>
+            </>
+          )}
+          {page === "Updates" && availableUpdate && (
             <section className="update-banner" aria-live="polite">
               <div className="update-copy">
                 <Download size={18} />
