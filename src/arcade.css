@@ -1,0 +1,150 @@
+@import '@fontsource/source-code-pro/cyrillic-400.css';
+@import '@fontsource/source-code-pro/cyrillic-600.css';
+@import '@fontsource/source-code-pro/cyrillic-700.css';
+@import '@fontsource/source-code-pro/latin-400.css';
+@import '@fontsource/source-code-pro/latin-600.css';
+@import '@fontsource/source-code-pro/latin-700.css';
+
+/* Presentation layer only. Network state and all actions remain in main.tsx. */
+:root, [data-theme="dark"], [data-theme="system"] {
+  --canvas: #000;
+  --surface: #000;
+  --ink: #fff;
+  --muted: #aaa;
+  --line: #333;
+  --wash: #171717;
+  --blue: #007fe8;
+  --link: #007fe8;
+  --outline: #fff;
+  font-family: 'Source Code Pro', Consolas, monospace;
+  font-feature-settings: 'zero';
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink);
+  background: var(--canvas);
+  color-scheme: dark;
+}
+/* Preserve the existing explicit light-theme preference. */
+[data-theme="light"] {
+  --canvas: #fafafa; --surface: #fafafa; --ink: #111;
+  --muted: #555; --line: #ccc; --wash: #eee; --outline: #111;
+  color-scheme: light;
+}
+button, input, textarea, select { border-radius: 10px; }
+button { background: transparent; border-color: var(--outline); font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; padding: 11px 15px; }
+button:hover { background: var(--wash); border-color: var(--ink); }
+button.primary:hover { background: #006dcc; border-color: #006dcc; }
+button.selected { background: transparent; color: var(--ink); border-color: var(--link); }
+input, select, textarea { border-color: #777; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
+input, textarea, .log-view, td { text-transform: none; letter-spacing: normal; }
+h1 { font-size: clamp(28px, 3vw, 42px); font-weight: 700; letter-spacing: .13em; line-height: 1.35; text-transform: uppercase; overflow-wrap: anywhere; }
+h2, h3 { font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+h2 { font-size: 17px; }
+small { font-size: 11px; }
+aside { width: 265px; padding: 30px 20px 18px; }
+.content { margin-left: 265px; width: calc(100% - 265px); }
+.brand { font-size: 30px; letter-spacing: .12em; font-weight: 700; text-transform: uppercase; margin: 0 10px 32px; }
+.brand-dot { color: var(--ink); }
+.workspace { border-color: #777; border-radius: 15px; padding: 15px; margin-bottom: 25px; }
+.workspace strong { font-size: 11px; }
+.nav-label { color: var(--muted); letter-spacing: .18em; }
+nav { gap: 3px; scrollbar-width: thin; scrollbar-color: #555 transparent; }
+nav button { min-height: 42px; padding: 10px 12px; font-size: 11px; border: 1px solid transparent; border-radius: 10px; color: var(--muted); letter-spacing: .1em; }
+nav button.active { color: var(--ink); background: transparent; border-color: var(--link); }
+nav button.active svg { color: var(--link); }
+.sidebar-bottom { padding-top: 25px; }
+.privacy.protected, .privacy.unprotected { color: var(--ink); }
+.privacy.unprotected svg { stroke-dasharray: 3 2; }
+.privacy small { margin-top: 5px; line-height: 1.6; }
+.version { font-size: 9px; gap: 8px; }
+.version .sidebar-update { border-radius: 10px; padding: 8px; }
+.topbar { height: 70px; padding: 0 40px; letter-spacing: .08em; text-transform: uppercase; }
+.dot.online { background: var(--ink); }
+.content main { max-width: 1280px; padding: 40px; }
+.page-head { align-items: flex-start; margin-bottom: 35px; flex-wrap: wrap; }
+.page-head > div { flex: 1 1 450px; }
+.page-head h1 { max-width: 900px; }
+.page-head p { max-width: 660px; line-height: 1.8; font-size: 12px; margin-top: 16px; }
+.eyebrow { color: var(--muted); font-size: 10px; letter-spacing: .2em; margin-bottom: 15px; }
+.connection-hero, .list, .table-wrap, .dialog, .log-view, .rule-checks, .onboarding, .update-banner { border: 1px solid var(--outline); border-radius: 15px; background: var(--surface); box-shadow: none; }
+.connection-hero { padding: 30px 30px 0; }
+.hero-main { padding: 40px 0; gap: 25px; }
+.hero-main h2 { font-size: 25px; letter-spacing: .06em; }
+.hero-main p { font-size: 12px; }
+.power, .is-connected .power { border-radius: 50%; background: transparent; color: var(--ink); border-color: var(--outline); }
+.hero-details { padding: 25px 0; }
+.hero-details small { font-size: 9px; letter-spacing: .12em; }
+.hero-details button { text-transform: none; letter-spacing: normal; }
+.stats { margin: 30px 0 50px; padding: 25px 0; }
+.stats strong { font-size: 34px; letter-spacing: -.04em; }
+.stats span { font-size: 10px; }
+.section-head { margin-bottom: 25px; flex-wrap: wrap; }
+.quick-rules { gap: 0 30px; }
+.quick-rules > div { padding: 20px 0; }
+.letter-icon { border-radius: 10px; background: transparent; }
+.route { border-radius: 10px; padding: 8px 10px; }
+.route-PROXY, .route-BLOCK { color: var(--ink); }
+.default-route { flex-wrap: wrap; padding: 25px 0; }
+.onboarding { margin-top: 30px; padding: 30px; }
+.toolbar { flex-wrap: wrap; gap: 15px; margin: 30px 0; }
+.search { border-color: #777; border-radius: 10px; }
+.auto-options { gap: 20px; margin: 25px 0; }
+.auto-options button { border-radius: 15px; padding: 25px; }
+.auto-options strong { letter-spacing: .04em; }
+.auto-options small { text-transform: none; letter-spacing: normal; line-height: 1.7; }
+.server-row, .group-row, .diagnostic-row { padding: 22px; gap: 15px; }
+.server-row.connected-server { background: var(--wash); box-shadow: none; border-left: 3px solid var(--link); }
+.server-row.connected-server strong { color: var(--ink); }
+.server-row strong { font-size: 13px; }
+.icon-button { border: 0; }
+.settings-section { padding: 30px; border: 1px solid var(--outline); border-radius: 15px; margin-bottom: 30px; }
+.settings-section > h2 { margin-bottom: 20px; }
+.setting-row { gap: 25px; padding: 22px 0; }
+.setting-row:last-child { border-bottom: 0; }
+.setting-row p { line-height: 1.8; }
+.setting-row > div { min-width: 0; }
+.toggle { border: 1px solid #777; width: 38px; height: 23px; border-radius: 10px; background: transparent; padding: 3px; }
+.toggle span { height: 15px; width: 15px; border-radius: 6px; background: #777; }
+.toggle.on { background: transparent; border-color: var(--outline); }
+.toggle.on span { background: var(--ink); }
+.table-wrap { margin-top: 30px; }
+th { text-transform: uppercase; letter-spacing: .1em; font-size: 10px; }
+td, th { padding: 17px 14px; }
+.checkmark, .failed, .log-ERROR, .error, .log-INFO { color: var(--ink); }
+.log-view { font-family: inherit; padding: 25px; font-size: 12px; line-height: 1.8; }
+.log-view > div { border-color: var(--line); }
+.alert { color: var(--ink); background: var(--surface); border: 1px dashed var(--outline); border-radius: 15px; padding: 20px; }
+.update-banner { padding: 25px; gap: 20px; }
+.page-heading { margin-bottom: 35px; }
+.update-progress { border-radius: 0; }
+.main-footer { margin: 20px 40px 0; padding: 25px 0; font-size: 9px; letter-spacing: .05em; }
+.empty { padding: 65px 30px; border: 1px solid var(--line); border-radius: 15px; }
+.empty p { line-height: 1.9; }
+.overlay { background: #000b; backdrop-filter: none; }
+.dialog { padding: 30px; }
+.rule-checks { padding: 25px; }
+.rule-table-row { padding: 18px; }
+.subscription { padding: 30px; }
+@media(max-height: 850px) {
+  aside { padding-top: 20px; }
+  .brand { margin-bottom: 20px; font-size: 26px; }
+  .workspace { margin-bottom: 15px; padding: 10px 12px; }
+  nav { gap: 1px; }
+  nav button { min-height: 32px; padding: 6px 10px; font-size: 10px; }
+  .sidebar-bottom { padding-top: 15px; }
+  .privacy small { font-size: 9px; }
+  .version { margin-top: 12px; padding-top: 12px; }
+}
+@media(max-width: 1100px) {
+  aside { width: 235px; padding: 25px 15px 15px; }
+  .content { margin-left: 235px; width: calc(100% - 235px); }
+  .content main { padding: 30px; }
+  .topbar { padding: 0 30px; }
+  h1 { font-size: 28px; letter-spacing: .1em; }
+  .quick-rules { grid-template-columns: 1fr; }
+  .hero-main { flex-wrap: wrap; }
+  .hero-main h2 { font-size: 21px; }
+  .auto-options { grid-template-columns: 1fr; }
+  .settings-section { padding: 25px; }
+}

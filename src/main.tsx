@@ -38,6 +38,7 @@ import { request, download, bytes, native } from "./api";
 import { RouteSelect, routeName } from "./RuleEditor";
 import type { Snapshot, Settings, Group, Connection } from "./types";
 import "./style.css";
+import "./arcade.css";
 import { RulesPanel } from "./RulesPanel";
 import { RuleChecks } from "./RuleChecks";
 import { ActiveServer } from "./ActiveServer";
@@ -90,7 +91,7 @@ function App() {
         const beta = /^1\.0\.0-beta\.(\d+)$/.exec(version);
         const label = beta ? `Beta ${beta[1]}` : version;
         setVersionLabel(label);
-        await getCurrentWindow().setTitle(`Atlas — ${label}`);
+        await getCurrentWindow().setTitle("atlas");
       })
       .catch((reason) => console.warn("Не удалось прочитать версию Atlas", reason));
   }, []);
@@ -433,7 +434,7 @@ function App() {
             </span>
           </div>
           <div className="version">
-            <span>Атлас для Windows</span>
+            <span>atlas by TLQ</span>
             {availableUpdate ? (
               <button
                 className="sidebar-update"
