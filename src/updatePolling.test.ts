@@ -3,6 +3,31 @@ import { startUpdatePolling, UPDATE_CHECK_INTERVAL_MS } from "./updatePolling";
 
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 describe("update polling", () => {
+  it("allows manual retry after an error and reports current version", async () => {
+    vi.useFakeTimers();
+    const check = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(null);
+    const current = vi.fn();
+    const started = vi.fn();
+    const polling = startUpdatePolling(check, vi.fn(), vi.fn(), { onStart: started, onCurrent: current });
+    await vi.advanceTimersByTimeAsync(0);
+    await polling.checkNow();
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(started).toHaveBeenCalledTimes(2);
+    expect(current).toHaveBeenCalledTimes(1);
+    polling();
+  });
+  it("shares the in-flight guard between manual and scheduled checks", async () => {
+    vi.useFakeTimers();
+    let resolve!: (value: string | null) => void;
+    const check = vi.fn(() => new Promise<string | null>(done => { resolve = done; }));
+    const polling = startUpdatePolling(check, vi.fn(), vi.fn());
+    await vi.advanceTimersByTimeAsync(0);
+    await polling.checkNow();
+    expect(check).toHaveBeenCalledTimes(1);
+    resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    polling();
+  });
   it("checks at startup, retries after failures every six hours", async () => {
     vi.useFakeTimers();
     const check = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(null);

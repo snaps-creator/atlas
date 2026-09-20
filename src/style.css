@@ -221,6 +221,8 @@ aside {
   font-weight: 600;
 }
 nav {
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -244,6 +246,7 @@ nav button small {
   margin-left: auto;
 }
 .sidebar-bottom {
+  flex-shrink: 0;
   margin-top: auto;
   padding: 40px 8px 0;
 }
@@ -271,6 +274,7 @@ nav button small {
   line-height: 1.35;
 }
 .version {
+  align-items: center;
   font-size: 10px;
   color: #909099;
   border-top: 1px solid var(--line);
@@ -677,6 +681,17 @@ nav button small {
 .server-row strong {
   font-size: 12px;
 }
+.version .sidebar-update {
+  padding: 5px 9px;
+  font-size: 10px;
+  color: white;
+  background: var(--link);
+  border: 0;
+  border-radius: 7px;
+  white-space: nowrap;
+}
+.update-settings > button { margin: 16px 0; }
+.update-error-details { color: var(--muted); overflow-wrap: anywhere; }
 .server-row.connected-server {
   background: rgba(47, 163, 111, 0.1);
   box-shadow: inset 3px 0 #2fa36f;
