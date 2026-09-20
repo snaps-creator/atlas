@@ -55,6 +55,9 @@ fn summarize_protection(settings: &Settings, checks: &[Value]) -> Value {
         "UDP через TUN",
         "DNS / утечки",
     ];
+    if required.iter().any(|name| !checks.iter().any(|item| item["name"] == **name)) {
+        return json!({"secure":false,"detail":"Проверка защиты не завершена: отсутствуют обязательные результаты.","checkedAt":crate::model::now()});
+    }
     let failed = required.iter().find_map(|name| {
         checks
             .iter()
@@ -534,5 +537,20 @@ mod tests {
         let mut checks = protected_checks();
         checks[3]["ok"] = json!(false);
         assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
+    }
+
+    #[test]
+    fn missing_or_unknown_checks_never_report_protected() {
+        let mut settings = Settings::default();
+        settings.default_route = Route::Proxy;
+        assert_eq!(summarize_protection(&settings, &[])["secure"], false);
+        for index in 0..protected_checks().len() {
+            let mut checks = protected_checks();
+            checks.remove(index);
+            assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
+            let mut checks = protected_checks();
+            checks[index]["ok"] = Value::Null;
+            assert_eq!(summarize_protection(&settings, &checks)["secure"], false);
+        }
     }
 }

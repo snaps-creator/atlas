@@ -1,5 +1,5 @@
 //! Privileged network broker. Installed builds use an SCM-managed service;
-//! portable/dev builds retain the per-session UAC helper as a safe fallback.
+//! the desktop client authenticates the pipe server against its SCM identity.
 use crate::{core::Core, model::Settings, network_guard};
 use serde_json::{json, Value};
 use std::{
@@ -85,15 +85,15 @@ pub struct Broker {
 }
 impl Broker {
     pub fn launch() -> Result<Self, String> {
-        crate::service::start_on_demand().map_err(|error| {
-            format!("{error}. Переустановите Atlas: сетевой модуль не запускается без UAC.")
-        })?;
         Self::connect_service()
     }
     fn connect_service() -> Result<Self, String> {
         // A cold Windows service start can be delayed by signature/AV checks.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
+            // A previous session may still be shutting down when StartService
+            // reports ALREADY_RUNNING. Retry startup until the new pipe exists.
+            let start_error = crate::service::start_on_demand().err();
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -105,10 +105,7 @@ impl Broker {
                         return Err("Нельзя подтвердить сетевую службу".into());
                     }
                 }
-                verify_process_image(
-                    server_pid,
-                    &std::env::current_exe().map_err(|e| e.to_string())?,
-                )?;
+                crate::service::verify_server_pid(server_pid)?;
                 let hello = receive(&mut file, Duration::from_secs(10))?;
                 if hello["ready"] != true {
                     return Err("Сетевая служба не готова".into());
@@ -118,7 +115,9 @@ impl Broker {
                 });
             }
             if Instant::now() >= deadline {
-                return Err("Системная служба Atlas недоступна".into());
+                return Err(start_error.unwrap_or_else(|| {
+                    "Системная служба Atlas не открыла канал за 15 секунд".into()
+                }));
             }
             thread::sleep(Duration::from_millis(100));
         }

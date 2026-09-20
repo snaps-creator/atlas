@@ -227,6 +227,46 @@ pub fn start_on_demand() -> Result<(), String> {
     }
 }
 
+/// SCM is the authority for the service PID; querying a SYSTEM process directly
+/// requires permissions that the desktop user deliberately does not have.
+pub fn verify_server_pid(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return Err(windows_error("Диспетчер служб"));
+        }
+        let service = OpenServiceW(manager, wide(NAME).as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let error = windows_error("Проверка службы Atlas");
+            CloseServiceHandle(manager);
+            return Err(error);
+        }
+        let mut status: SERVICE_STATUS_PROCESS = std::mem::zeroed();
+        let mut needed = 0;
+        let ok = QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            &mut status as *mut _ as *mut u8,
+            std::mem::size_of_val(&status) as u32,
+            &mut needed,
+        );
+        let result = if ok == 0 {
+            Err(windows_error("Проверка процесса службы Atlas"))
+        } else if pid != 0 && status.dwProcessId == pid && status.dwCurrentState == SERVICE_RUNNING
+        {
+            Ok(())
+        } else {
+            Err("Канал не принадлежит запущенной службе Atlas".into())
+        };
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        result
+    }
+}
+
 pub fn uninstall() -> Result<(), String> {
     let name = wide(NAME);
     unsafe {

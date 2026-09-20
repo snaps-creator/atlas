@@ -644,6 +644,19 @@ pub fn network_service() -> Result<(), String> {
     service::run()
 }
 
+/// Exercises the installed service handshake without starting a network core.
+pub fn check_network_service() -> Result<(), String> {
+    let broker = broker::Broker::launch()?;
+    if service::verify_server_pid(std::process::id()).is_ok() {
+        return Err("Проверка службы приняла посторонний PID".into());
+    }
+    let status = broker.call("status", Value::Null)?;
+    if status["running"] != false || status["guard"] != false {
+        return Err("Проверка ожидала службу без активной VPN-сессии".into());
+    }
+    Ok(())
+}
+
 pub fn install_network_service() -> Result<(), String> {
     service::install()
 }
