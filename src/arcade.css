@@ -46,8 +46,8 @@ small { font-size: 11px; }
 aside { width: 265px; padding: 30px 20px 18px; }
 .content { margin-left: 265px; width: calc(100% - 265px); }
 .app, .content { min-height: calc(100vh / 1.2); }
-.brand { font-size: 30px; letter-spacing: .12em; font-weight: 700; text-transform: uppercase; margin: 0 10px 32px; }
-.brand-dot { color: var(--ink); }
+.brand { font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; font-size: 32px; letter-spacing: -1.8px; font-weight: 600; text-transform: none; margin: 0 12px 32px; }
+.brand-dot { color: var(--blue); }
 .workspace { border-color: #777; border-radius: 15px; padding: 15px; margin-bottom: 25px; }
 .workspace strong { font-size: 11px; }
 .nav-label { color: var(--muted); letter-spacing: .18em; }
@@ -128,9 +128,9 @@ td, th { padding: 17px 14px; }
 .rule-checks { padding: 25px; }
 .rule-table-row { padding: 18px; }
 .subscription { padding: 30px; }
-@media(max-height: 850px) {
+@media(max-height: 1100px) {
   aside { padding-top: 20px; }
-  .brand { margin-bottom: 20px; font-size: 26px; }
+  .brand { margin-bottom: 20px; }
   .workspace { margin-bottom: 15px; padding: 10px 12px; }
   nav { gap: 1px; }
   nav button { min-height: 32px; padding: 6px 10px; font-size: 10px; }
