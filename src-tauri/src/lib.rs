@@ -52,7 +52,7 @@ impl App {
                 *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p)});
             }
         }
-        json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.directory.join("tun-guard.active").exists(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs})
+        json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs})
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
         next.mode = "tun".into();

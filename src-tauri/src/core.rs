@@ -88,6 +88,14 @@ impl Core {
     pub fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         self.client().api(method, path, body)
     }
+    pub fn guard_active(&self) -> bool {
+        self.broker.as_ref().is_some_and(|broker| {
+            broker.alive()
+                && broker
+                    .call("status", Value::Null)
+                    .is_ok_and(|status| status["guard"] == true)
+        })
+    }
     pub fn running(&mut self) -> bool {
         if let Some(broker) = &self.broker {
             if !broker.alive() {
@@ -136,6 +144,7 @@ impl Core {
         self.child = Some(
             self.command()
                 .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .arg("-d")
                 .arg(&self.directory)
                 .arg("-f")
@@ -144,7 +153,15 @@ impl Core {
                 .map_err(|_| "Не удалось запустить Mihomo")?,
         );
         self.logs.lock().map_err(|_| "Журнал недоступен")?.clear();
-        if let Some(output) = self.child.as_mut().and_then(|c| c.stdout.take()) {
+        let child = self.child.as_mut().unwrap();
+        let mut outputs: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
+        if let Some(output) = child.stdout.take() {
+            outputs.push(Box::new(output));
+        }
+        if let Some(output) = child.stderr.take() {
+            outputs.push(Box::new(output));
+        }
+        for output in outputs {
             let logs = self.logs.clone();
             std::thread::spawn(move || {
                 use std::io::BufRead;
@@ -168,17 +185,29 @@ impl Core {
                 return Err(e);
             }
         }
-        for _ in 0..50 {
+        // Mihomo exposes its controller before creating the TUN adapter.
+        // A false enable flag during that interval is pending, not a failure.
+        let deadline = Instant::now() + Duration::from_secs(if s.mode == "tun" { 60 } else { 5 });
+        while Instant::now() < deadline {
+            if s.mode == "tun"
+                && self.logs.lock().is_ok_and(|logs| {
+                    logs.iter()
+                        .any(|line| line.to_lowercase().contains("start tun listening error"))
+                })
+            {
+                break;
+            }
             if !self.running() {
                 break;
             }
             if self.api("GET", "/version", None).is_ok() {
                 if s.mode == "tun" {
-                    let config = self.api("GET", "/configs", None)?;
-                    if config["tun"]["enable"] != true {
-                        let detail = self.tun_error();
-                        self.stop()?;
-                        return Err(detail);
+                    let ready = self
+                        .api("GET", "/configs", None)
+                        .is_ok_and(|config| config["tun"]["enable"] == true);
+                    if !ready {
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
                     }
                 }
                 self.api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected})))?;
@@ -188,8 +217,13 @@ impl Core {
             }
             thread::sleep(Duration::from_millis(100));
         }
+        let error = if s.mode == "tun" {
+            self.tun_error()
+        } else {
+            "Mihomo не прошёл проверку запуска".into()
+        };
         self.stop()?;
-        Err("Mihomo не прошёл проверку запуска".into())
+        Err(error)
     }
     fn commit(&self, path: &std::path::Path) -> Result<(), String> {
         let current = self.directory.join("current.yaml");
@@ -206,13 +240,16 @@ impl Core {
         let detail = self.logs.lock().ok().and_then(|logs| {
             logs.iter()
                 .rev()
-                .find(|line| line.contains("Start TUN listening error"))
+                .find(|line| {
+                    let lower = line.to_lowercase();
+                    lower.contains("tun") && (lower.contains("error") || lower.contains("fatal"))
+                })
                 .cloned()
         });
         detail
             .map(|line| format!("Не удалось создать TUN: {line}"))
             .unwrap_or_else(|| {
-                "Ядро не создало TUN. Подключение отменено, защитные блокировки сняты.".into()
+                "Не дождались готовности TUN: ядро завершилось или истекло время ожидания. Подключение отменено.".into()
             })
     }
     pub fn apply(&mut self, s: &Settings) -> Result<(), String> {
@@ -289,6 +326,7 @@ mod integration_tests {
         std::fs::write(&marker, b"stale").unwrap();
         // A deliberately nonexistent executable proves stop cannot launch a core/helper.
         let mut core = Core::new(directory.join("missing.exe"), directory.clone());
+        assert!(!core.guard_active()); // An on-disk marker does not prove live WFP filters.
         core.stop().unwrap();
         core.stop().unwrap();
         assert!(!marker.exists());
