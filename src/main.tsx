@@ -170,11 +170,11 @@ function App() {
         return;
       }
       if (alive)
-        setProtection({
-          secure: false,
+        setProtection((current) => ({
+          ...current,
           detail: "Проверяем защищённый путь трафика…",
           checkedAt: 0,
-        });
+        }));
       try {
         const result = await request<ProtectionStatus>("protection_status");
         if (alive) setProtection(result);

@@ -640,10 +640,6 @@ pub fn run() {
         .expect("Atlas failed to initialize");
 }
 
-pub fn network_helper(parent: u32, pipe: &str) -> Result<(), String> {
-    broker::serve(parent, pipe)
-}
-
 pub fn network_service() -> Result<(), String> {
     service::run()
 }

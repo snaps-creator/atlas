@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::Path;
 use winreg::{enums::*, RegKey};
 const INTERNET: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct Snapshot {
     enabled: Option<u32>,
     server: Option<String>,
@@ -30,37 +30,6 @@ fn notify() {
             0,
         );
     }
-}
-pub fn enable(path: &Path) -> Result<(), String> {
-    let k = key()?;
-    if path.exists() {
-        return Err("Есть незавершённое восстановление системного прокси".into());
-    }
-    let s = Snapshot {
-        enabled: k.get_value("ProxyEnable").ok(),
-        server: k.get_value("ProxyServer").ok(),
-        bypass: k.get_value("ProxyOverride").ok(),
-        pac: k.get_value("AutoConfigURL").ok(),
-    };
-    std::fs::write(path, serde_json::to_vec(&s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let result = (|| {
-        k.set_value("ProxyServer", &"127.0.0.1:17890")
-            .map_err(|e| e.to_string())?;
-        k.set_value("ProxyOverride", &"<local>;localhost;127.*;[::1]")
-            .map_err(|e| e.to_string())?;
-        if s.pac.is_some() {
-            k.delete_value("AutoConfigURL").map_err(|e| e.to_string())?
-        }
-        k.set_value("ProxyEnable", &1u32)
-            .map_err(|e| e.to_string())?;
-        notify();
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = restore(path);
-    }
-    result
 }
 pub fn restore(path: &Path) -> Result<(), String> {
     if !path.exists() {

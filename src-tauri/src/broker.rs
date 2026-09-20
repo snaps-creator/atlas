@@ -18,7 +18,6 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::*,
     System::{Pipes::*, Threading::*},
-    UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
 };
 const LIMIT: usize = 16 * 1024 * 1024;
 const SERVICE_PIPE: &str = r"\\.\pipe\Atlas-Network-Service";
@@ -83,18 +82,17 @@ fn receive(file: &mut File, timeout: Duration) -> Result<Value, String> {
 }
 pub struct Broker {
     pipe: Mutex<File>,
-    process: isize,
 }
 impl Broker {
     pub fn launch() -> Result<Self, String> {
-        let _ = crate::service::start_on_demand();
-        if let Ok(service) = Self::connect_service() {
-            return Ok(service);
-        }
-        Self::launch_elevated()
+        crate::service::start_on_demand().map_err(|error| {
+            format!("{error}. Переустановите Atlas: сетевой модуль не запускается без UAC.")
+        })?;
+        Self::connect_service()
     }
     fn connect_service() -> Result<Self, String> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // A cold Windows service start can be delayed by signature/AV checks.
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .read(true)
@@ -117,7 +115,6 @@ impl Broker {
                 }
                 return Ok(Self {
                     pipe: Mutex::new(file),
-                    process: 0,
                 });
             }
             if Instant::now() >= deadline {
@@ -126,86 +123,7 @@ impl Broker {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    fn launch_elevated() -> Result<Self, String> {
-        unsafe {
-            let pipe_name = format!(r"\\.\pipe\Atlas-{}", uuid::Uuid::new_v4().simple());
-            let pipe = CreateNamedPipeW(
-                wide(&pipe_name).as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                65536,
-                65536,
-                0,
-                std::ptr::null(),
-            );
-            if pipe == INVALID_HANDLE_VALUE {
-                return Err(error("Не удалось создать канал сетевой службы"));
-            }
-            let mut file = File::from_raw_handle(pipe);
-            let exe = wide(
-                &std::env::current_exe()
-                    .map_err(|e| e.to_string())?
-                    .to_string_lossy(),
-            );
-            let verb = wide("runas");
-            let args = wide(&format!(
-                "--network-helper {} {}",
-                std::process::id(),
-                pipe_name
-            ));
-            let mut launch: SHELLEXECUTEINFOW = std::mem::zeroed();
-            launch.cbSize = std::mem::size_of_val(&launch) as u32;
-            launch.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
-            launch.lpVerb = verb.as_ptr();
-            launch.lpFile = exe.as_ptr();
-            launch.lpParameters = args.as_ptr();
-            launch.nShow = SW_HIDE;
-            if ShellExecuteExW(&mut launch) == 0 {
-                return Err(error("Запуск сетевой службы отменён или запрещён"));
-            }
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let connected = ConnectNamedPipe(pipe, std::ptr::null_mut()) != 0
-                    || GetLastError() == ERROR_PIPE_CONNECTED;
-                if connected {
-                    break;
-                }
-                if Instant::now() > deadline
-                    || WaitForSingleObject(launch.hProcess, 0) == WAIT_OBJECT_0
-                {
-                    CloseHandle(launch.hProcess);
-                    return Err("Сетевая служба не подключилась".into());
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            let mut peer = 0;
-            if GetNamedPipeClientProcessId(pipe, &mut peer) == 0
-                || peer != GetProcessId(launch.hProcess)
-            {
-                CloseHandle(launch.hProcess);
-                return Err("Не удалось подтвердить сетевую службу".into());
-            }
-            let hello = receive(&mut file, Duration::from_secs(10))?;
-            if hello["ready"] != true {
-                CloseHandle(launch.hProcess);
-                return Err("Сетевая служба не готова".into());
-            }
-            let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
-            if SetNamedPipeHandleState(pipe, &mode, std::ptr::null(), std::ptr::null()) == 0 {
-                CloseHandle(launch.hProcess);
-                return Err(error("Не удалось настроить канал сетевой службы"));
-            }
-            Ok(Self {
-                pipe: Mutex::new(file),
-                process: launch.hProcess as isize,
-            })
-        }
-    }
     pub fn alive(&self) -> bool {
-        if self.process != 0 {
-            return unsafe { WaitForSingleObject(self.process as _, 0) == WAIT_TIMEOUT };
-        }
         let Ok(file) = self.pipe.lock() else {
             return false;
         };
@@ -240,15 +158,6 @@ impl Broker {
             Err(e.into())
         } else {
             Ok(reply["result"].clone())
-        }
-    }
-}
-impl Drop for Broker {
-    fn drop(&mut self) {
-        if self.process != 0 {
-            unsafe {
-                CloseHandle(self.process as _);
-            }
         }
     }
 }
@@ -390,40 +299,6 @@ fn allowed_api(method: &str, path: &str) -> bool {
     }
     false
 }
-pub fn serve(parent: u32, pipe_name: &str) -> Result<(), String> {
-    if !pipe_name.starts_with(r"\\.\pipe\Atlas-") || pipe_name.len() > 100 {
-        return Err("Некорректный канал".into());
-    }
-    let parent_handle =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, parent) };
-    if parent_handle.is_null() {
-        return Err("Родительский процесс недоступен".into());
-    }
-    if let Err(error) =
-        verify_process_image(parent, &std::env::current_exe().map_err(|e| e.to_string())?)
-    {
-        unsafe {
-            CloseHandle(parent_handle);
-        }
-        return Err(error);
-    }
-    let pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_name)
-        .map_err(|_| "Канал Атласа недоступен")?;
-    let mut server_pid = 0;
-    unsafe {
-        if GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut server_pid) == 0
-            || server_pid != parent
-        {
-            CloseHandle(parent_handle);
-            return Err("Не удалось подтвердить интерфейс Атласа".into());
-        }
-    }
-    run_channel(pipe, Some(parent_handle))
-}
-
 fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), String> {
     let directory = secure_directory()?;
     let mut core = Core::privileged(directory.join("mihomo.exe"), directory.clone());
