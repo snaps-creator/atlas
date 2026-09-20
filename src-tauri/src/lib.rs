@@ -97,9 +97,7 @@ impl App {
                     let _ = windows::restore(&self.core.directory.join("proxy-restore.json"));
                     self.status = "Error".into();
                     self.error = Some(e.clone());
-                    if self.settings.mode != "tun" {
-                        let _ = self.core.stop();
-                    }
+                    let _ = self.core.stop();
                     return Err(e);
                 }
                 self.status = "Connected".into();
@@ -114,9 +112,7 @@ impl App {
                 Ok(())
             }
             Err(e) => {
-                if self.settings.mode != "tun" {
-                    let _ = self.core.stop();
-                }
+                let _ = self.core.stop();
                 let _ = windows::restore(&self.core.directory.join("proxy-restore.json"));
                 self.status = "Error".into();
                 self.error = Some(e.clone());
@@ -126,8 +122,8 @@ impl App {
         }
     }
     fn disconnect(&mut self) -> Result<(), String> {
-        windows::restore(&self.core.directory.join("proxy-restore.json"))?;
-        self.core.stop()?;
+        let stopped = self.core.stop();
+        let restored = windows::restore(&self.core.directory.join("proxy-restore.json"));
         self.status = "Disconnected".into();
         self.settings.was_connected = false;
         self.store.save(&self.settings)?;
@@ -135,6 +131,8 @@ impl App {
             "INFO",
             "Соединение отключено; сетевые настройки восстановлены",
         );
+        stopped?;
+        restored?;
         Ok(())
     }
     fn prepare_restart(&mut self) -> Result<(), String> {
@@ -394,11 +392,9 @@ pub fn cleanup() -> Result<(), String> {
     )
     .join("net.atlasvpn.desktop");
     windows::restore(&dir.join("proxy-restore.json"))?;
-    if dir.join("tun-guard.active").exists() {
-        let broker = broker::Broker::launch()?;
-        broker.call("stop", Value::Null)?;
-        std::fs::remove_file(dir.join("tun-guard.active")).map_err(|e| e.to_string())?;
-    }
+    // This command runs elevated from the uninstaller. Cleanup must never launch a VPN.
+    network_guard::clear()?;
+    let _ = std::fs::remove_file(dir.join("tun-guard.active"));
     use winreg::{enums::*, RegKey};
     for path in [
         r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -524,6 +520,14 @@ pub fn run() {
                 storage::Store::open(&dir.join("atlas.db")).map_err(std::io::Error::other)?;
             let mut settings = store.load().map_err(std::io::Error::other)?;
             settings.mode = "tun".into();
+            // Repair stale startup registration to match the saved user preference.
+            if !settings.startup.launch_with_windows {
+                let _ = app.autolaunch().disable();
+                if std::env::args().any(|arg| arg == "--autostart") {
+                    app.handle().exit(0);
+                    return Ok(());
+                }
+            }
             let binary = app.path().resource_dir()?.join("resources/mihomo.exe");
             let core = core::Core::new(binary, dir);
             let auto = settings.startup.auto_connect
@@ -580,9 +584,9 @@ pub fn run() {
                             let state = handle.state::<Shared>();
                             if let Ok(mut a) = state.lock() {
                                 if action == "quit" {
-                                    if a.disconnect().is_ok() {
-                                        handle.exit(0)
-                                    }
+                                    let _ = a.disconnect();
+                                    drop(a);
+                                    handle.exit(0);
                                 } else if action == "restart" {
                                     if a.prepare_restart().is_ok() {
                                         drop(a);

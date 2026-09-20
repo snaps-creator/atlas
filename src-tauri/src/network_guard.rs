@@ -79,12 +79,39 @@ pub fn clear() -> Result<(), String> {
     }
 }
 pub struct Guard(Engine);
+
+/// A competing full-tunnel must be disconnected by its owner before Atlas connects.
+/// Reading routes has no side effects; never delete another client's routes/filters.
+pub fn check_competing_routes() -> Result<(), String> {
+    use windows_sys::Win32::{
+        NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2},
+        Networking::WinSock::AF_UNSPEC,
+    };
+    unsafe {
+        let mut table = ptr::null_mut();
+        checked(
+            GetIpForwardTable2(AF_UNSPEC, &mut table),
+            "проверка маршрутов перед подключением",
+        )?;
+        let rows =
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let conflict = rows
+            .iter()
+            .any(|row| row.DestinationPrefix.PrefixLength == 1 && row.Loopback == 0);
+        FreeMibTable(table.cast());
+        if conflict {
+            return Err("Обнаружен активный маршрут другого VPN. Отключите его перед подключением Atlas. Сетевые настройки не изменены.".into());
+        }
+    }
+    Ok(())
+}
+
 impl Guard {
-    pub fn prepare(core: &Path) -> Result<Self, String> {
+    pub fn prepare(_core: &Path) -> Result<Self, String> {
         clear()?; // Remove only Atlas-owned filters left by older releases.
-        let guard = Self(Engine::with_session(true)?);
-        guard.policy(core, false)?;
-        Ok(guard)
+                  // Do not block the entire host while the adapter has not even been created.
+                  // The caller reports Connected only after install has committed the policy.
+        Ok(Self(Engine::with_session(true)?))
     }
     pub fn install(&self, core: &Path) -> Result<(), String> {
         self.policy(core, true)

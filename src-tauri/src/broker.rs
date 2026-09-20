@@ -87,6 +87,7 @@ pub struct Broker {
 }
 impl Broker {
     pub fn launch() -> Result<Self, String> {
+        let _ = crate::service::start_on_demand();
         if let Ok(service) = Self::connect_service() {
             return Ok(service);
         }
@@ -226,7 +227,15 @@ impl Broker {
             .lock()
             .map_err(|_| "Ошибка канала сетевой службы")?;
         send(&mut file, &json!({"op":op,"payload":payload}))?;
-        let reply = receive(&mut file, Duration::from_secs(45))?;
+        // Starting can include driver installation; its IPC deadline must outlive readiness.
+        let reply = receive(
+            &mut file,
+            Duration::from_secs(if matches!(op, "start" | "apply") {
+                120
+            } else {
+                45
+            }),
+        )?;
         if let Some(e) = reply["error"].as_str() {
             Err(e.into())
         } else {
@@ -423,7 +432,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
     loop {
-        if parent_handle.is_none() && crate::service::is_stopping() {
+        if crate::service::is_stopping() {
             break;
         }
         if let Some(parent) = parent_handle {
@@ -463,6 +472,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;
+                network_guard::check_competing_routes()?;
                 core.validate(&s)?;
                 guard = Some(network_guard::Guard::prepare(&core.binary)?);
                 if let Err(e) = core.start(&s) {
@@ -470,14 +480,24 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                     guard = None;
                     return Err(e);
                 }
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + Duration::from_secs(60);
                 loop {
+                    if crate::service::is_stopping()
+                        || parent_handle.is_some_and(
+                            |parent| unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0,
+                        )
+                    {
+                        let _ = core.stop();
+                        guard = None;
+                        return Err("Подключение отменено: Atlas завершает работу".into());
+                    }
                     match guard.as_ref().unwrap().install(&core.binary) {
                         Ok(()) => break,
-                        Err(e) if Instant::now() >= deadline => {
+                        Err(e) if !core.running() || Instant::now() >= deadline => {
+                            let logs = core.client().logs().unwrap_or_default();
                             let _ = core.stop();
                             guard = None;
-                            return Err(e);
+                            return Err(format!("{e}. Ядро: {logs:?}"));
                         }
                         Err(_) => thread::sleep(Duration::from_millis(100)),
                     }
@@ -490,12 +510,30 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;
                 core.apply(&s)?;
-                if let Some(policy) = &guard {
-                    if let Err(error) = policy.install(&core.binary) {
+                // API success alone is not proof of a working TUN adapter.
+                // Apply the same adapter-readiness check used for initial startup.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while let Some(policy) = &guard {
+                    match policy.install(&core.binary) {
+                        Ok(()) => break,
+                        Err(error) if !core.running() || Instant::now() >= deadline => {
+                            let logs = core.client().logs().unwrap_or_default();
+                            let _ = core.stop();
+                            guard = None;
+                            configured = false;
+                            return Err(format!("{error}. Ядро: {logs:?}"));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(100)),
+                    }
+                    if crate::service::is_stopping()
+                        || parent_handle.is_some_and(
+                            |parent| unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0,
+                        )
+                    {
                         let _ = core.stop();
                         guard = None;
                         configured = false;
-                        return Err(error);
+                        return Err("Обновление подключения отменено".into());
                     }
                 }
                 Ok(json!({}))
@@ -511,10 +549,11 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 core.api(method, path, None)
             }
             "stop" => {
-                core.stop()?;
+                let stopped = core.stop();
                 guard = None;
-                network_guard::clear()?;
                 explicit_stop = true;
+                stopped?;
+                network_guard::clear()?;
                 Ok(json!({}))
             }
             _ => Err("Неизвестная команда сетевой службы".into()),
@@ -530,7 +569,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
             break;
         }
     }
-    core.stop()?;
+    let stopped = core.stop();
     drop(core);
     drop(guard);
     if let Some(parent) = parent_handle {
@@ -546,7 +585,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     {
         let _ = std::fs::remove_dir_all(&directory);
     }
-    Ok(())
+    stopped
 }
 
 pub fn serve_service() -> Result<(), String> {
@@ -583,7 +622,11 @@ pub fn serve_service() -> Result<(), String> {
                 return Err(error("Не удалось открыть канал сетевой службы"));
             }
             let mut connected = false;
+            let deadline = Instant::now() + Duration::from_secs(30);
             while !crate::service::is_stopping() {
+                if Instant::now() >= deadline {
+                    break;
+                }
                 if ConnectNamedPipe(handle, std::ptr::null_mut()) != 0
                     || GetLastError() == ERROR_PIPE_CONNECTED
                 {
@@ -615,7 +658,17 @@ pub fn serve_service() -> Result<(), String> {
                 continue;
             }
             let file = File::from_raw_handle(handle);
-            let _ = run_channel(file, None);
+            let parent = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                0,
+                client_pid,
+            );
+            if parent.is_null() {
+                break;
+            }
+            let _ = run_channel(file, Some(parent));
+            // A service session belongs to a single Atlas connection, not the OS lifetime.
+            break;
         }
     }
     Ok(())
