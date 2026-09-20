@@ -1,6 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { check } from "@tauri-apps/plugin-updater";
+import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { startUpdatePolling } from "./updatePolling";
 import {
   Activity,
   ArrowDown,
@@ -48,7 +51,6 @@ type ProtectionStatus = {
   detail: string;
   checkedAt: number;
 };
-const APP_VERSION_LABEL = "Beta v1";
 const autoTestIntervals = [30, 60, 120, 300, 600, 900, 1800, 3600];
 function intervalLabel(seconds: number) {
   return seconds < 60 ? `${seconds} сек.` : `${seconds / 60} мин.`;
@@ -76,6 +78,18 @@ const pageNames: Record<string, string> = {
   Settings: "Настройки",
 };
 function App() {
+  const [versionLabel, setVersionLabel] = useState("");
+  useEffect(() => {
+    if (!native) return;
+    void getVersion()
+      .then(async (version) => {
+        const beta = /^1\.0\.0-beta\.(\d+)$/.exec(version);
+        const label = beta ? `Beta ${beta[1]}` : version;
+        setVersionLabel(label);
+        await getCurrentWindow().setTitle(`Atlas — ${label}`);
+      })
+      .catch((reason) => console.warn("Не удалось прочитать версию Atlas", reason));
+  }, []);
   const [page, setPage] = useState("Dashboard");
   const [data, setData] = useState<Snapshot | null>(null);
   const [error, setError] = useState("");
@@ -103,7 +117,7 @@ function App() {
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [logLevel, setLogLevel] = useState("ALL");
   const [sortLatency, setSortLatency] = useState(false);
-  const updateCheckStarted = useRef(false);
+  const protectionCheckRunning = useRef(false);
   const [availableUpdate, setAvailableUpdate] =
     useState<AvailableUpdate | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
@@ -130,16 +144,12 @@ function App() {
     return () => clearInterval(timer);
   }, [refresh]);
   useEffect(() => {
-    if (!native || updateCheckStarted.current) return;
-    updateCheckStarted.current = true;
-    void check()
-      .then((update) => {
-        if (update) setAvailableUpdate(update);
-      })
-      .catch((reason) => {
-        // Update checks must never delay or block the main application.
-        console.warn("Не удалось проверить обновления Atlas", reason);
-      });
+    if (!native) return;
+    return startUpdatePolling(
+      () => check({ timeout: 15000 }),
+      setAvailableUpdate,
+      (reason) => console.warn("Не удалось проверить обновления Atlas", reason),
+    );
   }, []);
   useEffect(() => {
     if (data) document.documentElement.dataset.theme = data.settings.theme;
@@ -169,6 +179,8 @@ function App() {
           });
         return;
       }
+      if (protectionCheckRunning.current) return;
+      protectionCheckRunning.current = true;
       if (alive)
         setProtection((current) => ({
           ...current,
@@ -185,10 +197,12 @@ function App() {
             detail: `Не удалось подтвердить защиту: ${String(reason)}`,
             checkedAt: Math.floor(Date.now() / 1000),
           });
+      } finally {
+        protectionCheckRunning.current = false;
       }
     };
     void inspect();
-    const timer = window.setInterval(inspect, 5 * 60 * 1000);
+    const timer = window.setInterval(inspect, 30 * 1000);
     return () => {
       alive = false;
       window.clearInterval(timer);
@@ -397,7 +411,7 @@ function App() {
             </span>
           </div>
           <div className="version">
-            Атлас для Windows <span>{APP_VERSION_LABEL}</span>
+            Атлас для Windows <span>{versionLabel}</span>
           </div>
         </div>
       </aside>
@@ -1428,7 +1442,7 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Об этой сборке</h2>
-                    <p>Atlas {APP_VERSION_LABEL} · Mihomo 1.19.31 · React + Tauri + Rust</p>
+                    <p>Atlas {versionLabel} · Mihomo 1.19.31 · React + Tauri + Rust</p>
                   </section>
                 </>
               )}

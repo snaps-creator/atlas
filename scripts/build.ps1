@@ -9,4 +9,5 @@ try {
     if ($LASTEXITCODE) { throw 'Rust tests failed' }
     npm.cmd run tauri build
     if ($LASTEXITCODE) { throw 'Installer build failed' }
+    & (Join-Path $PSScriptRoot 'copy-installer.ps1')
 } finally { Pop-Location }

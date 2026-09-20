@@ -58,7 +58,10 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         }
         doc["ipv6"] = json!(true);
         doc["tun"]["device"] = json!("Atlas-TUN");
-        doc["tun"]["inet6-address"] = json!(["fdfe:dcba:9876::1/126"]);
+        // The top-level Mihomo TUN IPv4 address derives from fake-ip-range.
+        // Do not reuse another client's default 198.18.0.1 address.
+        doc["dns"]["fake-ip-range"] = json!("198.19.0.1/16");
+        doc["tun"]["inet6-address"] = json!(["fd72:6174:6c61::1/126"]);
         doc["tun"]["route-address"] = json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
         doc["tun"]["dns-hijack"] = json!(["any:53", "tcp://any:53"]);
         doc["tun"]["udp-timeout"] = json!(300);
@@ -111,6 +114,8 @@ mod tests {
         assert_eq!(tun["tun"]["enable"], true);
         assert_eq!(tun["tun"]["strict-route"], true);
         assert_eq!(tun["tun"]["device"], "Atlas-TUN");
+        assert_eq!(tun["dns"]["fake-ip-range"], "198.19.0.1/16");
+        assert_eq!(tun["tun"]["inet6-address"][0], "fd72:6174:6c61::1/126");
         assert_eq!(tun["ipv6"], true); // Keep IPv6 captured even when resolution is disabled.
         assert_eq!(tun["rules"][0], "IP-CIDR6,::/0,REJECT,no-resolve");
         assert_eq!(

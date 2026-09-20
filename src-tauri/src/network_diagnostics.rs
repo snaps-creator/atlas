@@ -5,7 +5,7 @@ use crate::{
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -55,7 +55,10 @@ fn summarize_protection(settings: &Settings, checks: &[Value]) -> Value {
         "UDP через TUN",
         "DNS / утечки",
     ];
-    if required.iter().any(|name| !checks.iter().any(|item| item["name"] == **name)) {
+    if required
+        .iter()
+        .any(|name| !checks.iter().any(|item| item["name"] == **name))
+    {
         return json!({"secure":false,"detail":"Проверка защиты не завершена: отсутствуют обязательные результаты.","checkedAt":crate::model::now()});
     }
     let failed = required.iter().find_map(|name| {
@@ -114,6 +117,42 @@ fn follows_route(c: &Value, route: &Route) -> bool {
         Route::Direct => tun(c) && chain_has(c, "DIRECT") && !chain_has(c, "REJECT"),
         Route::Block => rejected(c),
     }
+}
+
+// The probe is routed by the same rules as other traffic. MATCH is only the
+// fallback; e.g. google.com can select ATLAS while the default is DIRECT.
+fn configured_route(c: &Value, settings: &Settings) -> Option<Route> {
+    let kind = c["rule"].as_str()?.replace('-', "").to_uppercase();
+    if kind == "MATCH" {
+        return Some(settings.default_route.clone());
+    }
+    let payload = c["rulePayload"].as_str()?;
+    settings
+        .groups
+        .iter()
+        .filter(|group| group.enabled)
+        .find_map(|group| {
+            group
+                .rules
+                .iter()
+                .filter_map(|rule| crate::rules::normalize(rule).ok())
+                .find_map(|rule| {
+                    let matches = if rule.kind == "PROCESS-DOMAIN" && kind == "AND" {
+                        rule.value.split_once('|').is_some_and(|(process, domain)| {
+                            payload == format!("((PROCESS-NAME,{process}),(DOMAIN,{domain}))")
+                        })
+                    } else {
+                        let same_kind = rule.kind.replace('-', "") == kind
+                            || (rule.kind == "IP-CIDR6" && kind == "IPCIDR");
+                        same_kind && rule.value.eq_ignore_ascii_case(payload)
+                    };
+                    matches.then(|| group.route.clone())
+                })
+        })
+}
+
+fn follows_configured_route(c: &Value, settings: &Settings) -> bool {
+    configured_route(c, settings).is_some_and(|route| follows_route(c, &route))
 }
 
 fn rejected(c: &Value) -> bool {
@@ -227,6 +266,17 @@ fn https_probe(host: &str) -> Result<String, ()> {
     response.text().map_err(|_| ())
 }
 
+// A TUN stack can accept TCP locally before REJECT is applied upstream.
+// Only an authenticated remote TLS/HTTP response proves external connectivity.
+fn https_reachable(target: SocketAddr) -> bool {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .is_ok_and(|http| http.get(format!("https://{target}/")).send().is_ok())
+}
+
 fn dns_query() -> Result<(u16, usize), ()> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|_| ())?;
     let source_port = socket.local_addr().map_err(|_| ())?.port();
@@ -300,13 +350,12 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
         let confirmed = !flows.is_empty()
             && flows
                 .iter()
-                .all(|connection| follows_route(connection, &settings.default_route));
+                .all(|connection| follows_configured_route(connection, settings));
         let ok = Some(valid && confirmed && settings.mode == "tun");
         let detail = if valid && confirmed {
             format!(
-                "Ответ {} через TUN по маршруту {:?}. Запрос выполнен без системного прокси.",
-                response.unwrap().trim(),
-                settings.default_route
+                "Ответ {} через TUN по настроенным правилам. Запрос выполнен без системного прокси.",
+                response.unwrap().trim()
             )
         } else if valid {
             "Ответ получен, но соединение не найдено среди TUN-потоков Atlas.".into()
@@ -320,7 +369,7 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
         let target: SocketAddr = IPV6_TEST_ADDRESS.parse().unwrap();
         let addresses = HashSet::from([target.ip()]);
         let (connected, entries) = observe(&client, || {
-            let connected = TcpStream::connect_timeout(&target, Duration::from_secs(5)).is_ok();
+            let connected = https_reachable(target);
             std::thread::sleep(Duration::from_millis(300));
             connected
         });
@@ -338,7 +387,7 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
         let detail: String = if connected && tunneled {
             "IPv6-соединение фактически прошло через TUN → ATLAS.".into()
         } else if safely_rejected {
-            "Тестовое IPv6-соединение не установлено: прямой выход IPv6 фактически заблокирован."
+            "Проверочный HTTPS-запрос по IPv6 заблокирован; неподтверждённых маршрутов не обнаружено."
                 .into()
         } else if connected {
             "IPv6-соединение установлено вне подтверждённого пути TUN → ATLAS.".into()
@@ -379,13 +428,17 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
     });
     results.push(check(
         "UDP через TUN",
-        flow.map(|connection| udp.is_ok() && follows_route(connection, &settings.default_route)),
+        flow.map(|connection| udp.is_ok() && follows_configured_route(connection, settings)),
         if udp.is_ok()
-            && flow.is_some_and(|connection| follows_route(connection, &settings.default_route))
+            && flow.is_some_and(|connection| follows_configured_route(connection, settings))
         {
             "Ответ STUN и совпадающий исходный порт подтверждают UDP через TUN по настроенному маршруту."
+        } else if udp.is_err() {
+            "STUN-сервер не ответил: передача UDP не подтверждена. Это не доказывает утечку."
+        } else if flow.is_none() {
+            "Ответ STUN получен, но тестовый UDP-поток не найден в Atlas."
         } else {
-            "Нет ответа STUN или подтверждения маршрута его сокета через TUN → ATLAS."
+            "Ответ STUN получен, но путь UDP не соответствует сработавшему правилу Atlas."
         },
     ));
 
@@ -447,6 +500,31 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_tcp_accept_is_not_remote_https_connectivity() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut socket, _)) = listener.accept() {
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut hello = [0; 1024];
+                    let _ = socket.read(&mut hello);
+                    return true; // Accept TCP, then reject without a TLS response.
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        });
+        assert!(!https_reachable(address));
+        assert!(server.join().unwrap());
+    }
+
     fn protected_checks() -> Vec<Value> {
         [
             "Ядро",
@@ -458,6 +536,37 @@ mod tests {
         .into_iter()
         .map(|name| check(name, Some(true), "ok"))
         .collect()
+    }
+
+    #[test]
+    fn probes_follow_rule_overrides_instead_of_default_route() {
+        let mut settings = Settings::default();
+        settings.default_route = Route::Direct;
+        settings.groups = crate::rules::import("rules:\n - DOMAIN-SUFFIX,google.com,ATLAS\n - IP-CIDR,192.0.2.0/24,DIRECT,no-resolve\n - DOMAIN,blocked.example,REJECT").unwrap().groups;
+        let mut flow = json!({"metadata":{"type":"Tun","network":"udp"},"rule":"DomainSuffix","rulePayload":"google.com","chains":["node","ATLAS"]});
+        assert!(follows_configured_route(&flow, &settings));
+        flow["chains"] = json!(["DIRECT"]);
+        assert!(!follows_configured_route(&flow, &settings));
+        settings.default_route = Route::Proxy;
+        flow["rule"] = json!("IPCIDR");
+        flow["rulePayload"] = json!("192.0.2.0/24");
+        assert!(follows_configured_route(&flow, &settings));
+        flow["rule"] = json!("Match");
+        assert!(!follows_configured_route(&flow, &settings));
+        flow["chains"] = json!(["node", "ATLAS"]);
+        assert!(follows_configured_route(&flow, &settings));
+        flow["rule"] = json!("Domain");
+        flow["rulePayload"] = json!("blocked.example");
+        assert!(!follows_configured_route(&flow, &settings));
+        flow["chains"] = json!(["REJECT"]);
+        assert!(follows_configured_route(&flow, &settings));
+        flow["rulePayload"] = json!("unknown.example");
+        assert!(!follows_configured_route(&flow, &settings));
+        flow["rule"] = json!("DomainSuffix");
+        flow["rulePayload"] = json!("google.com");
+        flow["chains"] = json!(["node", "ATLAS"]);
+        settings.groups[0].enabled = false;
+        assert!(!follows_configured_route(&flow, &settings));
     }
 
     #[test]

@@ -32,6 +32,7 @@ $config = Join-Path $OutputDirectory 'probe.yaml'
 @'
 mode: direct
 log-level: debug
+external-controller: 127.0.0.1:19992
 ipv6: true
 tun:
   enable: true
@@ -44,13 +45,28 @@ tun:
   dns-hijack: []
 dns:
   enable: false
-  fake-ip-range: 192.0.2.1/30
+  fake-ip-range: 198.19.0.1/16
 '@ | Set-Content -LiteralPath $config -Encoding utf8
 $process = $null
+$http = New-Object System.Net.WebClient
+$http.Proxy = $null
+# Warm up PowerShell JSON and HTTP code before starting the measured process.
+'{}' | ConvertFrom-Json | Out-Null
+try { $null = $http.DownloadString('http://127.0.0.1:19992/configs') } catch {}
 try {
     $process = Start-Process -FilePath $binary -ArgumentList @('-d', ('"' + $OutputDirectory + '"'), '-f', ('"' + $config + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log')
     $deadline = (Get-Date).AddSeconds(60)
     $adapter = $null
+    $observations = @()
+    for ($sample = 0; $sample -lt 100; $sample++) {
+        try {
+            $api = $http.DownloadString('http://127.0.0.1:19992/configs') | ConvertFrom-Json
+            $observations += [pscustomobject]@{Time=[DateTime]::UtcNow.ToString('o');TunEnabled=$api.tun.enable}
+            if ($api.tun.enable) { break }
+        } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    $observations | ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'api-readiness.json')
     do {
         Start-Sleep -Milliseconds 500
         $process.Refresh()
@@ -58,6 +74,7 @@ try {
     } while (-not $adapter -and -not $process.HasExited -and (Get-Date) -lt $deadline)
     [pscustomobject]@{ Found=[bool]$adapter; Status=$adapter.Status; InterfaceIndex=$adapter.ifIndex; CoreExited=$process.HasExited } | ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'result.json')
 } finally {
+    $http.Dispose()
     if ($process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force
         $process.WaitForExit()
