@@ -59,10 +59,13 @@ nav button.active svg { color: var(--link); }
 .privacy.protected { color: #2fa36f; }
 .privacy.unprotected { color: #e45b65; }
 .privacy small { margin-top: 5px; line-height: 1.6; }
+.privacy .protection-check-spinner { display: inline-block; margin-left: 8px; vertical-align: middle; }
 .version { font-size: 9px; gap: 8px; }
 .version .sidebar-update { border-radius: 10px; padding: 8px; }
 .topbar { height: 70px; padding: 0 40px; letter-spacing: .08em; text-transform: uppercase; }
 .dot.online { background: var(--ink); }
+.topbar .top-status:has(.dot.online) { color: #2fa36f; }
+.top-status .dot.online { background: #2fa36f; }
 .content main { max-width: 1280px; padding: 40px; }
 .page-head { align-items: flex-start; margin-bottom: 35px; flex-wrap: wrap; }
 .page-head > div { flex: 1 1 450px; }
@@ -75,6 +78,8 @@ nav button.active svg { color: var(--link); }
 .hero-main h2 { font-size: 25px; letter-spacing: .06em; }
 .hero-main p { font-size: 12px; }
 .power, .is-connected .power { border-radius: 50%; background: transparent; color: var(--ink); border-color: var(--outline); }
+.is-connected .power { color: #2fa36f; border-color: #2fa36f; }
+.is-connected .hero-main h2 { color: #2fa36f; }
 .hero-details { padding: 25px 0; }
 .hero-details small { font-size: 9px; letter-spacing: .12em; }
 .hero-details button { text-transform: none; letter-spacing: normal; }
@@ -86,7 +91,9 @@ nav button.active svg { color: var(--link); }
 .quick-rules > div { padding: 20px 0; }
 .letter-icon { border-radius: 10px; background: transparent; }
 .route { border-radius: 10px; padding: 8px 10px; }
-.route-PROXY, .route-BLOCK { color: var(--ink); }
+.route-PROXY, .route option[value="PROXY"] { color: #2fa36f; }
+.route-BLOCK, .route option[value="BLOCK"] { color: #e45b65; }
+.route-DIRECT, .route option[value="DIRECT"] { color: #007fe8; }
 .default-route { flex-wrap: wrap; padding: 25px 0; }
 .onboarding { margin-top: 30px; padding: 30px; }
 .toolbar { flex-wrap: wrap; gap: 15px; margin: 30px 0; }
@@ -114,6 +121,9 @@ nav button.active svg { color: var(--link); }
 th { text-transform: uppercase; letter-spacing: .1em; font-size: 10px; }
 td, th { padding: 17px 14px; }
 .checkmark, .failed, .log-ERROR, .error, .log-INFO { color: var(--ink); }
+.diagnostic-row[data-result="success"] > span { color: #2fa36f; }
+.diagnostic-row[data-result="failure"] > span { color: #e45b65; }
+.diagnostic-row[data-result="unknown"] > span { color: var(--muted); }
 .log-view { font-family: inherit; padding: 25px; font-size: 12px; line-height: 1.8; }
 .log-view > div { border-color: var(--line); }
 .alert { color: var(--ink); background: var(--surface); border: 1px dashed var(--outline); border-radius: 15px; padding: 20px; }
