@@ -40,6 +40,9 @@ fn send(file: &mut File, value: &Value) -> Result<(), String> {
 fn read_bytes(file: &mut File, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
     let mut offset = 0;
     while offset < buffer.len() {
+        if Instant::now() >= deadline {
+            return Err("Время ожидания сетевой службы истекло".into());
+        }
         let mut available = 0;
         unsafe {
             if PeekNamedPipe(
@@ -81,7 +84,7 @@ fn receive(file: &mut File, timeout: Duration) -> Result<Value, String> {
     serde_json::from_slice(&data).map_err(|_| "Некорректный ответ сетевой службы".into())
 }
 pub struct Broker {
-    pipe: Mutex<File>,
+    pipe: Mutex<Option<File>>,
 }
 impl Broker {
     pub fn launch() -> Result<Self, String> {
@@ -111,7 +114,7 @@ impl Broker {
                     return Err("Сетевая служба не готова".into());
                 }
                 return Ok(Self {
-                    pipe: Mutex::new(file),
+                    pipe: Mutex::new(Some(file)),
                 });
             }
             if Instant::now() >= deadline {
@@ -123,7 +126,12 @@ impl Broker {
         }
     }
     pub fn alive(&self) -> bool {
-        let Ok(file) = self.pipe.lock() else {
+        let file = match self.pipe.try_lock() {
+            Ok(file) => file,
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+            Err(_) => return false,
+        };
+        let Some(file) = file.as_ref() else {
             return false;
         };
         let mut available = 0;
@@ -139,20 +147,38 @@ impl Broker {
         }
     }
     pub fn call(&self, op: &str, payload: Value) -> Result<Value, String> {
-        let mut file = self
-            .pipe
-            .lock()
-            .map_err(|_| "Ошибка канала сетевой службы")?;
-        send(&mut file, &json!({"op":op,"payload":payload}))?;
-        // Starting can include driver installation; its IPC deadline must outlive readiness.
-        let reply = receive(
-            &mut file,
-            Duration::from_secs(if matches!(op, "start" | "apply") {
-                120
-            } else {
-                45
-            }),
-        )?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut slot = loop {
+            match self.pipe.try_lock() {
+                Ok(slot) => break slot,
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                _ => return Err("Сетевая служба занята. Повторите операцию.".into()),
+            }
+        };
+        let file = slot.as_mut().ok_or("Канал сетевой службы закрыт")?;
+        let reply = (|| {
+            send(file, &json!({"op":op,"payload":payload}))?;
+            // Starting can include driver installation; its IPC deadline must outlive readiness.
+            receive(
+                file,
+                Duration::from_secs(if matches!(op, "start" | "apply") {
+                    120
+                } else {
+                    15
+                }),
+            )
+        })();
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                // A late reply must never be mistaken for the next command's reply.
+                // Closing the session also lets the service clean up its TUN/WFP.
+                *slot = None;
+                return Err(error);
+            }
+        };
         if let Some(e) = reply["error"].as_str() {
             Err(e.into())
         } else {
@@ -305,6 +331,15 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut configured = false;
     let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
+    let mut active_settings: Option<Settings> = None;
+    let mut last_health = Instant::now();
+    let mut routes = network_guard::route_signature().unwrap_or_default();
+    let mut health_failures = 0;
+    let mut tun_identity = network_guard::tun_identity();
+    let mut delays: std::collections::HashMap<
+        String,
+        (Instant, std::sync::mpsc::Receiver<Result<Value, String>>),
+    > = std::collections::HashMap::new();
     loop {
         if crate::service::is_stopping() {
             break;
@@ -313,6 +348,43 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
             if unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0 {
                 break;
             }
+        }
+        if configured && last_health.elapsed() >= Duration::from_secs(5) {
+            let resumed = last_health.elapsed() > Duration::from_secs(30);
+            let observed = network_guard::route_signature();
+            if resumed
+                || network_guard::tun_identity() != tun_identity
+                || observed.as_ref().is_ok_and(|value| *value != routes)
+            {
+                if let Some(settings) = &active_settings {
+                    // Re-evaluate the physical egress and rebind WFP to the new TUN
+                    // LUID after sleep or a route/interface change. A failed repair
+                    // closes the session; the desktop retries with bounded backoff.
+                    if core.apply(settings).is_err()
+                        || guard
+                            .as_ref()
+                            .is_none_or(|g| g.install(&core.binary).is_err())
+                    {
+                        break;
+                    }
+                }
+                if let Ok(value) = observed {
+                    routes = value;
+                }
+                tun_identity = network_guard::tun_identity();
+            }
+            if !core.running() {
+                break;
+            }
+            if core.api("GET", "/version", None).is_err() {
+                health_failures += 1;
+            } else {
+                health_failures = 0;
+            }
+            if health_failures >= 3 {
+                break;
+            }
+            last_health = Instant::now();
         }
         let mut available = 0;
         if unsafe {
@@ -342,6 +414,43 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
         let op = request["op"].as_str().unwrap_or("");
         let payload = &request["payload"];
         let result: Result<Value, String> = (|| match op {
+            "delay" => {
+                let path = payload["path"].as_str().ok_or("Нет пути")?;
+                if !path.contains("/delay?") || !allowed_api("GET", path) {
+                    return Err("Проверка сервера не разрешена".into());
+                }
+                delays.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(30));
+                if delays.len() >= 16 {
+                    return Err("Слишком много проверок серверов".into());
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let client = core.client();
+                let path = path.to_owned();
+                thread::Builder::new()
+                    .name("atlas-delay".into())
+                    .spawn(move || {
+                        let _ = tx.send(client.api("GET", &path, None));
+                    })
+                    .map_err(|_| "Не удалось запустить проверку")?;
+                delays.insert(id.clone(), (Instant::now(), rx));
+                Ok(json!({"id":id}))
+            }
+            "delay_result" => {
+                let id = payload["id"].as_str().ok_or("Нет проверки")?;
+                let (_, rx) = delays.get(id).ok_or("Проверка истекла")?;
+                match rx.try_recv() {
+                    Ok(result) => {
+                        delays.remove(id);
+                        result.map(|v| json!({"done":true,"value":v}))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => Ok(json!({"done":false})),
+                    Err(_) => {
+                        delays.remove(id);
+                        Err("Проверка прервана".into())
+                    }
+                }
+            }
             "start" => {
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
@@ -377,6 +486,10 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                     }
                 }
                 configured = true;
+                active_settings = Some(s);
+                routes = network_guard::route_signature().unwrap_or_default();
+                last_health = Instant::now();
+                tun_identity = network_guard::tun_identity();
                 Ok(json!({"running":true}))
             }
             "apply" => {
@@ -410,6 +523,22 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                         return Err("Обновление подключения отменено".into());
                     }
                 }
+                active_settings = Some(s);
+                routes = network_guard::route_signature().unwrap_or_default();
+                tun_identity = network_guard::tun_identity();
+                last_health = Instant::now();
+                Ok(json!({}))
+            }
+            "select" => {
+                let name = payload["name"].as_str().ok_or("Нет сервера")?;
+                let settings = active_settings.as_mut().ok_or("Ядро не подключено")?;
+                if !["AUTO", "FAILOVER"].contains(&name)
+                    && !settings.servers().iter().any(|p| p["name"] == name)
+                {
+                    return Err("Сервер отсутствует в подписках".into());
+                }
+                core.select(name)?;
+                settings.selected = name.to_owned();
                 Ok(json!({}))
             }
             "status" => Ok(json!({"running":core.running(),"guard":configured})),
@@ -439,7 +568,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
         if send(&mut pipe, &reply).is_err() {
             break;
         }
-        if explicit_stop {
+        if explicit_stop || (active_settings.is_some() && !configured) {
             break;
         }
     }
@@ -567,4 +696,15 @@ mod tests {
         assert!(reject_file_keys(&json!({"private-key-path":"C:/secret"})).is_err());
         assert!(reject_file_keys(&json!({"ws-opts":{"path":"/ws"}})).is_ok());
     }
+}
+#[test]
+fn busy_channel_is_not_reported_as_a_crashed_core() {
+    let broker = Broker {
+        pipe: Mutex::new(None),
+    };
+    let lock = broker.pipe.lock().unwrap();
+    assert!(broker.alive());
+    drop(lock);
+    assert!(!broker.alive());
+    assert!(broker.call("status", Value::Null).is_err());
 }

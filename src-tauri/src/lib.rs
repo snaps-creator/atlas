@@ -28,6 +28,7 @@ struct App {
     status: String,
     error: Option<String>,
     logs: Vec<Value>,
+    reconnect: Arc<std::sync::atomic::AtomicBool>,
 }
 impl App {
     fn log(&mut self, level: &str, message: &str) {
@@ -68,13 +69,30 @@ impl App {
         if next.mode != self.settings.mode && self.core.running() {
             return Err("Перед изменением режима отключите соединение".into());
         }
+        let same_config = config::same_network_config(&self.settings, &next);
+        let selection_only = same_config && next.selected != self.settings.selected;
         if !next.subscriptions.is_empty() {
-            self.core.apply(&next)?;
+            if selection_only {
+                if !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
+                    && !next.servers().iter().any(|p| p["name"] == next.selected)
+                {
+                    return Err("Выбранный сервер отсутствует в подписках".into());
+                }
+                if self.core.running() {
+                    self.core.select(&next.selected)?;
+                }
+            } else if !same_config {
+                self.core.apply(&next)?;
+            }
         }
         let previous = self.settings.clone();
         if let Err(e) = self.store.save(&next) {
             if self.core.running() {
-                let _ = self.core.apply(&previous);
+                if selection_only {
+                    let _ = self.core.select(&previous.selected);
+                } else if !same_config {
+                    let _ = self.core.apply(&previous);
+                }
             }
             return Err(e);
         }
@@ -92,6 +110,10 @@ impl App {
             .and_then(|_| self.core.start(&self.settings));
         match result {
             Ok(()) => {
+                if !self.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.disconnect()?;
+                    return Err("Подключение отменено".into());
+                }
                 self.settings.was_connected = true;
                 if let Err(e) = self.store.save(&self.settings) {
                     let _ = windows::restore(&self.core.directory.join("proxy-restore.json"));
@@ -122,6 +144,8 @@ impl App {
         }
     }
     fn disconnect(&mut self) -> Result<(), String> {
+        self.reconnect
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let stopped = self.core.stop();
         let restored = windows::restore(&self.core.directory.join("proxy-restore.json"));
         self.status = "Disconnected".into();
@@ -386,6 +410,8 @@ impl App {
     }
 }
 type Shared = Arc<Mutex<App>>;
+struct ConnectionIntent(Arc<std::sync::atomic::AtomicBool>);
+type ShuttingDown = Arc<std::sync::atomic::AtomicBool>;
 pub fn cleanup() -> Result<(), String> {
     let dir = std::path::PathBuf::from(
         std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?,
@@ -416,8 +442,71 @@ async fn request(
     payload: Option<Value>,
 ) -> Result<Value, String> {
     let shared = state.inner().clone();
+    if action == "connect" || action == "disconnect" {
+        app.state::<ConnectionIntent>()
+            .0
+            .store(action == "connect", std::sync::atomic::Ordering::SeqCst);
+    }
+    if app
+        .state::<ShuttingDown>()
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("Atlas завершает работу".into());
+    }
+    if action == "connections" || action == "proxies" {
+        let client = shared
+            .try_lock()
+            .map_err(|_| "Atlas занят, повторите операцию")?
+            .core
+            .client();
+        return tauri::async_runtime::spawn_blocking(move || {
+            client.api(
+                "GET",
+                if action == "connections" {
+                    "/connections"
+                } else {
+                    "/proxies"
+                },
+                None,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if action == "public_ip" {
+        if !shared
+            .try_lock()
+            .map_err(|_| "Atlas занят, повторите операцию")?
+            .core
+            .running()
+        {
+            return Err("Сначала подключитесь".into());
+        }
+        return tauri::async_runtime::spawn_blocking(move || {
+            reqwest::blocking::Client::builder()
+                .proxy(reqwest::Proxy::all("http://127.0.0.1:17890").map_err(|e| e.to_string())?)
+                .timeout(std::time::Duration::from_secs(8))
+                .build()
+                .map_err(|e| e.to_string())?
+                .get("https://api.ipify.org?format=json")
+                .send()
+                .map_err(|_| "Не удалось определить IP")?
+                .json::<Value>()
+                .map_err(|_| "Не удалось прочитать IP".into())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if action == "applications" {
+        return tauri::async_runtime::spawn_blocking(move || Ok(json!(applications::list())))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     if action == "site_check" {
-        let id = payload.as_ref().and_then(|p| p["id"].as_str()).ok_or("Нет сервиса")?;
+        let id = payload
+            .as_ref()
+            .and_then(|p| p["id"].as_str())
+            .ok_or("Нет сервиса")?;
         let url = match id {
             "chatgpt" => "https://chatgpt.com",
             "grok" => "https://grok.com",
@@ -427,8 +516,12 @@ async fn request(
             _ => return Err("Неизвестный сервис".into()),
         };
         {
-            let mut a = shared.lock().map_err(|_| "Ошибка состояния")?;
-            if !a.core.running() { return Err("Сначала подключите Atlas".into()); }
+            let mut a = shared
+                .try_lock()
+                .map_err(|_| "Atlas занят, повторите операцию")?;
+            if !a.core.running() {
+                return Err("Сначала подключите Atlas".into());
+            }
         }
         return tauri::async_runtime::spawn_blocking(move || {
             let client = reqwest::blocking::Client::builder()
@@ -447,7 +540,9 @@ async fn request(
         let payload = payload.ok_or("Нет правила")?;
         let key = payload["key"].as_str().ok_or("Нет ключа правила")?;
         let (settings, client, rule, route) = {
-            let a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            let a = shared
+                .try_lock()
+                .map_err(|_| "Atlas занят, повторите операцию")?;
             if a.settings.routing_mode != RoutingMode::Rule {
                 return Err("Для проверки правил включите режим «Правила» на Главной".into());
             }
@@ -474,7 +569,9 @@ async fn request(
     }
     if action == "diagnostics" {
         let (settings, client) = {
-            let a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            let a = shared
+                .try_lock()
+                .map_err(|_| "Atlas занят, повторите операцию")?;
             (a.settings.clone(), a.core.client())
         };
         return tauri::async_runtime::spawn_blocking(move || {
@@ -485,7 +582,9 @@ async fn request(
     }
     if action == "protection_status" {
         let (settings, client) = {
-            let mut a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            let mut a = shared
+                .try_lock()
+                .map_err(|_| "Atlas занят, повторите операцию")?;
             if !a.core.running() || a.status != "Connected" {
                 return Ok(json!({
                     "secure": false,
@@ -508,7 +607,9 @@ async fn request(
             .ok_or("Не выбран сервер")?
             .to_owned();
         let client = {
-            let a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            let a = shared
+                .try_lock()
+                .map_err(|_| "Atlas занят, повторите операцию")?;
             if !a.settings.servers().iter().any(|p| p["name"] == name) {
                 return Err("Сервер отсутствует в подписках".into());
             }
@@ -521,7 +622,9 @@ async fn request(
         .map_err(|e| e.to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut a = shared.lock().map_err(|_| "Ошибка внутреннего состояния")?;
+        let mut a = shared
+            .try_lock()
+            .map_err(|_| "Atlas занят, повторите операцию")?;
         a.dispatch(&app, &action, payload.unwrap_or(Value::Null))
     })
     .await
@@ -568,6 +671,8 @@ pub fn run() {
                     w.hide()?
                 }
             }
+            let intent = Arc::new(std::sync::atomic::AtomicBool::new(auto));
+            app.manage(ConnectionIntent(intent.clone()));
             let shared = Arc::new(Mutex::new(App {
                 settings,
                 store,
@@ -575,8 +680,11 @@ pub fn run() {
                 status: "Disconnected".into(),
                 error: None,
                 logs: vec![],
+                reconnect: intent.clone(),
             }));
             app.manage(shared.clone());
+            let shutdown: ShuttingDown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.manage(shutdown.clone());
             use tauri::menu::{Menu, MenuItem};
             let show = MenuItem::with_id(app, "show", "Открыть Атлас", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Подключить", true, None::<&str>)?;
@@ -610,6 +718,20 @@ pub fn run() {
                     } else {
                         let handle = app.clone();
                         let action = id.to_owned();
+                        if action == "connect" || action == "disconnect" || action == "quit" {
+                            app.state::<ConnectionIntent>().0.store(action == "connect", std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if action == "quit" {
+                            if app.state::<ShuttingDown>().swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+                            // Never leave Exit queued behind a driver/configuration timeout.
+                            // The service watches the parent process and releases its dynamic
+                            // filters and owned core when the desktop process exits.
+                            let fallback = app.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_secs(8));
+                                fallback.exit(0);
+                            });
+                        }
                         tauri::async_runtime::spawn_blocking(move || {
                             let state = handle.state::<Shared>();
                             if let Ok(mut a) = state.lock() {
@@ -632,21 +754,24 @@ pub fn run() {
                 .build(app)?;
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                if auto {
-                    std::thread::sleep(std::time::Duration::from_secs(delay));
-                    for wait in [3, 5, 10, 20] {
-                        let mut a = shared.lock().unwrap();
-                        if a.connect().is_ok() {
-                            break;
-                        }
-                        if a.settings.mode == "tun" { break; }
-                        drop(a);
-                        std::thread::sleep(std::time::Duration::from_secs(wait));
-                    }
-                }
+                let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));
+                let mut failures = 0u32;
+                let mut retry_at = std::time::Instant::now();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    let mut a = shared.lock().unwrap();
+                    if shutdown.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                    let Ok(mut a) = shared.try_lock() else { continue; };
+                    if startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                        startup_at = None;
+                        if intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Disconnected" {
+                            let _ = a.connect();
+                            retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                        }
+                    }
+                    if !intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Connected" {
+                        let _ = a.disconnect();
+                        continue;
+                    }
                     if a.status == "Connected" && !a.core.running() {
                         let _ = windows::restore(&a.core.directory.join("proxy-restore.json"));
                         a.status = "Error".into();
@@ -654,6 +779,14 @@ pub fn run() {
                         a.error = Some(message.into());
                         a.log("ERROR",message);
                         let _ = handle.emit("core-crashed", ());
+                        retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    }
+                    if a.reconnect.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Error" && std::time::Instant::now() >= retry_at {
+                        a.log("INFO", "Попытка восстановления VPN после сбоя");
+                        let _ = a.core.stop();
+                        if a.connect().is_ok() { failures = 0; }
+                        else { failures = failures.saturating_add(1); }
+                        retry_at = std::time::Instant::now() + std::time::Duration::from_secs(retry_delay(failures));
                     }
                 }
             });
@@ -668,6 +801,23 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![request])
         .run(tauri::generate_context!())
         .expect("Atlas failed to initialize");
+}
+
+fn retry_delay(failures: u32) -> u64 {
+    (3u64.saturating_mul(1u64 << failures.min(5))).min(60)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn repeated_outages_back_off_without_overflow_or_busy_loop() {
+        assert_eq!(
+            (0..7).map(retry_delay).collect::<Vec<_>>(),
+            vec![3, 6, 12, 24, 48, 60, 60]
+        );
+        assert_eq!(retry_delay(u32::MAX), 60);
+    }
 }
 
 pub fn network_service() -> Result<(), String> {
