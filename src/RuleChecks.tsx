@@ -35,7 +35,7 @@ export function RuleChecks({
   const [checks, setChecks] = useState<Record<string, Check>>({});
   const [error, setError] = useState("");
   async function checkRules() {
-    if (!connected || active.current) return;
+    if (!connected || active.current || (settings?.routingMode && settings.routingMode !== "rule")) return;
     active.current = true;
     const run = ++generation.current;
     setChecking(true);
@@ -128,6 +128,9 @@ export function RuleChecks({
   }
   const entries = Object.values(checks);
   if (!visible) return null;
+  if (settings?.routingMode && settings.routingMode !== "rule") {
+    return visible ? <p className="muted">Проверка правил доступна в режиме «Правила». Переключите режим на Главной.</p> : null;
+  }
   return (
     <section className="rule-checks">
       <h2>Проверка правил</h2>

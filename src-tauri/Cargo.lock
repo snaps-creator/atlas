@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "atlas-vpn"
-version = "1.0.0-beta.14.4"
+version = "1.0.0-beta.14.5"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
