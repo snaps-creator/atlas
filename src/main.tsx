@@ -88,7 +88,7 @@ function App() {
     void getVersion()
       .then(async (version) => {
         setAppVersion(version);
-        const beta = /^1\.0\.0-beta\.(\d+)$/.exec(version);
+        const beta = /^1\.0\.0-beta\.(\d+(?:\.\d+)*)$/.exec(version);
         const label = beta ? `Beta ${beta[1]}` : version;
         setVersionLabel(label);
         await getCurrentWindow().setTitle("atlas");
