@@ -77,6 +77,8 @@ nav button.active svg { color: var(--link); }
 .hero-main h2 { font-size: 25px; letter-spacing: .06em; }
 .hero-main p { font-size: 12px; }
 .power, .is-connected .power { border-radius: 50%; background: transparent; color: var(--ink); border-color: var(--outline); }
+.is-connected .power { color: #2fa36f; border-color: #2fa36f; }
+.is-connected .hero-main h2 { color: #2fa36f; }
 .hero-details { padding: 25px 0; }
 .hero-details small { font-size: 9px; letter-spacing: .12em; }
 .hero-details button { text-transform: none; letter-spacing: normal; }
@@ -118,6 +120,9 @@ nav button.active svg { color: var(--link); }
 th { text-transform: uppercase; letter-spacing: .1em; font-size: 10px; }
 td, th { padding: 17px 14px; }
 .checkmark, .failed, .log-ERROR, .error, .log-INFO { color: var(--ink); }
+.diagnostic-row[data-result="success"] > span { color: #2fa36f; }
+.diagnostic-row[data-result="failure"] > span { color: #e45b65; }
+.diagnostic-row[data-result="unknown"] > span { color: var(--muted); }
 .log-view { font-family: inherit; padding: 25px; font-size: 12px; line-height: 1.8; }
 .log-view > div { border-color: var(--line); }
 .alert { color: var(--ink); background: var(--surface); border: 1px dashed var(--outline); border-radius: 15px; padding: 20px; }

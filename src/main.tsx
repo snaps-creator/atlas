@@ -1227,7 +1227,7 @@ function App() {
                   {checks.length ? (
                     <div className="list">
                       {checks.map((c) => (
-                        <div className="diagnostic-row" key={c.name}>
+                        <div className="diagnostic-row" data-result={c.ok === null ? "unknown" : c.ok ? "success" : "failure"} key={c.name}>
                           <span className={c.ok ? "checkmark" : "failed"}>
                             {c.ok === null ? (
                               "—"
