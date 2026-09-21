@@ -1,5 +1,6 @@
 //! Session-owned WFP policy. Only the owned core, loopback and the TUN interface
-//! can originate traffic. DIRECT exceptions are still evaluated by Mihomo.
+//! can originate internet traffic. DHCP and private IPv4 LAN destinations are
+//! permitted so that the host can keep its address and reach office resources.
 //! Windows releases dynamic filters if the helper dies, restoring prior policy.
 use std::{path::Path, ptr};
 use windows_sys::{
@@ -55,7 +56,7 @@ impl Drop for Engine {
     }
 }
 unsafe fn erase(engine: HANDLE) -> Result<(), String> {
-    for i in 0..8 {
+    for i in 0..13 {
         let r = FwpmFilterDeleteByKey0(engine, &key(i));
         if r != 0 && r != 0x80320003 {
             return Err(format!("Не удалось удалить фильтр Атласа: {r:#x}"));
@@ -198,6 +199,41 @@ impl Guard {
                         )?;
                     }
                 }
+                // DHCP must survive the kill switch, including broadcast discovery
+                // and unicast renewal. Match protocol AND both ports, never all UDP.
+                for (offset, layer, local, remote) in [
+                    (8, FWPM_LAYER_ALE_AUTH_CONNECT_V4, 68, 67),
+                    (9, FWPM_LAYER_ALE_AUTH_CONNECT_V6, 546, 547),
+                ] {
+                    let mut conditions = [std::mem::zeroed::<FWPM_FILTER_CONDITION0>(); 3];
+                    conditions[0].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+                    conditions[0].conditionValue.r#type = FWP_UINT8;
+                    conditions[0].conditionValue.Anonymous.uint8 = 17;
+                    conditions[1].fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
+                    conditions[1].conditionValue.r#type = FWP_UINT16;
+                    conditions[1].conditionValue.Anonymous.uint16 = local;
+                    conditions[2].fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+                    conditions[2].conditionValue.r#type = FWP_UINT16;
+                    conditions[2].conditionValue.Anonymous.uint16 = remote;
+                    permit(e.0, offset, layer, name.as_mut_ptr(), &mut conditions)?;
+                }
+                // Existing, more-specific Windows LAN routes stay on Ethernet/Wi-Fi.
+                // Allow their RFC1918 destinations without permitting public internet
+                // on those interfaces. Do not change routes or disable DNS leak filters.
+                for (index, (addr, mask)) in LAN_V4.iter().copied().enumerate() {
+                    let mut subnet = FWP_V4_ADDR_AND_MASK { addr, mask };
+                    let mut condition: FWPM_FILTER_CONDITION0 = std::mem::zeroed();
+                    condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                    condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
+                    condition.conditionValue.Anonymous.v4AddrMask = &mut subnet;
+                    permit(
+                        e.0,
+                        10 + index as u128,
+                        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                        name.as_mut_ptr(),
+                        std::slice::from_mut(&mut condition),
+                    )?;
+                }
                 checked(FwpmTransactionCommit0(e.0), "завершение транзакции")
             })();
             if outcome.is_err() {
@@ -205,6 +241,62 @@ impl Guard {
             }
             FwpmFreeMemory0(&mut app_id as *mut _ as *mut _);
             outcome
+        }
+    }
+}
+
+const LAN_V4: [(u32, u32); 3] = [
+    (0x0a000000, 0xff000000),
+    (0xac100000, 0xfff00000),
+    (0xc0a80000, 0xffff0000),
+];
+
+unsafe fn permit(
+    engine: HANDLE,
+    id: u128,
+    layer: GUID,
+    name: *mut u16,
+    conditions: &mut [FWPM_FILTER_CONDITION0],
+) -> Result<(), String> {
+    for condition in conditions.iter_mut() {
+        condition.matchType = FWP_MATCH_EQUAL;
+    }
+    let mut filter: FWPM_FILTER0 = std::mem::zeroed();
+    filter.filterKey = key(id);
+    filter.displayData.name = name;
+    filter.layerKey = layer;
+    filter.subLayerKey = SUBLAYER;
+    filter.weight.r#type = FWP_UINT8;
+    filter.weight.Anonymous.uint8 = 10;
+    filter.action.r#type = FWP_ACTION_PERMIT;
+    filter.numFilterConditions = conditions.len() as u32;
+    filter.filterCondition = conditions.as_mut_ptr();
+    checked(
+        FwpmFilterAdd0(engine, &filter, ptr::null_mut(), ptr::null_mut()),
+        "исключение локальной сети",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn lan_exceptions_do_not_allow_public_or_fake_ip_destinations() {
+        let allowed = |ip: &str| {
+            let ip = u32::from(ip.parse::<std::net::Ipv4Addr>().unwrap());
+            LAN_V4.iter().any(|(network, mask)| ip & mask == *network)
+        };
+        for ip in ["192.168.1.1", "10.1.2.3", "172.16.0.1", "172.31.255.254"] {
+            assert!(allowed(ip), "{ip}");
+        }
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "172.15.255.255",
+            "172.32.0.1",
+            "198.19.0.1",
+        ] {
+            assert!(!allowed(ip), "{ip}");
         }
     }
 }
