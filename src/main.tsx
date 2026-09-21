@@ -132,6 +132,7 @@ function App() {
   const [updateCheckStatus, setUpdateCheckStatus] = useState<"idle" | "checking" | "current" | "available" | "error">("idle");
   const [updateCheckError, setUpdateCheckError] = useState("");
   const [updateCheckedAt, setUpdateCheckedAt] = useState<number | null>(null);
+  const [protectionChecking, setProtectionChecking] = useState(false);
   const [protection, setProtection] = useState<ProtectionStatus>({
     secure: false,
     detail: "Atlas не подключён.",
@@ -204,12 +205,7 @@ function App() {
       }
       if (protectionCheckRunning.current) return;
       protectionCheckRunning.current = true;
-      if (alive)
-        setProtection((current) => ({
-          ...current,
-          detail: "Проверяем защищённый путь трафика…",
-          checkedAt: 0,
-        }));
+      if (alive) setProtectionChecking(true);
       try {
         const result = await request<ProtectionStatus>("protection_status");
         if (alive) setProtection(result);
@@ -222,6 +218,7 @@ function App() {
           });
       } finally {
         protectionCheckRunning.current = false;
+        setProtectionChecking(false);
       }
     };
     void inspect();
@@ -430,6 +427,13 @@ function App() {
             <Shield size={15} />
             <span>
               {protection.secure ? "Данные защищены" : "Данные не защищены"}
+              {protectionChecking && data?.running && data.status === "Connected" && (
+                <RefreshCw
+                  size={12}
+                  className="spin protection-check-spinner"
+                  aria-label="Проверка защиты"
+                />
+              )}
               <small>{protection.detail}</small>
             </span>
           </div>
@@ -716,58 +720,6 @@ function App() {
                     </div>
                   </div>
                   <section className="section">
-                    <div className="section-head">
-                      <div>
-                        <h2>Быстрые правила</h2>
-                        <p></p>
-                      </div>
-                      <button onClick={() => setPage("Rules")}>
-                        Все правила
-                        <ChevronRight size={15} />
-                      </button>
-                    </div>
-                    {s?.groups.length ? (
-                      <div className="quick-rules">
-                        {s.groups.slice(0, 6).map((g) => (
-                          <div key={g.id}>
-                            <span className="letter-icon">{g.name[0]}</span>
-                            <div>
-                              <strong>{g.name}</strong>
-                              <small>{g.rules.length} условий</small>
-                            </div>
-                            <RouteSelect
-                              value={g.route}
-                              onChange={(r) =>
-                                run(() =>
-                                  save({
-                                    ...s,
-                                    groups: s.groups.map((x) =>
-                                      x.id === g.id ? { ...x, route: r } : x,
-                                    ),
-                                  }),
-                                )
-                              }
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="inline-empty">
-                        <ListFilter size={22} />
-                        <span>
-                          Настройте, какие приложения и сайты используют VPN.
-                        </span>
-                        <button
-                          onClick={() => {
-                            setPage("Rules");
-                            setPage("Rules");
-                          }}
-                        >
-                          Создать правило
-                          <Plus size={15} />
-                        </button>
-                      </div>
-                    )}
                     <div className="default-route">
                       <span>
                         <Globe2 size={15} />

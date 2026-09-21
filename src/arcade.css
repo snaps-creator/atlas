@@ -59,6 +59,7 @@ nav button.active svg { color: var(--link); }
 .privacy.protected { color: #2fa36f; }
 .privacy.unprotected { color: #e45b65; }
 .privacy small { margin-top: 5px; line-height: 1.6; }
+.privacy .protection-check-spinner { display: inline-block; margin-left: 8px; vertical-align: middle; }
 .version { font-size: 9px; gap: 8px; }
 .version .sidebar-update { border-radius: 10px; padding: 8px; }
 .topbar { height: 70px; padding: 0 40px; letter-spacing: .08em; text-transform: uppercase; }
