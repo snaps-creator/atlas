@@ -16,6 +16,8 @@
   --blue: #007fe8;
   --link: #007fe8;
   --outline: #fff;
+  --control-height: 32px;
+  --control-radius: 10px;
   font-family: 'Source Code Pro', Consolas, monospace;
   font-feature-settings: 'zero';
   font-size: 14px;
@@ -138,6 +140,26 @@ td, th { padding: 17px 14px; }
 .rule-checks { padding: 25px; }
 .rule-table-row { padding: 18px; }
 .subscription { padding: 30px; }
+/* Shared compact action size, based on the route selector. */
+button:not(.toggle):not(.group-name):not(.app-choice):not(.text-button):not(.power):not(nav button):not(.auto-options button),
+:root select {
+  box-sizing: border-box;
+  height: var(--control-height);
+  min-height: var(--control-height);
+  padding: 0 var(--control-padding, 10px);
+  border-radius: var(--control-radius);
+  font-size: 10px;
+  line-height: 16px;
+}
+button.icon-button:not(.toggle),
+button[aria-label="Закрыть"],
+.rule-table-row > button:last-child {
+  --control-padding: 0px;
+  width: var(--control-height);
+  min-width: var(--control-height);
+  padding: 0;
+  flex-shrink: 0;
+}
 @media(max-height: 1100px) {
   aside { padding-top: 20px; }
   .brand { margin-bottom: 20px; }
