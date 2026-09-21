@@ -1,5 +1,15 @@
 use crate::{model::*, rules};
 use serde_json::{json, Value};
+/// Compare only generated network settings, ignoring the selector's initial order.
+/// UI preferences must never cause TUN reconfiguration.
+pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
+    let mut comparison = next.clone();
+    comparison.selected = previous.selected.clone();
+    generate(&comparison, "comparison")
+        .ok()
+        .zip(generate(previous, "comparison").ok())
+        .is_some_and(|(a, b)| a == b)
+}
 pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     if !(MIN_AUTO_TEST_INTERVAL_SECONDS..=MAX_AUTO_TEST_INTERVAL_SECONDS)
         .contains(&s.auto_test_interval_seconds)
@@ -47,7 +57,10 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"url-test","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"tolerance":50,"lazy":false},{"name":"FAILOVER","type":"fallback","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"lazy":false}],"rules":rules::compile(s)?});
     doc["mode"] = json!(s.routing_mode);
     // Pin global traffic to Atlas instead of Mihomo's generated DIRECT default.
-    doc["proxy-groups"].as_array_mut().unwrap().push(json!({"name":"GLOBAL","type":"select","proxies":["ATLAS"]}));
+    doc["proxy-groups"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"GLOBAL","type":"select","proxies":["ATLAS"]}));
     // Match Clash Verge's warm-connection URL latency measurement.
     doc["unified-delay"] = json!(true);
     if s.mode == "tun" {
@@ -73,7 +86,15 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
             .dns
             .servers
             .iter()
-            .map(|server| format!("{}#{}", server.split('#').next().unwrap(), if s.routing_mode == RoutingMode::Direct { "DIRECT" } else { "ATLAS" }))
+            .map(|server| format!(
+                "{}#{}",
+                server.split('#').next().unwrap(),
+                if s.routing_mode == RoutingMode::Direct {
+                    "DIRECT"
+                } else {
+                    "ATLAS"
+                }
+            ))
             .collect::<Vec<_>>());
         doc["dns"]["proxy-server-nameserver"] =
             json!(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]);
@@ -102,6 +123,21 @@ mod tests {
         let mut s = Settings::default();
         s.mode = "system".into();
         s.subscriptions.push(Subscription{id:"a".into(),name:"test".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"test","type":"ss","server":"127.0.0.1","port":443,"cipher":"aes-128-gcm","password":"test"})]});
+        let mut ui = s.clone();
+        ui.theme = "light".into();
+        ui.selected = "test".into();
+        assert!(
+            same_network_config(&s, &ui),
+            "theme and selector do not reload TUN"
+        );
+        ui.dns.servers = vec!["https://9.9.9.9/dns-query".into()];
+        assert!(!same_network_config(&s, &ui), "DNS changes must reload");
+        ui = s.clone();
+        ui.routing_mode = RoutingMode::Global;
+        assert!(
+            !same_network_config(&s, &ui),
+            "routing mode changes must reload"
+        );
         let y: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(y["rules"][0], "MATCH,DIRECT");
         assert_eq!(y["allow-lan"], false);
@@ -153,9 +189,17 @@ mod tests {
         s.routing_mode = RoutingMode::Direct;
         let direct: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(direct["mode"], "direct");
-        assert!(direct["dns"]["nameserver"][0].as_str().unwrap().ends_with("#DIRECT"));
+        assert!(direct["dns"]["nameserver"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("#DIRECT"));
         let mut legacy = serde_json::to_value(&s).unwrap();
         legacy.as_object_mut().unwrap().remove("routingMode");
-        assert_eq!(serde_json::from_value::<Settings>(legacy).unwrap().routing_mode, RoutingMode::Rule);
+        assert_eq!(
+            serde_json::from_value::<Settings>(legacy)
+                .unwrap()
+                .routing_mode,
+            RoutingMode::Rule
+        );
     }
 }

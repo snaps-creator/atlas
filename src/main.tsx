@@ -144,11 +144,16 @@ function App() {
     checkedAt: 0,
   });
   const [activeServer, setActiveServer] = useState<string | null>(null);
+  const refreshPending = useRef(false);
   const refresh = useCallback(async () => {
+    if (refreshPending.current) return;
+    refreshPending.current = true;
     try {
       setData(await request<Snapshot>("snapshot"));
     } catch (e) {
-      setError(String(e));
+      if (!String(e).includes("Atlas занят")) setError(String(e));
+    } finally {
+      refreshPending.current = false;
     }
   }, []);
   useEffect(() => {
@@ -271,7 +276,7 @@ function App() {
           setTrafficError("");
         }
       } catch (e) {
-        if (alive) setTrafficError(String(e));
+        if (alive && !String(e).includes("занят")) setTrafficError(String(e));
       } finally {
         pending = false;
       }

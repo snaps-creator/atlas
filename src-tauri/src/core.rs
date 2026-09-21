@@ -15,6 +15,7 @@ pub struct Core {
     broker: Option<std::sync::Arc<crate::broker::Broker>>,
     elevated: bool,
     secret: String,
+    ports: [u16; 3],
     pub started: Option<Instant>,
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
@@ -33,6 +34,7 @@ impl Core {
                 uuid::Uuid::new_v4().simple()
             ),
             started: None,
+            ports: [17890, 19090, 11053],
             logs: Default::default(),
         }
     }
@@ -51,6 +53,14 @@ impl Core {
     }
     pub fn validate(&self, s: &Settings) -> Result<PathBuf, String> {
         let yaml = config::generate(s, &self.secret)?;
+        #[cfg(test)]
+        let yaml = {
+            let mut doc: Value = serde_yaml::from_str(&yaml).map_err(|e| e.to_string())?;
+            doc["mixed-port"] = json!(self.ports[0]);
+            doc["external-controller"] = json!(format!("127.0.0.1:{}", self.ports[1]));
+            doc["dns"]["listen"] = json!(format!("127.0.0.1:{}", self.ports[2]));
+            serde_yaml::to_string(&doc).map_err(|e| e.to_string())?
+        };
         let path = self.directory.join("candidate.yaml");
         std::fs::write(&path, yaml).map_err(|e| e.to_string())?;
         let mut c = self
@@ -81,6 +91,7 @@ impl Core {
     pub fn client(&self) -> ApiClient {
         ApiClient {
             secret: self.secret.clone(),
+            controller_port: self.ports[1],
             broker: self.broker.clone(),
             logs: self.logs.clone(),
         }
@@ -89,12 +100,7 @@ impl Core {
         self.client().api(method, path, body)
     }
     pub fn guard_active(&self) -> bool {
-        self.broker.as_ref().is_some_and(|broker| {
-            broker.alive()
-                && broker
-                    .call("status", Value::Null)
-                    .is_ok_and(|status| status["guard"] == true)
-        })
+        self.started.is_some() && self.broker.as_ref().is_some_and(|broker| broker.alive())
     }
     pub fn running(&mut self) -> bool {
         if let Some(broker) = &self.broker {
@@ -102,10 +108,9 @@ impl Core {
                 let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
                 return false;
             }
-            return broker.alive()
-                && broker
-                    .call("status", Value::Null)
-                    .is_ok_and(|v| v["running"] == true);
+            // The service closes this session when its core dies. Status polling
+            // must not queue behind URL latency tests on the command pipe.
+            return true;
         }
         if let Some(child) = self.child.as_mut() {
             matches!(child.try_wait(), Ok(None))
@@ -136,7 +141,7 @@ impl Core {
             self.started = Some(Instant::now());
             return Ok(());
         }
-        for port in [17890, 19090, 11053] {
+        for port in self.ports {
             std::net::TcpListener::bind(("127.0.0.1", port))
                 .map_err(|_| format!("Порт {port} занят другим приложением"))?;
         }
@@ -282,6 +287,14 @@ impl Core {
         }
         self.commit(&path)
     }
+    pub fn select(&self, name: &str) -> Result<(), String> {
+        if let Some(broker) = &self.broker {
+            broker.call("select", json!({"name":name}))?;
+        } else {
+            self.api("PUT", "/proxies/ATLAS", Some(json!({"name":name})))?;
+        }
+        Ok(())
+    }
     pub fn stop(&mut self) -> Result<(), String> {
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
             self.broker = None;
@@ -361,6 +374,10 @@ mod integration_tests {
         std::fs::create_dir_all(&directory).unwrap();
         let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/mihomo.exe");
         let mut core = Core::new(binary, directory.clone());
+        let reservations: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        core.ports = std::array::from_fn(|i| reservations[i].local_addr().unwrap().port());
         let mut settings = Settings::default();
         settings.mode = "system".into();
         // Isolated fixture. No real subscription, credentials or OS proxy changes.
@@ -369,9 +386,29 @@ mod integration_tests {
         tun_candidate.mode = "tun".into();
         core.validate(&tun_candidate)
             .expect("Mihomo must accept dual-stack TUN configuration");
+        drop(reservations);
         core.start(&settings).unwrap();
         assert!(core.running());
         assert!(core.api("GET", "/version", None).unwrap()["version"].is_string());
+        let process = core.child.as_ref().unwrap().id();
+        let original_config = std::fs::read(directory.join("last-working.yaml")).unwrap();
+        for name in ["fixture", "AUTO", "FAILOVER", "fixture", "AUTO"] {
+            core.select(name).unwrap();
+            assert_eq!(
+                core.api("GET", "/proxies/ATLAS", None).unwrap()["now"],
+                name
+            );
+            assert_eq!(core.child.as_ref().unwrap().id(), process);
+            assert_eq!(
+                std::fs::read(directory.join("last-working.yaml")).unwrap(),
+                original_config
+            );
+        }
+        assert!(core.select("missing-fixture").is_err());
+        assert_eq!(
+            core.api("GET", "/proxies/ATLAS", None).unwrap()["now"],
+            "AUTO"
+        );
         settings.selected = "FAILOVER".into();
         core.apply(&settings).unwrap();
         assert_eq!(
@@ -416,7 +453,7 @@ mod integration_tests {
             }
         });
         let client = reqwest::blocking::Client::builder()
-            .proxy(reqwest::Proxy::all("http://127.0.0.1:17890").unwrap())
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{}", core.ports[0])).unwrap())
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
@@ -436,7 +473,7 @@ mod integration_tests {
             let (n, peer) = echo.recv_from(&mut b).unwrap();
             echo.send_to(&b[..n], peer).unwrap();
         });
-        let mut control = std::net::TcpStream::connect("127.0.0.1:17890").unwrap();
+        let mut control = std::net::TcpStream::connect(("127.0.0.1", core.ports[0])).unwrap();
         control
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
@@ -482,6 +519,13 @@ mod integration_tests {
         alive.store(false, Ordering::SeqCst);
         worker.join().unwrap();
         assert!(response.is_err() || !response.unwrap().status().is_success());
+        // Kill only this isolated, non-TUN test child to exercise restart readiness.
+        core.child.as_mut().unwrap().kill().unwrap();
+        core.child.as_mut().unwrap().wait().unwrap();
+        assert!(!core.running());
+        core.start(&settings).unwrap();
+        assert!(core.running());
+        assert!(core.api("GET", "/version", None).is_ok());
         core.stop().unwrap();
         assert!(!core.running());
         drop(core);
@@ -491,6 +535,7 @@ mod integration_tests {
 
 #[derive(Clone)]
 pub struct ApiClient {
+    controller_port: u16,
     secret: String,
     broker: Option<std::sync::Arc<crate::broker::Broker>>,
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
@@ -511,17 +556,39 @@ impl ApiClient {
     }
     pub fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         if let Some(broker) = &self.broker {
+            if method == "GET" && path.contains("/delay?") {
+                let job = broker.call("delay", json!({"path":path}))?;
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err("Проверка сервера превысила время ожидания".into());
+                    }
+                    let result = broker.call("delay_result", json!({"id":job["id"]}))?;
+                    if result["done"] == true {
+                        return Ok(result["value"].clone());
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                }
+            }
             return broker.call("api", json!({"method":method,"path":path}));
         }
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(12))
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(if path.contains("/delay?") {
+                12
+            } else {
+                3
+            }))
             .build()
             .map_err(|e| e.to_string())?;
         let method =
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "Некорректный метод")?;
         let mut req = client
-            .request(method, format!("http://127.0.0.1:19090{path}"))
+            .request(
+                method,
+                format!("http://127.0.0.1:{}{path}", self.controller_port),
+            )
             .bearer_auth(&self.secret);
         if let Some(b) = body {
             req = req.json(&b)
