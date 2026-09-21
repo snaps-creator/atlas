@@ -18,8 +18,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run tauri build
 ```
 
-Готовый установщик для пользователя находится в корне проекта: `Atlas Beta 14.3 Setup.exe`. Скрипт `scripts/build.ps1` автоматически включает текущую версию в название установщика.
-Исходный bundle после сборки: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.14.3_x64-setup.exe`.
+Готовый установщик для пользователя находится в корне проекта: `Atlas Beta 14.4 Setup.exe`. Скрипт `scripts/build.ps1` автоматически включает текущую версию в название установщика.
+Исходный bundle после сборки: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.14.4_x64-setup.exe`.
 Ядро и локальная GeoIP-база включены в проект. Контрольные суммы находятся в `src-tauri/resources`.
 Дистрибутив пока не подписан издательским сертификатом, поэтому Windows показывает
 «Неизвестный издатель» при установке. При обычном запуске Atlas этот запрос больше
