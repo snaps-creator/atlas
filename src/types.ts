@@ -23,6 +23,7 @@ export type Settings = {
   selected: string;
   defaultRoute: Route;
   mode: string;
+  routingMode: "rule" | "global" | "direct";
   dns: { servers: string[]; ipv6: boolean; fakeIp: boolean };
   startup: {
     launchWithWindows: boolean;

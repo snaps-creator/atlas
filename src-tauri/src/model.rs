@@ -72,6 +72,8 @@ pub struct Startup {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    #[serde(default)]
+    pub routing_mode: RoutingMode,
     pub groups: Vec<RuleGroup>,
     pub subscriptions: Vec<Subscription>,
     pub selected: String,
@@ -88,6 +90,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            routing_mode: RoutingMode::Rule,
             groups: vec![],
             subscriptions: vec![],
             selected: "AUTO".into(),
@@ -114,6 +117,14 @@ impl Default for Settings {
             favorites: vec![],
         }
     }
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    #[default]
+    Rule,
+    Global,
+    Direct,
 }
 impl Settings {
     pub fn servers(&self) -> Vec<Value> {

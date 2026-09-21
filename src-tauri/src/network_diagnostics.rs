@@ -24,7 +24,10 @@ fn protection_policy_error(settings: &Settings) -> Option<&'static str> {
     if settings.mode != "tun" {
         return Some("TUN Atlas выключен.");
     }
-    let has_vpn_route = matches!(settings.default_route, Route::Proxy)
+    if settings.routing_mode == crate::model::RoutingMode::Direct {
+        return Some("Прямой режим: трафик идёт без VPN.");
+    }
+    let has_vpn_route = settings.routing_mode == crate::model::RoutingMode::Global || matches!(settings.default_route, Route::Proxy)
         || settings.groups.iter().any(|group| {
             group.enabled && !group.rules.is_empty() && matches!(group.route, Route::Proxy)
         });
@@ -122,6 +125,11 @@ fn follows_route(c: &Value, route: &Route) -> bool {
 // The probe is routed by the same rules as other traffic. MATCH is only the
 // fallback; e.g. google.com can select ATLAS while the default is DIRECT.
 fn configured_route(c: &Value, settings: &Settings) -> Option<Route> {
+    match settings.routing_mode {
+        crate::model::RoutingMode::Global => return Some(Route::Proxy),
+        crate::model::RoutingMode::Direct => return Some(Route::Direct),
+        _ => {}
+    }
     let kind = c["rule"].as_str()?.replace('-', "").to_uppercase();
     if kind == "MATCH" {
         return Some(settings.default_route.clone());

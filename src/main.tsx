@@ -41,6 +41,8 @@ import "./style.css";
 import "./arcade.css";
 import { RulesPanel } from "./RulesPanel";
 import { RuleChecks } from "./RuleChecks";
+import { DashboardTools } from "./DashboardTools";
+import { trafficRate, type TrafficSample } from "./traffic";
 import { ActiveServer } from "./ActiveServer";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
@@ -108,6 +110,9 @@ function App() {
   const activeTests = useRef(new Set<string>());
   const [connections, setConnections] = useState<Connection[]>([]);
   const [traffic, setTraffic] = useState({ up: 0, down: 0 });
+  const [samples, setSamples] = useState<TrafficSample[]>([]);
+  const [memory, setMemory] = useState<number | null>(null);
+  const [trafficError, setTrafficError] = useState("");
   const [inspection, setInspection] = useState<Connection | null>(null);
   const [checks, setChecks] = useState<
     { name: string; ok: boolean | null; detail: string }[]
@@ -183,6 +188,7 @@ function App() {
         data.running,
         data.status,
         data.settings.defaultRoute,
+        data.settings.routingMode,
         data.settings.selected,
         data.settings.dns.servers.join("|"),
         data.settings.groups
@@ -234,20 +240,41 @@ function App() {
       setDnsText(data.settings.dns.servers.join("\n"));
   }, [page]);
   useEffect(() => {
+    setSamples([]);
+    setTraffic({ up: 0, down: 0 });
+    setMemory(null);
+    setTrafficError("");
     if (!data?.running) return;
     let alive = true;
+    let pending = false;
+    let previous: { time: number; up: number; down: number } | null = null;
     const poll = async () => {
+      if (pending) return;
+      pending = true;
       try {
         const r = await request<{
           connections: Connection[];
           uploadTotal: number;
           downloadTotal: number;
+          memory?: number;
         }>("connections");
         if (alive) {
           setConnections(r.connections ?? []);
+          const time = Date.now();
+          const sample = trafficRate(previous, { time, up: r.uploadTotal, down: r.downloadTotal });
+          if (sample) {
+            setSamples(old => [...old.filter(point => point.time >= time - 600000), sample]);
+          }
+          previous = { time, up: r.uploadTotal, down: r.downloadTotal };
           setTraffic({ up: r.uploadTotal, down: r.downloadTotal });
+          setMemory(r.memory ?? null);
+          setTrafficError("");
         }
-      } catch {}
+      } catch (e) {
+        if (alive) setTrafficError(String(e));
+      } finally {
+        pending = false;
+      }
     };
     void poll();
     const t = setInterval(poll, 2500);
@@ -524,6 +551,7 @@ function App() {
             </section>
           )}
           <RuleChecks
+            key={s?.routingMode ?? "rule"}
             settings={s}
             connected={connected}
             visible={page === "Rules"}
@@ -693,32 +721,7 @@ function App() {
                       </div>
                     </div>
                   </section>
-                  <div className="stats">
-                    <div>
-                      <span>
-                        <ArrowDown size={16} />
-                        Загружено за сессию
-                      </span>
-                      <strong>{connected ? bytes(traffic.down) : "—"}</strong>
-                      <small>Входящий трафик</small>
-                    </div>
-                    <div>
-                      <span>
-                        <ArrowUp size={16} />
-                        Отправлено за сессию
-                      </span>
-                      <strong>{connected ? bytes(traffic.up) : "—"}</strong>
-                      <small>Исходящий трафик</small>
-                    </div>
-                    <div>
-                      <span>
-                        <Activity size={16} />
-                        Соединения
-                      </span>
-                      <strong>{connected ? connections.length : "—"}</strong>
-                      <small>Активные прямо сейчас</small>
-                    </div>
-                  </div>
+                  <DashboardTools connected={connected} settings={s} busy={busy} save={save} samples={samples} traffic={traffic} memory={memory} connections={connections.length} error={trafficError} />
                   <section className="section">
                     <div className="default-route">
                       <span>

@@ -45,6 +45,9 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     let mut seen = std::collections::HashSet::new();
     selection.retain(|n| seen.insert(n.clone()));
     let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"url-test","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"tolerance":50,"lazy":false},{"name":"FAILOVER","type":"fallback","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"lazy":false}],"rules":rules::compile(s)?});
+    doc["mode"] = json!(s.routing_mode);
+    // Pin global traffic to Atlas instead of Mihomo's generated DIRECT default.
+    doc["proxy-groups"].as_array_mut().unwrap().push(json!({"name":"GLOBAL","type":"select","proxies":["ATLAS"]}));
     // Match Clash Verge's warm-connection URL latency measurement.
     doc["unified-delay"] = json!(true);
     if s.mode == "tun" {
@@ -70,7 +73,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
             .dns
             .servers
             .iter()
-            .map(|server| format!("{}#ATLAS", server.split('#').next().unwrap()))
+            .map(|server| format!("{}#{}", server.split('#').next().unwrap(), if s.routing_mode == RoutingMode::Direct { "DIRECT" } else { "ATLAS" }))
             .collect::<Vec<_>>());
         doc["dns"]["proxy-server-nameserver"] =
             json!(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]);
@@ -143,5 +146,16 @@ mod tests {
         s.dns.ipv6 = true;
         let v6: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_ne!(v6["rules"][0], "IP-CIDR6,::/0,REJECT,no-resolve");
+        s.routing_mode = RoutingMode::Global;
+        let global: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
+        assert_eq!(global["mode"], "global");
+        assert_eq!(global["proxy-groups"][3]["proxies"], json!(["ATLAS"]));
+        s.routing_mode = RoutingMode::Direct;
+        let direct: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
+        assert_eq!(direct["mode"], "direct");
+        assert!(direct["dns"]["nameserver"][0].as_str().unwrap().ends_with("#DIRECT"));
+        let mut legacy = serde_json::to_value(&s).unwrap();
+        legacy.as_object_mut().unwrap().remove("routingMode");
+        assert_eq!(serde_json::from_value::<Settings>(legacy).unwrap().routing_mode, RoutingMode::Rule);
     }
 }

@@ -1,0 +1,176 @@
+.dashboard-tools {
+  margin: 28px 0;
+  display: grid;
+  gap: 20px;
+}
+.dashboard-panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 20px;
+  min-width: 0;
+}
+.dashboard-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.dashboard-panel h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.dashboard-panel header > span,
+.dashboard-note,
+.chart-times {
+  color: var(--muted);
+  font-size: 11px;
+}
+.traffic-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-size: 11px;
+}
+.traffic-legend span {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.traffic-legend span:last-child {
+  margin-left: auto;
+  color: var(--muted);
+}
+.traffic-upload {
+  color: #e8a64b;
+  stroke: currentColor;
+}
+.traffic-download {
+  color: #42aaff;
+  stroke: currentColor;
+}
+.traffic-chart {
+  position: relative;
+  height: 160px;
+  margin-top: 12px;
+}
+.traffic-chart svg {
+  width: 100%;
+  height: 100%;
+}
+.chart-grid {
+  stroke: var(--line);
+  stroke-dasharray: 4 6;
+}
+.traffic-chart polyline {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.traffic-chart p {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.chart-times {
+  display: flex;
+  justify-content: space-between;
+}
+.traffic-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+  margin: 22px 0 0;
+}
+.traffic-metrics div {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.traffic-metrics dt {
+  font-size: 11px;
+  color: var(--muted);
+}
+.traffic-metrics dd {
+  margin: 4px 0 0;
+  font-size: 21px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.site-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px 8px;
+}
+.site-result {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  padding: 8px 0;
+  font-size: 12px;
+  min-width: 0;
+}
+.site-result svg,
+.site-result span {
+  color: var(--muted);
+}
+.site-result strong {
+  font-size: 11px;
+}
+.site-result .site-ok {
+  color: #66ce97;
+}
+.site-result .site-failed,
+.site-failed {
+  color: #f5aa7f;
+}
+.dashboard-note {
+  margin: 16px 0 0;
+}
+.routing-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.routing-modes button {
+  flex: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 12px;
+  padding: 10px;
+}
+.mode-description {
+  margin: 18px 0 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+[data-theme="light"] .traffic-upload {
+  color: #8b5600;
+}
+[data-theme="light"] .traffic-download {
+  color: #0066b3;
+}
+[data-theme="light"] .site-result .site-ok {
+  color: #18713b;
+}
+[data-theme="light"] .site-failed {
+  color: #a13d0c;
+}
+@media (max-width: 650px) {
+  .traffic-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .dashboard-panel {
+    padding: 15px;
+  }
+}

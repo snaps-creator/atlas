@@ -416,11 +416,41 @@ async fn request(
     payload: Option<Value>,
 ) -> Result<Value, String> {
     let shared = state.inner().clone();
+    if action == "site_check" {
+        let id = payload.as_ref().and_then(|p| p["id"].as_str()).ok_or("Нет сервиса")?;
+        let url = match id {
+            "chatgpt" => "https://chatgpt.com",
+            "grok" => "https://grok.com",
+            "gemini" => "https://gemini.google.com",
+            "youtube" => "https://www.youtube.com",
+            "telegram" => "https://web.telegram.org",
+            _ => return Err("Неизвестный сервис".into()),
+        };
+        {
+            let mut a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            if !a.core.running() { return Err("Сначала подключите Atlas".into()); }
+        }
+        return tauri::async_runtime::spawn_blocking(move || {
+            let client = reqwest::blocking::Client::builder()
+                .proxy(reqwest::Proxy::all("http://127.0.0.1:17890").map_err(|e| e.to_string())?)
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build().map_err(|e| e.to_string())?;
+            let start = std::time::Instant::now();
+            match client.get(url).send() {
+                Ok(response) => Ok(json!({"ok":response.status().is_success(),"ms":start.elapsed().as_millis(),"status":response.status().as_u16()})),
+                Err(_) => Ok(json!({"ok":false,"ms":null,"status":null})),
+            }
+        }).await.map_err(|e| e.to_string())?;
+    }
     if action == "rule_probe" {
         let payload = payload.ok_or("Нет правила")?;
         let key = payload["key"].as_str().ok_or("Нет ключа правила")?;
         let (settings, client, rule, route) = {
             let a = shared.lock().map_err(|_| "Ошибка состояния")?;
+            if a.settings.routing_mode != RoutingMode::Rule {
+                return Err("Для проверки правил включите режим «Правила» на Главной".into());
+            }
             let (rule, route) = a
                 .settings
                 .groups
