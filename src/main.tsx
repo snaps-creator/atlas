@@ -49,11 +49,7 @@ import "flag-icons/css/flag-icons.min.css";
 import { latencyLabel, testPool, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
-type ProtectionStatus = {
-  secure: boolean;
-  detail: string;
-  checkedAt: number;
-};
+import { type ProtectionStatus, unavailableProtection, protectionLabel } from "./protection";
 const autoTestIntervals = [30, 60, 120, 300, 600, 900, 1800, 3600];
 function intervalLabel(seconds: number) {
   return seconds < 60 ? `${seconds} сек.` : `${seconds / 60} мин.`;
@@ -204,40 +200,34 @@ function App() {
     : "disconnected";
   useEffect(() => {
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setProtectionChecking(false);
+    setProtection({ secure: null, detail: "Проверяем текущее соединение…", checkedAt: 0 });
+    const schedule = (ms: number) => { if (alive) timer = setTimeout(inspect, ms); };
     const inspect = async () => {
+      if (!alive) return;
       if (!data?.running || data.status !== "Connected") {
-        if (alive)
-          setProtection({
-            secure: false,
-            detail: "Atlas не подключён.",
-            checkedAt: Math.floor(Date.now() / 1000),
-          });
+        setProtection({ secure: false, detail: "Atlas не подключён.", checkedAt: Math.floor(Date.now() / 1000) });
         return;
       }
-      if (protectionCheckRunning.current) return;
+      if (protectionCheckRunning.current) { schedule(1000); return; }
       protectionCheckRunning.current = true;
-      if (alive) setProtectionChecking(true);
+      setProtectionChecking(true);
+      let retry = 30000;
       try {
         const result = await request<ProtectionStatus>("protection_status");
-        if (alive) setProtection(result);
+        if (alive) setProtection(previous => ({ ...result, lastConfirmedAt: result.secure === true ? result.checkedAt : previous.lastConfirmedAt }));
       } catch (reason) {
-        if (alive)
-          setProtection({
-            secure: false,
-            detail: `Не удалось подтвердить защиту: ${String(reason)}`,
-            checkedAt: Math.floor(Date.now() / 1000),
-          });
+        retry = String(reason).includes("занят") ? 3000 : 10000;
+        if (alive) setProtection(previous => unavailableProtection(previous, reason));
       } finally {
         protectionCheckRunning.current = false;
-        setProtectionChecking(false);
+        if (alive) setProtectionChecking(false);
+        schedule(retry);
       }
     };
     void inspect();
-    const timer = window.setInterval(inspect, 30 * 1000);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
+    return () => { alive = false; if (timer !== undefined) clearTimeout(timer); };
   }, [protectionKey]);
   useEffect(() => {
     setQuery("");
@@ -452,13 +442,13 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <div
-            className={`privacy ${protection.secure ? "protected" : "unprotected"}`}
+            className={`privacy ${protection.secure === null ? "unknown" : protection.secure ? "protected" : "unprotected"}`}
             title={protection.detail}
             aria-live="polite"
           >
             <Shield size={15} />
             <span>
-              {protection.secure ? "Данные защищены" : "Данные не защищены"}
+              {protectionLabel(protection)}
               {protectionChecking && data?.running && data.status === "Connected" && (
                 <RefreshCw
                   size={12}
@@ -467,6 +457,9 @@ function App() {
                 />
               )}
               <small>{protection.detail}</small>
+              {protection.secure === null && protection.lastConfirmedAt && (
+                <small>Последнее подтверждение: {new Date(protection.lastConfirmedAt * 1000).toLocaleString("ru-RU")}</small>
+              )}
             </span>
           </div>
           <div className="version">

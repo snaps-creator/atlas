@@ -1,5 +1,10 @@
 # Recovery and responsiveness
 
+The route-change/resume reapply policy below describes Beta 15.1. The subsequent
+source review in `VPN-CLIENT-RESEARCH.md` replaces it with Mihomo's existing native
+network monitor plus WFP-only rebinding on a changed TUN identity. The elapsed-time
+resume heuristic and automatic configuration reload on route changes are removed.
+
 Implemented changes:
 
 - A selector-only save uses PUT /proxies/ATLAS, without validation subprocess,

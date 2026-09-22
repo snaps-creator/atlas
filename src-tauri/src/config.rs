@@ -73,6 +73,9 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
             }
         }
         doc["ipv6"] = json!(true);
+        // Clash Verge's Windows default. Avoid the system TCP stack's additional
+        // inbound-firewall dependency while keeping Mihomo's routing/DNS policy.
+        doc["tun"]["stack"] = json!("gvisor");
         doc["tun"]["device"] = json!("Atlas-TUN");
         // The top-level Mihomo TUN IPv4 address derives from fake-ip-range.
         // Do not reuse another client's default 198.18.0.1 address.
@@ -151,6 +154,7 @@ mod tests {
         s.default_route = Route::Proxy;
         let tun: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(tun["tun"]["enable"], true);
+        assert_eq!(tun["tun"]["stack"], "gvisor");
         assert_eq!(tun["tun"]["strict-route"], true);
         assert_eq!(tun["tun"]["device"], "Atlas-TUN");
         assert_eq!(tun["dns"]["fake-ip-range"], "198.19.0.1/16");
