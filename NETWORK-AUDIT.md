@@ -127,7 +127,7 @@ stalling SOCKS handshake: 5.03 seconds; all 62 receive terminal results. A secon
 fixture checks 62 failed nodes. Neither fixture installs TUN or changes host routes.
 These fixtures verify scheduling/timeout behavior, not the office outage's cause.
 
-Final source checks after follow-up: 86 Rust tests, 26 frontend tests, frontend
+Final source checks after incident-export follow-up: 90 Rust tests, 26 frontend tests, frontend
 production build passed. Live Atlas core sockets use physical source 192.168.1.83;
 established connections to its VPN endpoint were present. No installed binaries,
 routes, adapter state or other client's processes were changed during this audit.

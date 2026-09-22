@@ -44,6 +44,7 @@ fn check_batch_62(healthy: usize) {
         while !worker_done.load(Ordering::SeqCst) && Instant::now() < deadline {
             if let Ok((stream, _)) = blackhole.accept() { held.push(stream); }
             if let Ok((mut stream, _)) = origin.accept() {
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                 let mut bytes = [0; 4096];
                 let _ = stream.read(&mut bytes);
@@ -127,6 +128,7 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok((mut stream, _)) = origin.accept() {
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut data = [0; 4096];
                 // TCP reads are not HTTP message boundaries. Closing after the
@@ -290,6 +292,9 @@ fn independent_clients_share_vless_server_and_recover_after_its_restart() {
                 // One slow peer's half-close must not hold up the other clients.
                 // This origin receives concurrent traffic through eight proxies.
                 connections.push(thread::spawn(move || {
+                    // Windows accept inherits the listener's nonblocking mode.
+                    // A read timeout alone does not turn WSAEWOULDBLOCK into a wait.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
