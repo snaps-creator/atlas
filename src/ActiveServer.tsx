@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { request } from "./api";
 import type { Latency } from "./latency";
+import type { PoolHealth } from "./usePoolRecovery";
 
 type Proxies = Record<string, { now?: string }>;
 export function resolveServer(proxies: Proxies): string | null {
@@ -17,9 +18,11 @@ export function resolveServer(proxies: Proxies): string | null {
 export function ActiveServer({
   connected,
   onChange,
+  poolHealth,
 }: {
   connected: boolean;
   onChange?: (name: string | null) => void;
+  poolHealth?: PoolHealth;
 }) {
   const [value, setValue] = useState<{ name: string; delay: number | null } | null>(null);
   useEffect(() => {
@@ -57,6 +60,6 @@ export function ActiveServer({
   }, [connected, onChange]);
   return <div className="active-server" title={value?.name}>
     <strong>{connected ? value?.name ?? "—" : "—"}</strong>
-    <small>{connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
+    <small className={connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "pool-error" : ""} title={poolHealth?.text}>{connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "Все серверы — таймаут" : connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
   </div>;
 }

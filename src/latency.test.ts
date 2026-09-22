@@ -21,7 +21,7 @@ test("ошибка контроллера не означает недоступ
   expect(latencyLabel({ status: "error", delay: null, attempts: 0 })).toBe("Ошибка проверки");
   expect(
     latencyLabel({ status: "unreachable", delay: null, attempts: 4 }),
-  ).toBe("Нет ответа");
+  ).toBe("Таймаут");
   expect(latencyLabel({ status: "ok", delay: 0, attempts: 1 })).toBe("0 мс");
 });
 

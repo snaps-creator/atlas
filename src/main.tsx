@@ -43,13 +43,15 @@ import { RulesPanel } from "./RulesPanel";
 import { RuleChecks } from "./RuleChecks";
 import { DashboardTools } from "./DashboardTools";
 import { trafficRate, type TrafficSample } from "./traffic";
+import { ServerCard } from "./ServerCard";
 import { ActiveServer } from "./ActiveServer";
+import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
 import { boundedLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
-import { type ProtectionStatus, unavailableProtection, protectionLabel } from "./protection";
+import { type ProtectionStatus, unavailableProtection, protectionLabel, connectionProtection, afterConnectionReady } from "./protection";
 const autoTestIntervals = [30, 60, 120, 300, 600, 900, 1800, 3600];
 function intervalLabel(seconds: number) {
   return seconds < 60 ? `${seconds} сек.` : `${seconds / 60} мин.`;
@@ -87,7 +89,7 @@ function App() {
       .then(async (version) => {
         setAppVersion(version);
         const beta = /^1\.0\.0-beta\.(\d+(?:\.\d+)*)$/.exec(version);
-        const label = beta ? `Beta ${beta[1]}` : version;
+        const label = version === "2.0.0-alpha.local" ? "Local Alpha 2.0" : beta ? `Beta ${beta[1]}` : version;
         setVersionLabel(label);
         await getCurrentWindow().setTitle("atlas");
       })
@@ -95,6 +97,7 @@ function App() {
   }, []);
   const [page, setPage] = useState("Dashboard");
   const [data, setData] = useState<Snapshot | null>(null);
+  const { health: poolHealth, checkPool } = usePoolRecovery(data, setData);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [reportBusy, setReportBusy] = useState(false);
@@ -124,7 +127,7 @@ function App() {
   const [dnsText, setDnsText] = useState("");
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [logLevel, setLogLevel] = useState("ALL");
-  const [sortLatency, setSortLatency] = useState(false);
+  const [sortLatency, setSortLatency] = useState(true);
   const protectionCheckRunning = useRef(false);
   const [availableUpdate, setAvailableUpdate] =
     useState<AvailableUpdate | null>(null);
@@ -137,8 +140,8 @@ function App() {
   const [updateCheckedAt, setUpdateCheckedAt] = useState<number | null>(null);
   const [protectionChecking, setProtectionChecking] = useState(false);
   const [protection, setProtection] = useState<ProtectionStatus>({
-    secure: false,
-    detail: "Atlas не подключён.",
+    secure: null,
+    detail: "Ожидаем состояние подключения.",
     checkedAt: 0,
   });
   const [activeServer, setActiveServer] = useState<string | null>(null);
@@ -192,6 +195,7 @@ function App() {
         data.status,
         data.settings.defaultRoute,
         data.settings.routingMode,
+        data.settings.tunStack,
         data.settings.selected,
         data.settings.dns.servers.join("|"),
         data.settings.groups
@@ -204,23 +208,23 @@ function App() {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setProtectionChecking(false);
-    setProtection({ secure: null, detail: "Проверяем текущее соединение…", checkedAt: 0 });
+    const pending = connectionProtection(data?.running ?? false, data?.status);
+    setProtection(pending ?? { secure: null, detail: "VPN подключён. Подготавливаем проверку защиты…", checkedAt: 0 });
     const schedule = (ms: number) => { if (alive) timer = setTimeout(inspect, ms); };
     const inspect = async () => {
       if (!alive) return;
-      if (!data?.running || data.status !== "Connected") {
-        setProtection({ secure: false, detail: "Atlas не подключён.", checkedAt: Math.floor(Date.now() / 1000) });
+      if (pending) {
+        setProtection(pending);
         return;
       }
       if (protectionCheckRunning.current) { schedule(1000); return; }
       protectionCheckRunning.current = true;
       setProtectionChecking(true);
-      let retry = 30000;
+      const retry = 5 * 60 * 1000;
       try {
         const result = await request<ProtectionStatus>("protection_status");
         if (alive) setProtection(previous => ({ ...result, lastConfirmedAt: result.secure === true ? result.checkedAt : previous.lastConfirmedAt }));
       } catch (reason) {
-        retry = String(reason).includes("занят") ? 3000 : 10000;
         if (alive) setProtection(previous => unavailableProtection(previous, reason));
       } finally {
         protectionCheckRunning.current = false;
@@ -228,8 +232,8 @@ function App() {
         schedule(retry);
       }
     };
-    void inspect();
-    return () => { alive = false; if (timer !== undefined) clearTimeout(timer); };
+    const cancelInitial = afterConnectionReady(pending === null, () => { void inspect(); });
+    return () => { alive = false; cancelInitial(); if (timer !== undefined) clearTimeout(timer); };
   }, [protectionKey]);
   useEffect(() => {
     setQuery("");
@@ -281,6 +285,7 @@ function App() {
     };
   }, [data?.running]);
   async function act(action: string, payload?: unknown) {
+    if (action === "connect") setProtection(connectionProtection(false, "Connecting")!);
     setBusy(true);
     setError("");
     try {
@@ -412,7 +417,7 @@ function App() {
           atlas<span className="brand-dot">.</span>
         </a>
         <div className="workspace">
-          <ActiveServer connected={connected} onChange={setActiveServer} />
+          <ActiveServer connected={connected} onChange={setActiveServer} poolHealth={poolHealth} />
           <button
             role="switch"
             aria-label="Подключение VPN"
@@ -824,8 +829,7 @@ function App() {
                     ))}
                   </div>
                   {servers.length ? (
-                    <div className="list">
-                      {servers
+                    <div className="server-grid">                      {servers
                         .filter(
                           (n) =>
                             n.name
@@ -840,82 +844,16 @@ function App() {
                             : 0,
                         )
                         .map((n) => (
-                          <div
-                            className={`server-row ${
-                              connected && activeServer === n.name
-                                ? "connected-server"
-                                : ""
-                            }`}
-                            key={n.name}
-                          >
-                            <button
-                              aria-label="В избранное"
-                              className="icon-button"
-                              onClick={() =>
-                                s &&
-                                run(() =>
-                                  save({
-                                    ...s,
-                                    favorites: s.favorites.includes(n.name)
-                                      ? s.favorites.filter((f) => f !== n.name)
-                                      : [...s.favorites, n.name],
-                                  }),
-                                )
-                              }
-                            >
-                              <Star
-                                size={17}
-                                fill={
-                                  s?.favorites.includes(n.name)
-                                    ? "currentColor"
-                                    : "none"
-                                }
-                              />
-                            </button>
-                            {n.country ? (
-                              <span
-                                className={`fi fi-${n.country}`}
-                                role="img"
-                                aria-label={n.country.toUpperCase()}
-                              />
-                            ) : (
-                              <Globe2 size={22} />
-                            )}
-                            <div className="grow">
-                              <strong>{n.name}</strong>
-                              <small>{n.type.toUpperCase()}</small>
-                            </div>
-                            <button
-                              disabled={
-                                !connected ||
-                                testingAll ||
-                                latencies[n.name]?.status === "testing"
-                              }
-                              title={
-                                latencies[n.name]?.error ?? "Проверить сервер"
-                              }
-                              onClick={() => run(() => test(n.name))}
-                            >
-                              {latencyLabel(latencies[n.name])}
-                            </button>
-                            <button
-                              className={
-                                s?.selected === n.name ? "selected" : ""
-                              }
-                              onClick={() =>
-                                s && run(() => save({ ...s, selected: n.name }))
-                              }
-                            >
-                              {s?.selected === n.name ? (
-                                <>
-                                  <Check size={14} />
-                                  Выбран
-                                </>
-                              ) : (
-                                "Выбрать"
-                              )}
-                            </button>
-                          </div>
+                          <ServerCard
+                            key={n.name} server={n}
+                            selected={s?.selected === n.name || (connected && activeServer === n.name)}
+                            favorite={s?.favorites.includes(n.name) ?? false}
+                            latency={latencies[n.name]} disabled={busy}
+                            testing={!connected || testingAll || latencies[n.name]?.status === "testing"}
+                            onSelect={() => s && run(() => save({ ...s, selected: n.name }))}
+                            onTest={() => run(() => test(n.name))}
+                            onFavorite={() => s && run(() => save({ ...s, favorites: s.favorites.includes(n.name) ? s.favorites.filter(f => f !== n.name) : [...s.favorites, n.name] }))}
+                          />
                         ))}
                     </div>
                   ) : (
@@ -1188,13 +1126,15 @@ function App() {
                   )}
                   <section className="settings-section">
                     <h2>Отчёт для разбора сбоя</h2>
+                    <p className={poolHealth.phase === "all_timeout" || poolHealth.phase === "local_error" ? "pool-error" : ""} role="status">{poolHealth.text}</p>
+                    <button disabled={!connected || poolHealth.phase === "checking" || poolHealth.phase === "refreshing"} onClick={checkPool}>Проверить все подписки и восстановить</button>
                     <p>Журналы Atlas, состояние службы и ядра, маршруты, DNS и DHCP-аренда этого компьютера. Работает без интернета. Сохраните отчёт до перезагрузки.</p>
                     <p className="footnote">Ключи и ссылки подписок скрываются. Локальные IP-адреса и названия адаптеров остаются в отчёте.</p>
                     <button disabled={reportBusy} onClick={async () => {
                       setReportBusy(true);
                       setReportSaved(false);
                       try {
-                        const result = await request<{ saved: boolean }>("diagnostics_export");
+                        const result = await request<{ saved: boolean }>("diagnostics_export", { poolHealth });
                         setReportSaved(result.saved);
                       } catch (error) {
                         setError(String(error));
@@ -1236,7 +1176,7 @@ function App() {
                   ) : (
                     empty(
                       "Понятный ответ вместо догадок",
-                      "Проверьте ядро, API, подписки и доступность сайтов. Проверка обращается к Google, OpenAI и Telegram.",
+                      "Проверка ядра, туннеля, IPv4/IPv6, UDP и перехвата DNS. Для проверки сетевого пути используются внешние контрольные адреса.",
                     )
                   )}
                 </>
@@ -1314,6 +1254,21 @@ function App() {
                   )}
                   <section className="settings-section">
                     <h2>Режим подключения</h2>
+                    <div className="setting-row">
+                      <div>
+                        <strong>Сетевой стек</strong>
+                        <p>Mixed использует TCP Windows; gVisor обрабатывает TCP внутри ядра. Для смены отключите VPN.</p>
+                      </div>
+                      <select
+                        aria-label="Сетевой стек"
+                        value={s.tunStack ?? "gvisor"}
+                        disabled={connected || busy || data.status === "Connecting" || data.status === "Disconnecting"}
+                        onChange={(e) => run(() => save({ ...s, tunStack: e.target.value as "gvisor" | "mixed" }))}
+                      >
+                        <option value="gvisor">gVisor</option>
+                        <option value="mixed">Mixed</option>
+                      </select>
+                    </div>
                     <select
                       aria-label="Режим подключения"
                       value={s.mode}

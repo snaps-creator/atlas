@@ -30,7 +30,7 @@ export class LatencyEpoch {
 export function latencyLabel(value?: Latency): string {
   if (value?.status === "ok" && value.delay !== null)
     return `${value.delay} мс`;
-  if (value?.status === "unreachable") return "Нет ответа";
+  if (value?.status === "unreachable") return "Таймаут";
   if (value?.status === "testing") return "Проверка…";
   if (value?.status === "error") return "Ошибка проверки";
   if (value?.status === "not_connected") return "Нет подключения";

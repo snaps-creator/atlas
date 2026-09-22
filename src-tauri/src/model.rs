@@ -73,6 +73,8 @@ pub struct Startup {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     #[serde(default)]
+    pub tun_stack: TunStack,
+    #[serde(default)]
     pub routing_mode: RoutingMode,
     pub groups: Vec<RuleGroup>,
     pub subscriptions: Vec<Subscription>,
@@ -90,6 +92,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            tun_stack: TunStack::Gvisor,
             routing_mode: RoutingMode::Rule,
             groups: vec![],
             subscriptions: vec![],
@@ -126,6 +129,13 @@ pub enum RoutingMode {
     Global,
     Direct,
 }
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunStack {
+    #[default]
+    Gvisor,
+    Mixed,
+}
 impl Settings {
     pub fn servers(&self) -> Vec<Value> {
         self.subscriptions
@@ -144,6 +154,19 @@ pub fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_settings_migrate_and_validate() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("tunStack");
+        assert_eq!(serde_json::from_value::<Settings>(value.clone()).unwrap().tun_stack, TunStack::Gvisor);
+        value["tunStack"] = serde_json::json!("mixed");
+        let mixed = serde_json::from_value::<Settings>(value.clone()).unwrap();
+        assert_eq!(mixed.tun_stack, TunStack::Mixed);
+        assert_eq!(serde_json::to_value(mixed).unwrap()["tunStack"], "mixed");
+        value["tunStack"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<Settings>(value).is_err());
+    }
 
     #[test]
     fn old_settings_receive_default_auto_test_interval() {

@@ -10,6 +10,7 @@ mod diagnostics;
 mod job;
 mod lan_policy;
 mod latency;
+mod auto_recovery;
 mod model;
 mod network_guard;
 mod portable;
@@ -73,6 +74,9 @@ impl App {
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
         next.mode = "tun".into();
+        if next.tun_stack != self.settings.tun_stack && self.core.running() {
+            return Err("Перед изменением сетевого стека отключите VPN".into());
+        }
         rules::compile(&next)?;
         if !["light", "dark", "system"].contains(&next.theme.as_str())
             || next.startup.delay_seconds > 300
@@ -473,6 +477,65 @@ async fn request(
     if action == "snapshot" {
         return Ok(app.state::<published_state::PublishedState>().get());
     }
+    if action == "pool_probe" {
+        let (client, revision) = {
+            let a = shared.try_lock().map_err(|_| "Atlas занят; проверка отложена")?;
+            if a.status != "Connected" { return Err("Atlas не подключён".into()); }
+            (a.core.client(), a.revision)
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            client.api("GET", "/version", None)?;
+            let mut delays = serde_json::Map::new();
+            for endpoint in latency::ENDPOINTS {
+                let url: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
+                match client.api("GET", &format!("/group/AUTO/delay?timeout=5000&url={url}"), None) {
+                    Ok(value) => {
+                        if let Some(values) = value.as_object() { delays.extend(values.clone()); }
+                        if !delays.is_empty() { break; }
+                    }
+                    Err(error) if error == "Mihomo API: HTTP 504" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            client.api("GET", "/version", None)?;
+            Ok(json!({"revision":revision,"delays":delays}))
+        }).await.map_err(|e| e.to_string())?;
+    }
+    if action == "pool_refresh" {
+        let expected = payload.as_ref().and_then(|v| v["revision"].as_u64()).ok_or("Нет ревизии")?;
+        let mut next = {
+            let a = shared.try_lock().map_err(|_| "Atlas занят; восстановление отложено")?;
+            if a.revision != expected || a.status != "Connected" { return Err("Состояние изменилось; восстановление отменено".into()); }
+            a.settings.clone()
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            // Download outside the app mutex; status and Disconnect remain responsive.
+            let mut failures = Vec::new();
+            for sub in &mut next.subscriptions {
+                let result = keyring::Entry::new("AtlasVPN", &sub.id)
+                    .map_err(|_| "Хранилище подписки недоступно".to_string())
+                    .and_then(|entry| entry.get_password().map_err(|_| "Ссылка подписки недоступна".to_string()))
+                    .and_then(|url| subscriptions::download(&url, true));
+                match result {
+                    Ok(mut nodes) => {
+                        for (index, node) in nodes.iter_mut().enumerate() {
+                            node["name"] = json!(format!("{} · {}-{}", node["name"].as_str().unwrap_or("Сервер"), sub.id.chars().take(8).collect::<String>(), index + 1));
+                        }
+                        sub.servers = nodes; sub.updated_at = model::now(); sub.error = None;
+                    }
+                    Err(error) => { sub.error = Some(error); failures.push(sub.name.clone()); }
+                }
+            }
+            let mut a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
+            if a.revision != expected || a.status != "Connected" || !a.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("Состояние изменилось; восстановление отменено".into());
+            }
+            next.selected = "AUTO".into();
+            a.save(next)?;
+            a.log("INFO", "Восстановление: обновление всех подписок завершено; выбран общий пул AUTO");
+            Ok(json!({"snapshot":a.snapshot(),"failedSubscriptions":failures}))
+        }).await.map_err(|e| e.to_string())?;
+    }
     if action == "connect" || action == "disconnect" {
         app.state::<ConnectionIntent>()
             .0
@@ -501,7 +564,10 @@ async fn request(
                 let mut secrets = Vec::new();
                 support_report::collect_secrets(&serde_json::to_value(&a.settings).map_err(|e| e.to_string())?, &mut secrets);
                 let context = json!({"status":a.status,"mode":a.settings.mode,
-                    "routingMode":a.settings.routing_mode,"error":a.error,"logs":a.logs});
+                    "routingMode":a.settings.routing_mode,"tunStack":a.settings.tun_stack,
+                    "selected":a.settings.selected,"autoTestIntervalSeconds":a.settings.auto_test_interval_seconds,
+                    "error":a.error,"logs":a.logs,
+                    "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});
                 (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
             }
             Err(_) => ("Atlas занят: состояние приложения и его журнал недоступны. Снимок Windows собирается независимо.".into(), None, Vec::new()),

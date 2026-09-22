@@ -484,7 +484,10 @@ mod integration_tests {
         s.subscriptions.push(Subscription {id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         for text in ["version: 1\ndefault-route: proxy\nrules: []", "version: 1\ndefault-route: proxy\nrules:\n - {domain-suffix: example.com, route: direct}\n - {ip-cidr: 192.0.2.0/24, route: block, no-resolve: true}"] {
             let import = crate::portable::parse(text).unwrap(); s.groups = import.groups;
-            for ipv6 in [false, true] { s.dns.ipv6 = ipv6; core.validate(&s).expect("Mihomo TUN configuration must be valid"); }
+            for stack in [crate::model::TunStack::Gvisor, crate::model::TunStack::Mixed] {
+                s.tun_stack = stack;
+                for ipv6 in [false, true] { s.dns.ipv6 = ipv6; core.validate(&s).expect("Mihomo TUN configuration must be valid"); }
+            }
         }
         drop(core);
         std::fs::remove_dir_all(directory).unwrap();

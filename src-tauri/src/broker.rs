@@ -369,7 +369,7 @@ fn allowed_api(method: &str, path: &str) -> bool {
     if method == "DELETE" && path.starts_with("/connections/") && !path.contains(['?', '#']) {
         return true;
     }
-    if method == "GET" && path.starts_with("/proxies/") && path.contains("/delay?") {
+    if method == "GET" && (path.starts_with("/proxies/") || path.starts_with("/group/AUTO/delay?")) && path.contains("/delay?") {
         if let Ok(url) = url::Url::parse(&format!("http://localhost{path}")) {
             return url.query_pairs().all(|(k, v)| match k.as_ref() {
                 "url" => [
@@ -426,12 +426,35 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
     let mut active_settings: Option<Settings> = None;
+    let mut recovery_trigger = crate::auto_recovery::Trigger::default();
+    let mut recovery_probe = crate::background_probe::Probe::default();
+    let mut recovery_pending = false;
+    let mut last_recovery_scan = Instant::now();
     let mut last_health = Instant::now();
     let mut health_failures = 0;
     let mut health_probe = crate::background_probe::Probe::default();
     let mut tun_identity = network_guard::tun_identity();
     let mut queries = crate::query_jobs::QueryJobs::default();
     loop {
+        if recovery_probe.poll().is_some() { recovery_pending = false; }
+        if configured && last_recovery_scan.elapsed() >= Duration::from_millis(500) {
+            last_recovery_scan = Instant::now();
+            if let Some(settings) = &active_settings {
+                // Consume failures during a check too, preventing a retry storm.
+                let lines = core.client().logs().unwrap_or_default();
+                let failed = recovery_trigger.observe(&settings.selected, &lines);
+                if failed && !recovery_pending {
+                    let client = core.client();
+                    let group = settings.selected.clone();
+                    recovery_pending = recovery_probe.start(move || {
+                        // Group URLTest refreshes health for all candidates. The
+                        // group, not Atlas, selects the fastest available node.
+                        let path = format!("/group/{group}/delay?timeout=5000&url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204");
+                        client.api("GET", &path, None).is_ok()
+                    });
+                }
+            }
+        }
         if crate::service::is_stopping() || core.cancelled() {
             break;
         }
@@ -631,8 +654,13 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 let stopped = core.stop();
                 guard = None;
                 explicit_stop = true;
-                stopped?;
-                network_guard::clear()?;
+                // Attempt every cleanup even if core termination failed. Never
+                // acknowledge Stop before releasing filters and cached fake IPs.
+                let filters = network_guard::clear();
+                let dns = crate::session_cleanup::flush_dns();
+                let errors: Vec<_> = [stopped, filters, dns].into_iter()
+                    .filter_map(Result::err).collect();
+                if !errors.is_empty() { return Err(errors.join("; ")); }
                 Ok(json!({}))
             }
             _ => Err("Неизвестная команда сетевой службы".into()),

@@ -74,9 +74,8 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         }
         // Honor the user's IPv6 policy for outbound dialing as well as DNS.
         // Windows strict-route blocks uncaptured IPv6 when Inet6Address is absent.
-        // Clash Verge's Windows default. Avoid the system TCP stack's additional
-        // inbound-firewall dependency while keeping Mihomo's routing/DNS policy.
-        doc["tun"]["stack"] = json!("gvisor");
+        // Stack selection does not change the LAN, DNS, or routing policy.
+        doc["tun"]["stack"] = json!(s.tun_stack);
         doc["tun"]["device"] = json!("Atlas-TUN");
         // The top-level Mihomo TUN IPv4 address derives from fake-ip-range.
         // Do not reuse another client's default 198.18.0.1 address.
@@ -165,6 +164,13 @@ mod tests {
         let tun: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(tun["tun"]["enable"], true);
         assert_eq!(tun["tun"]["stack"], "gvisor");
+        let mut mixed_settings = s.clone();
+        mixed_settings.tun_stack = TunStack::Mixed;
+        assert!(!same_network_config(&s, &mixed_settings));
+        let mut mixed: Value = serde_yaml::from_str(&generate(&mixed_settings, "secret").unwrap()).unwrap();
+        assert_eq!(mixed["tun"]["stack"], "mixed");
+        mixed["tun"]["stack"] = json!("gvisor");
+        assert_eq!(mixed, tun, "Changing stack must preserve all other network policies");
         assert_eq!(tun["tun"]["strict-route"], true);
         assert_eq!(tun["tun"]["device"], "Atlas-TUN");
         let exclusions = tun["tun"]["route-exclude-address"].as_array().unwrap();
