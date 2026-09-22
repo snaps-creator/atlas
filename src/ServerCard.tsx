@@ -19,7 +19,7 @@ export function ServerCard({ server, selected, favorite, latency, disabled, test
     </button>
     <button className={`server-card-delay ${tone}`} disabled={testing} onClick={onTest}
       aria-label={`Проверить задержку: ${server.name}. ${latencyLabel(latency)}`}
-      title={latency?.error ?? "Измерить задержку через этот сервер"}>
+      title={latency?.error ?? "HTTP-задержка как в Clash: cp.cloudflare.com, до 10 секунд. Не скорость скачивания."}>
       {delay == null ? latencyLabel(latency) : <>{delay}<small>мс</small></>}
     </button>
     <button className="server-card-favorite" onClick={onFavorite} disabled={disabled} aria-pressed={favorite} aria-label={`${favorite ? "Убрать из избранного" : "В избранное"}: ${server.name}`}>

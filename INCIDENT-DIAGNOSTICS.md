@@ -1,4 +1,9 @@
-# Incident TXT, schema 2
+# Incident TXT, schema 3 (working tree; not yet installed)
+
+The 22 September follow-up is described in [RELIABILITY-FIXES.md](RELIABILITY-FIXES.md).
+It fixes URL path encoding and pseudo-node filtering, requires per-URL HTTP 204
+health, and records upstream resolver responses instead of treating fake-IP as
+proof of successful resolution. The service performs endpoint-aware recovery.
 
 The Diagnostics → Download TXT action now captures a failure investigation bundle.
 It does not disconnect VPN, select a node, refresh subscriptions, enable auditing,
@@ -11,12 +16,16 @@ before closing Atlas or rebooting. Beta 17.2 includes a matching signed installe
 - Request-time status, selection, configuration revision, application logs, public
   endpoint/transport fields, subscription update times, configuration fingerprints.
   The final cached revision/configuration is included to identify changes mid-test.
-- A passive flight recorder across app restarts: status, selection, core health
-  histories, recent core errors and periods when the app lock could not be read.
-  It samples roughly every 15 seconds plus bounded API duration. It makes **no
-  internet probes**. It retains at most 240 entries / 2 MiB and appends only new
+- A flight recorder across app restarts: status, selection, selected-node URL health,
+  deduplicated core errors, received-byte progress and native interface counter
+  deltas. It samples roughly every 15 seconds plus bounded API duration. Ordinary
+  samples make no internet probes. New connection/DNS errors can trigger one bounded
+  incident capture per minute, including the same active probes as export.
+  It retains at most 4096 entries / 32 MiB and appends only new
   redacted records to `incident-history.ndjson` in the application data directory.
-  Rotation and expiry mean it is not an unlimited or packet-level history.
+  Only eight full automatic incident bundles are retained; small incident summaries
+  and periodic samples have the remaining capacity. Coverage, byte usage and dropped
+  entries are explicit. Rotation means this is not unlimited or packet-level history.
 - Before/after core version, selected groups, all nodes' health history and per-URL
   results, timestamped core errors. Per-URL IDs survive URL redaction.
 - Four parallel HEAD requests: two fixed control hosts, each via the local mixed

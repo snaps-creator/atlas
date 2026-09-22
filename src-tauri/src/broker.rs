@@ -363,6 +363,15 @@ fn reject_file_keys(value: &Value) -> Result<(), String> {
     Ok(())
 }
 fn allowed_api(method: &str, path: &str) -> bool {
+    if method == "GET" && path.starts_with("/dns/query?") {
+        if let Ok(url) = url::Url::parse(&format!("http://localhost{path}")) {
+            let pairs: Vec<_> = url.query_pairs().collect();
+            return pairs.len() == 2 && pairs.iter().all(|(key,value)| match key.as_ref() {
+                "name" => crate::support_probes::valid_dns_name(value),
+                "type" => matches!(value.as_ref(),"A"|"AAAA"), _ => false,
+            }) && pairs.iter().any(|(k,_)|k == "name") && pairs.iter().any(|(k,_)|k == "type");
+        }
+    }
     if method == "GET" && ["/version", "/connections", "/proxies"].contains(&path) {
         return true;
     }
@@ -373,11 +382,13 @@ fn allowed_api(method: &str, path: &str) -> bool {
         if let Ok(url) = url::Url::parse(&format!("http://localhost{path}")) {
             return url.query_pairs().all(|(k, v)| match k.as_ref() {
                 "url" => [
+                    crate::latency::DISPLAY_URL,
                     "https://www.gstatic.com/generate_204",
                     "https://cp.cloudflare.com/generate_204",
                 ]
                 .contains(&v.as_ref()),
                 "timeout" => v.parse::<u64>().is_ok_and(|n| n <= 10000),
+                "expected" => v == "204",
                 _ => false,
             });
         }
@@ -426,10 +437,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
     let mut active_settings: Option<Settings> = None;
-    let mut recovery_trigger = crate::auto_recovery::Trigger::default();
-    let mut recovery_probe = crate::background_probe::Probe::default();
-    let mut recovery_pending = false;
-    let mut recovery_cooldown = crate::auto_recovery::Cooldown::default();
+    let mut recovery = crate::resilient_selection::Recovery::default();
     let mut last_recovery_scan = Instant::now();
     let mut last_health = Instant::now();
     let mut health_failures = 0;
@@ -437,24 +445,9 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut tun_identity = network_guard::tun_identity();
     let mut queries = crate::query_jobs::QueryJobs::default();
     loop {
-        if recovery_probe.poll().is_some() { recovery_pending = false; }
         if configured && last_recovery_scan.elapsed() >= Duration::from_millis(500) {
             last_recovery_scan = Instant::now();
-            if let Some(settings) = &active_settings {
-                // Consume failures during a check too, preventing a retry storm.
-                let lines = core.client().logs().unwrap_or_default();
-                let failed = recovery_trigger.observe(&settings.selected, &lines);
-                if failed && !recovery_pending && recovery_cooldown.allow(Instant::now()) {
-                    let client = core.client();
-                    let group = settings.selected.clone();
-                    recovery_pending = recovery_probe.start(move || {
-                        // Group URLTest refreshes health for all candidates. The
-                        // group, not Atlas, selects the fastest available node.
-                        let path = format!("/group/{group}/delay?timeout=5000&url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204");
-                        client.api("GET", &path, None).is_ok()
-                    });
-                }
-            }
+            if let Some(settings) = &active_settings { recovery.tick(core.client(), settings); }
         }
         if crate::service::is_stopping() || core.cancelled() {
             break;
@@ -590,6 +583,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 configured = true;
                 health_probe = Default::default();
                 health_failures = 0;
+                recovery.invalidate();
                 active_settings = Some(s);
                 last_health = Instant::now();
                 tun_identity = network_guard::tun_identity();
@@ -626,6 +620,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                         return Err("Обновление подключения отменено".into());
                     }
                 }
+                recovery.invalidate();
                 active_settings = Some(s);
                 tun_identity = network_guard::tun_identity();
                 health_probe = Default::default();
@@ -641,6 +636,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 {
                     return Err("Сервер отсутствует в подписках".into());
                 }
+                recovery.invalidate();
                 core.select(name)?;
                 settings.selected = name.to_owned();
                 Ok(json!({}))

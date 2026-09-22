@@ -31,7 +31,7 @@ fn http_with(endpoint: &str, proxy: Option<&str>, timeout: Duration) -> Value {
 }
 fn eligible(node: &Value) -> bool {
     node.get("all").is_none() && node["type"].as_str().is_some_and(|kind| {
-        !["direct","reject","rejectdrop","pass","compatible","dns"].contains(&kind.to_ascii_lowercase().as_str())
+        !["direct","reject","rejectdrop","pass","passrule","compatible","dns"].contains(&kind.to_ascii_lowercase().replace('-', "").as_str())
     })
 }
 fn sample_nodes(proxies: &Value) -> Vec<String> {
@@ -75,6 +75,45 @@ fn dns() -> Value {
         "elapsedMs":start.elapsed().as_millis(),"result":result.unwrap_or_else(|e| json!({"response":false,"error":e})),
         "scope":"Local DNS reply; fake-IP response does not prove upstream DNS or VPN success"})
 }
+pub(crate) fn valid_dns_name(name: &str) -> bool {
+    name.len() <= 253 && name.contains('.') && name.split('.').all(|part|
+        !part.is_empty() && part.len() <= 63 && !part.starts_with('-') && !part.ends_with('-') && part.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'-'))
+}
+fn failed_domains(lines: &[String]) -> Vec<String> {
+    let mut domains = vec!["www.gstatic.com".to_owned(),"cp.cloudflare.com".to_owned()];
+    for line in lines.iter().rev().filter(|l| !l.starts_with("ATLAS_EVENT") && (l.contains("resolve failed") || l.contains("can't resolve ip"))) {
+        if let Some(name) = line.split("--> ").nth(1).and_then(|s|s.split(':').next()) {
+            if valid_dns_name(name) && name.parse::<std::net::IpAddr>().is_err() && !domains.iter().any(|s|s == name) { domains.push(name.into()); }
+        }
+        if domains.len() >= 6 { break; }
+    }
+    domains
+}
+fn dns_verdict(result: &Value) -> &'static str {
+    if let Some(error)=result["error"].as_str() {
+        if error.contains("SERVFAIL") {return "SERVFAIL";}
+        if error.contains("REFUSED") {return "REFUSED";}
+        if error.contains("NXDOMAIN") {return "NXDOMAIN";}
+    }
+    match result["Status"].as_u64() {
+        Some(3) => "NXDOMAIN", Some(2) => "SERVFAIL", Some(5) => "REFUSED",
+        Some(0) if result["Answer"].as_array().is_some_and(|a|!a.is_empty()) => "ANSWER",
+        Some(0) => "NO_ANSWER", Some(_) => "DNS_ERROR", None => "QUERY_FAILED",
+    }
+}
+pub(crate) fn upstream_dns(client: &ApiClient) -> Value {
+    let domains = failed_domains(&client.logs().unwrap_or_default());
+    let results = std::thread::scope(|scope| {
+        let jobs: Vec<_> = domains.iter().map(|name|scope.spawn(move || {
+            let path = format!("/dns/query?name={}&type=A",crate::latency::encode_name(name));
+            let at = crate::model::now();
+            let result = client.api("GET",&path,None).unwrap_or_else(|e|json!({"error":e}));
+            json!({"name":name,"at":at,"classification":dns_verdict(&result),"result":result})
+        })).collect();
+        jobs.into_iter().map(|j|j.join().unwrap_or(Value::Null)).collect::<Vec<_>>()
+    });
+    json!({"scope":"Mihomo default resolver Exchange, bypasses fake-IP replies; not a direct-nameserver measurement. NXDOMAIN is a DNS response, not proof that every resolver agrees.","results":results})
+}
 pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
     let started_at = crate::model::now();
     let mut http_results = Vec::new();
@@ -89,6 +128,7 @@ pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
     });
     // Query a bounded set of nodes individually. Unlike /group/delay this does
     // not ForceSet AUTO's selection. Include last failed and working histories.
+    let resolver = client.as_ref().filter(|_|Instant::now()<deadline).map(upstream_dns);
     let node_tests = client.map(|c| {
         if Instant::now() >= deadline { return json!({"error":"Export deadline reached before node tests","tested":0}); }
         match c.api("GET","/proxies",None) {
@@ -98,17 +138,15 @@ pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
                 let jobs: Vec<_> = names.iter().map(|name| {
                     let client = c.clone();
                     scope.spawn(move || {
-                        let encoded: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
                         let mut checks = Vec::new();
                         for (index, endpoint) in crate::latency::ENDPOINTS.iter().enumerate() {
                             if Instant::now() >= deadline {
                                 checks.push(json!({"control":index,"skipped":"Export deadline reached"}));
                                 break;
                             }
-                            let url: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
                             let start = Instant::now();
                             let at = crate::model::now();
-                            let result = client.api("GET",&format!("/proxies/{encoded}/delay?timeout=5000&url={url}"),None);
+                            let result = crate::latency::verified_probe(&client,name,endpoint);
                             checks.push(json!({"control":index,"startedAt":at,"elapsedMs":start.elapsed().as_millis(),
                                 "result":result.unwrap_or_else(|e|json!({"error":e}))}));
                         }
@@ -121,7 +159,7 @@ pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
         }
         Err(e) => json!({"error":e,"tested":0}),
     }}).unwrap_or_else(||json!({"error":"No captured core client; node probes skipped","tested":0}));
-    json!({"startedAt":started_at,"completedAt":crate::model::now(),"http":http_results,"localDns":local_dns,"nodeTests":node_tests,
+    json!({"startedAt":started_at,"completedAt":crate::model::now(),"http":http_results,"localDns":local_dns,"upstreamDns":resolver,"nodeTests":node_tests,
         "scope":"Windows path obeys active TUN/WFP/rules; it is NOT an independent physical bypass. Mixed proxy obeys Atlas rules. HTTP success need not imply every VPN node works."})
 }
 
@@ -130,9 +168,20 @@ mod tests {
     use super::*;
     use std::io::{Read,Write};
     #[test]
+    fn dns_failures_are_classified_without_claiming_every_timeout_is_nxdomain() {
+        assert_eq!(dns_verdict(&json!({"Status":3})),"NXDOMAIN");
+        assert_eq!(dns_verdict(&json!({"Status":2})),"SERVFAIL");
+        assert_eq!(dns_verdict(&json!({"Status":0})),"NO_ANSWER");
+        assert_eq!(dns_verdict(&json!({"error":"timeout"})),"QUERY_FAILED");
+        assert!(valid_dns_name("crl.anydesk.com"));
+        assert!(!valid_dns_name("a.com&name=other.com"));
+        assert_eq!(failed_domains(&["[TCP] dial DIRECT --> crl.anydesk.com:80 error: dns resolve failed".into()]).last().unwrap(),"crl.anydesk.com");
+    }
+    #[test]
     fn direct_and_group_nodes_never_count_as_vpn_evidence() {
         let mut p = json!({"proxies":{"ATLAS":{"now":"DIRECT","all":["DIRECT"]},
             "DIRECT":{"type":"Direct","alive":true},"named-direct":{"type":"Direct","alive":true},
+            "PASS-RULE":{"type":"PassRule","alive":true},"reject-drop":{"type":"RejectDrop","alive":false},
             "failed":{"type":"Vless","alive":false},"healthy":{"type":"Vless","alive":true}}});
         assert_eq!(sample_nodes(&p),vec!["failed","healthy"]);
         p["proxies"]["ATLAS"]["now"] = json!("healthy");

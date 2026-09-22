@@ -14,9 +14,9 @@ test("групповая проверка не зависает при поте�
     const request = new Promise<number>(resolve => { finish = resolve; });
     const result = boundedBatch(request).catch(error => String(error));
     await vi.advanceTimersByTimeAsync(18000);
-    expect(await result).toContain("18 секунд");
+    expect(await result).toContain("отведённое время");
     finish(42);
-    expect(await result).toContain("18 секунд");
+    expect(await result).toContain("отведённое время");
     expect(vi.getTimerCount()).toBe(0);
   } finally { vi.useRealTimers(); }
 });

@@ -2,7 +2,7 @@
 use serde_json::Value;
 use std::{collections::HashMap, sync::mpsc, time::{Duration, Instant}};
 type Reply = Result<Value, String>;
-const PER_CLASS: usize = 8;
+const PER_CLASS: usize = 16;
 #[derive(Default)]
 pub struct QueryJobs {
     jobs: HashMap<String, (Instant, bool, mpsc::Receiver<Reply>)>,

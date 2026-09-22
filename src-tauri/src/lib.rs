@@ -10,7 +10,9 @@ mod diagnostics;
 mod job;
 mod lan_policy;
 mod latency;
+#[cfg(test)]
 mod auto_recovery;
+mod resilient_selection;
 mod model;
 mod network_guard;
 mod portable;
@@ -27,6 +29,7 @@ mod subscriptions;
 mod support_report;
 mod support_probes;
 mod incident_history;
+mod interface_evidence;
 mod windows;
 use model::*;
 use serde_json::{json, Value};
@@ -493,9 +496,12 @@ async fn request(
             let mut delays = serde_json::Map::new();
             for endpoint in latency::ENDPOINTS {
                 let url: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
-                match client.api("GET", &format!("/group/AUTO/delay?timeout=5000&url={url}"), None) {
+                match client.api("GET", &format!("/group/AUTO/delay?timeout=5000&expected=204&url={url}"), None) {
                     Ok(value) => {
-                        if let Some(values) = value.as_object() { delays.extend(values.clone()); }
+                        let health = client.api("GET","/proxies",None)?;
+                        if let Some(values) = value.as_object() { delays.extend(values.iter()
+                            .filter(|(name,_)|health["proxies"][name.as_str()]["extra"][endpoint]["alive"] == true)
+                            .map(|(name,value)|(name.clone(),value.clone()))); }
                         if !delays.is_empty() { break; }
                     }
                     Err(error) if error == "Mihomo API: HTTP 504" => {}
@@ -535,9 +541,11 @@ async fn request(
             if a.revision != expected || a.status != "Connected" || !a.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("Состояние изменилось; восстановление отменено".into());
             }
-            next.selected = "AUTO".into();
+            if !["AUTO","FAILOVER"].contains(&next.selected.as_str()) && !next.servers().iter().any(|n|n["name"] == next.selected) {
+                return Err("Выбранный вручную сервер исчез из подписки. Автоматическая замена отменена; выберите сервер явно.".into());
+            }
             a.save(next)?;
-            a.log("INFO", "Восстановление: обновление всех подписок завершено; выбран общий пул AUTO");
+            a.log("INFO", "Восстановление: обновление подписок завершено; режим выбора сохранён");
             Ok(json!({"snapshot":a.snapshot(),"failedSubscriptions":failures}))
         }).await.map_err(|e| e.to_string())?;
     }
@@ -858,6 +866,9 @@ pub fn run() {
                 let shared = shared.clone();
                 let shutdown = shutdown.clone();
                 std::thread::spawn(move || {
+                    let mut recorder = support_report::Recorder::default();
+                    let incident_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let mut last_incident: Option<std::time::Instant> = None;
                     while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                         let captured = shared.try_lock().ok().map(|a| {
                             let mut secrets = Vec::new();
@@ -865,9 +876,23 @@ pub fn run() {
                             (a.status.clone(),a.revision,a.error.clone(),a.settings.selected.clone(),a.core.client(),secrets)
                         });
                         if let Some((status,revision,error,selected,client,secrets)) = captured {
-                            let evidence = if status == "Connected" {
-                                support_report::passive_sample(&client)
-                            } else { json!({"skipped":"No connected session"}) };
+                            let (evidence, incident) = if status == "Connected" {
+                                recorder.sample(&client)
+                            } else { (json!({"skipped":"No connected session"}),false) };
+                            if incident {
+                                let allowed = last_incident.is_none_or(|t|t.elapsed() >= std::time::Duration::from_secs(60));
+                                if allowed && !incident_busy.swap(true,std::sync::atomic::Ordering::SeqCst) {
+                                    last_incident = Some(std::time::Instant::now());
+                                    let busy = incident_busy.clone(); let c = client.clone(); let secrets = secrets.clone();
+                                    incident_history::record("incident_capture_started",json!({"revision":revision}),&[]);
+                                    std::thread::spawn(move || {
+                                        support_report::automatic_incident(c,secrets,revision);
+                                        busy.store(false,std::sync::atomic::Ordering::SeqCst);
+                                    });
+                                } else {
+                                    incident_history::record("incident_capture_coalesced",json!({"revision":revision,"reason":"Capture active or 60-second cooldown; new errors retained in sample"}),&[]);
+                                }
+                            }
                             incident_history::record("passive_sample",json!({"status":status,"revision":revision,
                                 "error":error,"selected":selected,"core":evidence}),&secrets);
                         } else {
