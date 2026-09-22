@@ -18,6 +18,7 @@ mod session_cleanup;
 mod shutdown;
 mod storage;
 mod subscriptions;
+mod support_report;
 mod windows;
 use model::*;
 use serde_json::{json, Value};
@@ -456,6 +457,22 @@ async fn request(
     {
         app.state::<ConnectionIntent>().0.store(false, std::sync::atomic::Ordering::SeqCst);
         return Err("Atlas завершает работу".into());
+    }
+    if action == "diagnostics_export" {
+        // Export must remain usable while connect/apply holds the application lock.
+        let (context, client, secrets) = match shared.try_lock() {
+            Ok(a) => {
+                let mut secrets = Vec::new();
+                support_report::collect_secrets(&serde_json::to_value(&a.settings).map_err(|e| e.to_string())?, &mut secrets);
+                let context = json!({"status":a.status,"mode":a.settings.mode,
+                    "routingMode":a.settings.routing_mode,"error":a.error,"logs":a.logs});
+                (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
+            }
+            Err(_) => ("Atlas занят: состояние приложения и его журнал недоступны. Снимок Windows собирается независимо.".into(), None, Vec::new()),
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            support_report::save(context, client, secrets).map(|saved| json!({"saved":saved}))
+        }).await.map_err(|e| e.to_string())?;
     }
     if action == "connections" || action == "proxies" {
         let client = shared

@@ -97,6 +97,8 @@ function App() {
   const [data, setData] = useState<Snapshot | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportSaved, setReportSaved] = useState(false);
   const [query, setQuery] = useState("");
   const [adding, setAdding] = useState(false);
   const [url, setUrl] = useState("");
@@ -1177,6 +1179,26 @@ function App() {
                       Запустить проверку
                     </button>,
                   )}
+                  <section className="settings-section">
+                    <h2>Отчёт для разбора сбоя</h2>
+                    <p>Журналы Atlas, состояние службы и ядра, маршруты, DNS и DHCP-аренда этого компьютера. Работает без интернета. Сохраните отчёт до перезагрузки.</p>
+                    <p className="footnote">Ключи и ссылки подписок скрываются. Локальные IP-адреса и названия адаптеров остаются в отчёте.</p>
+                    <button disabled={reportBusy} onClick={async () => {
+                      setReportBusy(true);
+                      setReportSaved(false);
+                      try {
+                        const result = await request<{ saved: boolean }>("diagnostics_export");
+                        setReportSaved(result.saved);
+                      } catch (error) {
+                        setError(String(error));
+                      } finally {
+                        setReportBusy(false);
+                      }
+                    }}>
+                      {reportBusy ? "Собираем отчёт…" : "Скачать отчёт TXT"}
+                    </button>
+                    <p role="status">{reportSaved ? "Отчёт сохранён." : reportBusy ? "Выберите файл для сохранения. Сбор данных может занять до минуты." : ""}</p>
+                  </section>
                   {checks.length ? (
                     <div className="list">
                       {checks.map((c) => (
