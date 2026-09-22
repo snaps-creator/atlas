@@ -1,6 +1,6 @@
 [package]
 name = "atlas-vpn"
-version = "1.0.0-beta.17.3"
+version = "1.0.0-beta.18.1.1"
 edition = "2021"
 
 [lib]
@@ -26,6 +26,7 @@ ipnet = "2"
 keyring = { version = "3", features = ["windows-native"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+ring = "0.17"
 maxminddb = "0.32.0"
 rfd = "0.17.2"
 png = "0.18.1"

@@ -31,7 +31,7 @@ extern "system" {
 extern "system" {
     fn LocalFree(p: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
-fn crypt(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn crypt(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     let data = Blob {
         len: input.len().try_into().map_err(|_| "Слишком большой файл")?,
         data: input.as_ptr() as *mut u8,

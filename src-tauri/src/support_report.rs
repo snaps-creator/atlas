@@ -267,7 +267,7 @@ fn reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     rx
 }
 
-fn run_bounded(mut command: Command, timeout: Duration) -> Result<String, String> {
+pub(crate) fn run_bounded(mut command: Command, timeout: Duration) -> Result<String, String> {
     let child = command
         .creation_flags(0x08000000)
         .stdin(Stdio::null())

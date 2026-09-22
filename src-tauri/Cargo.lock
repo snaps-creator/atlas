@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "atlas-vpn"
-version = "1.0.0-beta.17.3"
+version = "1.0.0-beta.18.1.1"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -234,6 +234,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rfd",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
