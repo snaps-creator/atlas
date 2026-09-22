@@ -570,7 +570,11 @@ function Get-WinEvent { param($FilterHashtable,$MaxEvents) [pscustomobject]@{Id=
         let script = format!("{stubs}\n{}", include_str!("support_snapshot.ps1"));
         let mut command = Command::new("powershell.exe");
         command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-        let output = run_bounded(command, Duration::from_secs(8)).unwrap();
+        // This is a content/failure-isolation test, not a startup benchmark.
+        // Cold PowerShell on shared CI runners can spend >8 s just starting.
+        // Timeout enforcement has separate readiness-synchronized tests above.
+        let output = run_bounded(command, Duration::from_secs(60)).unwrap();
+        assert!(!output.contains("Collector timed out"), "{output}");
         for expected in [
             "AtlasNetworkService",
             "mihomo.exe",
