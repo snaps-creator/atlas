@@ -32,6 +32,69 @@ pub(crate) fn is_stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
 }
 
+/// Independent of the command loop: a stuck core start/apply must not leave
+/// a privileged session and its dynamic filters alive after the desktop exits.
+pub(crate) struct SessionWatch(std::sync::Arc<AtomicBool>);
+impl Drop for SessionWatch {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+fn shutdown_watch(
+    finished: std::sync::Arc<AtomicBool>,
+    mut cancelled: impl FnMut() -> bool,
+    grace: std::time::Duration,
+    terminate: impl FnOnce(),
+) {
+    let mut deadline = None;
+    while !finished.load(Ordering::SeqCst) {
+        if cancelled() && deadline.is_none() {
+            deadline = Some(std::time::Instant::now() + grace);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if !finished.load(Ordering::SeqCst) {
+                terminate();
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+pub(crate) fn watch_session(parent_pid: u32) -> Result<SessionWatch, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, parent_pid) };
+    if handle.is_null() {
+        return Err(windows_error("Наблюдение за клиентом Atlas"));
+    }
+    let parent = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let finished = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_done = finished.clone();
+    std::thread::Builder::new()
+        .name("atlas-session-watch".into())
+        .spawn(move || {
+            shutdown_watch(
+                worker_done,
+                || {
+                    is_stopping()
+                        || unsafe {
+                            WaitForSingleObject(parent.as_raw_handle(), 0) == WAIT_OBJECT_0
+                        }
+                },
+                std::time::Duration::from_secs(5),
+                || {
+                    // Windows closes the dynamic WFP session and the KILL_ON_JOB_CLOSE
+                    // handle, terminating only this service's owned core.
+                    std::process::exit(1);
+                },
+            );
+        })
+        .map_err(|e| format!("Наблюдение за сессией: {e}"))?;
+    Ok(SessionWatch(finished))
+}
+
 fn report(state: u32, accepted: u32, exit_code: u32, wait_hint: u32) {
     let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
@@ -300,4 +363,43 @@ pub fn uninstall() -> Result<(), String> {
         CloseServiceHandle(manager);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    #[test]
+    fn cancelled_session_has_a_deadline_even_when_command_loop_is_stuck() {
+        let done = Arc::new(AtomicBool::new(false));
+        let terminated = AtomicBool::new(false);
+        let start = Instant::now();
+        shutdown_watch(
+            done,
+            || true,
+            Duration::from_millis(100),
+            || {
+                terminated.store(true, Ordering::SeqCst);
+            },
+        );
+        assert!(terminated.load(Ordering::SeqCst));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[test]
+    fn clean_shutdown_disarms_forced_exit() {
+        let done = Arc::new(AtomicBool::new(false));
+        let cancel_done = done.clone();
+        shutdown_watch(
+            done,
+            || {
+                cancel_done.store(true, Ordering::SeqCst);
+                true
+            },
+            Duration::from_millis(100),
+            || panic!("normal cleanup must not force exit"),
+        );
+    }
 }

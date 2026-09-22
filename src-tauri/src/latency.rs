@@ -13,33 +13,50 @@ pub struct TestResult {
 }
 fn attempts(mut test: impl FnMut(&str) -> Result<u64, String>) -> TestResult {
     for attempt in 0..4 {
-        if let Ok(delay) = test(ENDPOINTS[attempt % 2]) {
-            return TestResult {
-                status: "ok".into(),
-                delay: Some(delay),
-                attempts: attempt as u8 + 1,
-                error: None,
-            };
+        match test(ENDPOINTS[attempt % 2]) {
+            Ok(delay) => {
+                return TestResult {
+                    status: "ok".into(),
+                    delay: Some(delay),
+                    attempts: attempt as u8 + 1,
+                    error: None,
+                }
+            }
+            // Only the delay endpoint's explicit failed probe is evidence about
+            // the remote path. IPC, authentication and malformed replies are local errors.
+            Err(error)
+                if !matches!(
+                    error.as_str(),
+                    "Mihomo API: HTTP 503" | "Mihomo API: HTTP 504"
+                ) =>
+            {
+                return TestResult {
+                    status: "error".into(),
+                    delay: None,
+                    attempts: attempt as u8 + 1,
+                    error: Some(error),
+                }
+            }
+            Err(_) => {}
         }
     }
     TestResult {
         status: "unreachable".into(),
         delay: None,
         attempts: 4,
-        error: Some("Не ответили два проверочных адреса после четырёх попыток".into()),
+        error: Some("Два проверочных адреса не ответили через этот сервер. Это не доказывает недоступность всех сайтов через него.".into()),
     }
 }
 pub fn test(client: ApiClient, name: &str) -> TestResult {
-    if client.api("GET", "/version", None).is_err() {
+    if let Err(error) = client.api("GET", "/version", None) {
         return TestResult {
-            status: "not_connected".into(),
+            status: "error".into(),
             delay: None,
             attempts: 0,
-            error: Some("Ядро не запущено".into()),
+            error: Some(format!("Не удалось проверить ядро: {error}")),
         };
     }
     let encoded = encode_name(name);
-    let mut api_error = None;
     let mut result = attempts(|endpoint| {
         let url: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
         let response = client.api(
@@ -47,22 +64,10 @@ pub fn test(client: ApiClient, name: &str) -> TestResult {
             &format!("/proxies/{encoded}/delay?timeout=8000&url={url}"),
             None,
         );
-        if let Err(error) = &response {
-            if ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"]
-                .iter()
-                .any(|code| error.contains(code))
-            {
-                api_error = Some(error.clone());
-            }
-        }
         response?["delay"]
             .as_u64()
             .ok_or("Ядро не вернуло задержку".into())
     });
-    if result.status == "unreachable" && api_error.is_some() {
-        result.status = "error".into();
-        result.error = api_error;
-    }
     if result.status == "unreachable" && client.api("GET", "/version", None).is_err() {
         result.status = "error".into();
         result.error = Some("Связь с ядром прервалась во время проверки".into());
@@ -92,7 +97,7 @@ mod tests {
         let r = attempts(|url| {
             seen.push(url.to_owned());
             if url == ENDPOINTS[0] {
-                Err("timeout".into())
+                Err("Mihomo API: HTTP 504".into())
             } else {
                 Ok(31)
             }
@@ -106,7 +111,7 @@ mod tests {
         let mut count = 0;
         let r = attempts(|_| {
             count += 1;
-            Err("failed".into())
+            Err("Mihomo API: HTTP 504".into())
         });
         assert_eq!(count, 4);
         assert_eq!(r.status, "unreachable");
@@ -114,5 +119,19 @@ mod tests {
     #[test]
     fn zero_is_valid() {
         assert_eq!(attempts(|_| Ok(0)).delay, Some(0));
+    }
+    #[test]
+    fn control_failure_does_not_mark_working_server_unreachable() {
+        for error in [
+            "Сетевая служба занята",
+            "Канал сетевой службы закрыт",
+            "Mihomo API недоступен",
+            "Mihomo API: HTTP 401",
+        ] {
+            let r = attempts(|_| Err(error.into()));
+            assert_eq!(r.status, "error");
+            assert_eq!(r.attempts, 1);
+            assert_eq!(r.error.as_deref(), Some(error));
+        }
     }
 }

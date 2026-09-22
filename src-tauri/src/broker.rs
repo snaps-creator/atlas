@@ -28,19 +28,54 @@ fn wide(s: &str) -> Vec<u16> {
 fn error(action: &str) -> String {
     format!("{action}: код Windows {}", unsafe { GetLastError() })
 }
+fn nonblocking(file: &File) -> Result<(), String> {
+    let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+    if unsafe {
+        SetNamedPipeHandleState(
+            file.as_raw_handle(),
+            &mode,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err(error("Режим канала сетевой службы"));
+    }
+    Ok(())
+}
+fn write_bytes(file: &mut File, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if Instant::now() >= deadline || crate::service::is_stopping() {
+            return Err("Время записи в канал сетевой службы истекло".into());
+        }
+        // A byte-mode NOWAIT pipe can accept only part of a frame, including
+        // zero bytes when its buffer is full. Never use blocking write_all here.
+        let end = (offset + 4096).min(bytes.len());
+        match file.write(&bytes[offset..end]) {
+            Ok(0) => thread::sleep(Duration::from_millis(10)),
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return Err("Канал сетевой службы закрыт".into()),
+        }
+    }
+    Ok(())
+}
 fn send(file: &mut File, value: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|_| "Ошибка кодирования команды")?;
     if bytes.len() > LIMIT {
         return Err("Команда превышает 16 МБ".into());
     }
-    file.write_all(&(bytes.len() as u32).to_le_bytes())
-        .and_then(|_| file.write_all(&bytes))
-        .map_err(|_| "Канал сетевой службы закрыт".into())
+    let deadline = Instant::now() + Duration::from_secs(5);
+    write_bytes(file, &(bytes.len() as u32).to_le_bytes(), deadline)?;
+    write_bytes(file, &bytes, deadline)
 }
 fn read_bytes(file: &mut File, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
     let mut offset = 0;
     while offset < buffer.len() {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || crate::service::is_stopping() {
             return Err("Время ожидания сетевой службы истекло".into());
         }
         let mut available = 0;
@@ -109,6 +144,7 @@ impl Broker {
                     }
                 }
                 crate::service::verify_server_pid(server_pid)?;
+                nonblocking(&file)?;
                 let hello = receive(&mut file, Duration::from_secs(10))?;
                 if hello["ready"] != true {
                     return Err("Сетевая служба не готова".into());
@@ -329,6 +365,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut core = Core::privileged(directory.join("mihomo.exe"), directory.clone());
     send(&mut pipe, &json!({"ready":true}))?;
     let mut configured = false;
+    let mut cleanup_observer: Option<std::process::Child> = None;
     let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
     let mut active_settings: Option<Settings> = None;
@@ -349,6 +386,12 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
             }
         }
         if configured && last_health.elapsed() >= Duration::from_secs(5) {
+            if cleanup_observer
+                .as_mut()
+                .is_none_or(|child| !matches!(child.try_wait(), Ok(None)))
+            {
+                break;
+            }
             // Mihomo v1.19.31 already subscribes to Windows route/interface
             // notifications and resets resolver connections. Do not reload TUN
             // when DHCP, sleep or the physical egress changes.
@@ -450,6 +493,9 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 validate_settings(&s)?;
                 network_guard::check_competing_routes()?;
                 core.validate(&s)?;
+                if cleanup_observer.is_none() {
+                    cleanup_observer = Some(crate::session_cleanup::start_observer()?);
+                }
                 guard = Some(network_guard::Guard::prepare(&core.binary)?);
                 if let Err(e) = core.start(&s) {
                     let _ = core.stop();
@@ -566,6 +612,11 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let stopped = core.stop();
     drop(core);
     drop(guard);
+    let dns_cleanup = if cleanup_observer.is_some() {
+        crate::session_cleanup::flush_dns()
+    } else {
+        Ok(())
+    };
     if let Some(parent) = parent_handle {
         unsafe {
             CloseHandle(parent);
@@ -579,7 +630,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     {
         let _ = std::fs::remove_dir_all(&directory);
     }
-    stopped
+    stopped.and(dns_cleanup)
 }
 
 pub fn serve_service() -> Result<(), String> {
@@ -645,7 +696,7 @@ pub fn serve_service() -> Result<(), String> {
                 CloseHandle(handle);
                 continue;
             }
-            let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+            let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
             if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
                 DisconnectNamedPipe(handle);
                 CloseHandle(handle);
@@ -660,6 +711,13 @@ pub fn serve_service() -> Result<(), String> {
             if parent.is_null() {
                 break;
             }
+            let _watch = match crate::service::watch_session(client_pid) {
+                Ok(watch) => watch,
+                Err(error) => {
+                    CloseHandle(parent);
+                    return Err(error);
+                }
+            };
             let _ = run_channel(file, Some(parent));
             // A service session belongs to a single Atlas connection, not the OS lifetime.
             break;
@@ -670,6 +728,97 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pipe_pair() -> (File, File) {
+        let name = wide(&format!(r"\\.\pipe\atlas-test-{}", uuid::Uuid::new_v4()));
+        unsafe {
+            let handle = CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            );
+            assert_ne!(handle, INVALID_HANDLE_VALUE);
+            let server = File::from_raw_handle(handle);
+            let client = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(String::from_utf16_lossy(&name[..name.len() - 1]))
+                .unwrap();
+            assert!(
+                ConnectNamedPipe(handle, std::ptr::null_mut()) != 0
+                    || GetLastError() == ERROR_PIPE_CONNECTED
+            );
+            nonblocking(&client).unwrap();
+            (server, client)
+        }
+    }
+    #[test]
+    fn stalled_peer_cannot_block_writes_in_either_direction() {
+        for server_writes in [true, false] {
+            let (mut server, mut client) = pipe_pair();
+            let writer = if server_writes {
+                &mut server
+            } else {
+                &mut client
+            };
+            let start = Instant::now();
+            let result = write_bytes(
+                writer,
+                &vec![42; 1024 * 1024],
+                start + Duration::from_millis(100),
+            );
+            assert!(result.is_err());
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+    }
+    #[test]
+    fn frames_larger_than_pipe_buffer_survive_partial_writes() {
+        let (mut server, mut client) = pipe_pair();
+        let value = json!({"data":"x".repeat(256 * 1024)});
+        let expected = value.clone();
+        let worker = thread::spawn(move || {
+            let got = receive(&mut server, Duration::from_secs(5)).unwrap();
+            send(&mut server, &got).unwrap();
+        });
+        send(&mut client, &value).unwrap();
+        assert_eq!(
+            receive(&mut client, Duration::from_secs(5)).unwrap(),
+            expected
+        );
+        worker.join().unwrap();
+    }
+    #[test]
+    fn concurrent_commands_keep_their_own_replies() {
+        let (mut server, client) = pipe_pair();
+        let worker = thread::spawn(move || {
+            for _ in 0..32 {
+                let command = receive(&mut server, Duration::from_secs(5)).unwrap();
+                send(&mut server, &json!({"result":command["payload"]})).unwrap();
+            }
+        });
+        let broker = std::sync::Arc::new(Broker {
+            pipe: Mutex::new(Some(client)),
+        });
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let broker = broker.clone();
+                thread::spawn(move || {
+                    for j in 0..4 {
+                        let payload = json!({"client":i,"request":j});
+                        assert_eq!(broker.call("status", payload.clone()).unwrap(), payload);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        worker.join().unwrap();
+    }
     #[test]
     fn api_is_narrow() {
         assert!(!allowed_api("PUT", "/configs"));

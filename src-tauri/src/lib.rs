@@ -6,6 +6,7 @@ mod country;
 #[path = "network_diagnostics.rs"]
 mod diagnostics;
 mod job;
+mod lan_policy;
 mod latency;
 mod model;
 mod network_guard;
@@ -13,6 +14,8 @@ mod portable;
 mod rule_probe;
 mod rules;
 mod service;
+mod session_cleanup;
+mod shutdown;
 mod storage;
 mod subscriptions;
 mod windows;
@@ -451,6 +454,7 @@ async fn request(
         .state::<ShuttingDown>()
         .load(std::sync::atomic::Ordering::SeqCst)
     {
+        app.state::<ConnectionIntent>().0.store(false, std::sync::atomic::Ordering::SeqCst);
         return Err("Atlas завершает работу".into());
     }
     if action == "connections" || action == "proxies" {
@@ -625,6 +629,9 @@ async fn request(
         let mut a = shared
             .try_lock()
             .map_err(|_| "Atlas занят, повторите операцию")?;
+        if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Atlas завершает работу".into());
+        }
         a.dispatch(&app, &action, payload.unwrap_or(Value::Null))
     })
     .await
@@ -693,22 +700,14 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
             let menu =
                 Menu::with_items(app, &[&show, &connect, &disconnect, &restart, &quit])?;
-            let pixels: Vec<u8> = (0..32 * 32)
-                .flat_map(|i| {
-                    let x = i % 32;
-                    let y = i / 32;
-                    if (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 196 {
-                        [0, 113, 227, 255]
-                    } else {
-                        [0, 0, 0, 0]
-                    }
-                })
-                .collect();
+            let tray_icon = app.default_window_icon()
+                .ok_or("В сборке отсутствует иконка Atlas")?.clone();
             tauri::tray::TrayIconBuilder::new()
-                .icon(tauri::image::Image::new_owned(pixels, 32, 32))
+                .icon(tray_icon)
                 .tooltip("Atlas VPN")
                 .menu(&menu)
                 .on_menu_event(|app, event| {
+                    if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { return; }
                     let id = event.id.as_ref();
                     if id == "show" {
                         if let Some(w) = app.get_webview_window("main") {
@@ -726,20 +725,22 @@ pub fn run() {
                             // Never leave Exit queued behind a driver/configuration timeout.
                             // The service watches the parent process and releases its dynamic
                             // filters and owned core when the desktop process exits.
-                            let fallback = app.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(std::time::Duration::from_secs(8));
-                                fallback.exit(0);
-                            });
+                            shutdown::begin(std::time::Duration::from_secs(8), move || {
+                                let state = handle.state::<Shared>();
+                                // A poisoned mutex must not prevent resource cleanup.
+                                let mut a = state.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = a.disconnect();
+                                drop(a);
+                                handle.exit(0);
+                            }, || std::process::exit(0));
+                            return;
                         }
                         tauri::async_runtime::spawn_blocking(move || {
                             let state = handle.state::<Shared>();
                             if let Ok(mut a) = state.lock() {
-                                if action == "quit" {
-                                    let _ = a.disconnect();
-                                    drop(a);
-                                    handle.exit(0);
-                                } else if action == "restart" {
+                                // Work queued before Quit must not reopen the VPN.
+                                if handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { return; }
+                                if action == "restart" {
                                     if a.prepare_restart().is_ok() {
                                         drop(a);
                                         handle.restart()
@@ -794,8 +795,10 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if !window.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![request])
@@ -822,6 +825,10 @@ mod recovery_tests {
 
 pub fn network_service() -> Result<(), String> {
     service::run()
+}
+
+pub fn watch_network_session(pid: u32) -> Result<(), String> {
+    session_cleanup::run(pid)
 }
 
 /// Exercises the installed service handshake without starting a network core.
