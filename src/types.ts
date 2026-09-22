@@ -39,6 +39,7 @@ export type Settings = {
 };
 export type Log = { time: number; level: string; message: string };
 export type Snapshot = {
+  revision?: number;
   settings: Settings;
   status: string;
   running: boolean;

@@ -213,16 +213,7 @@ impl Guard {
                     (8, FWPM_LAYER_ALE_AUTH_CONNECT_V4, 68, 67),
                     (9, FWPM_LAYER_ALE_AUTH_CONNECT_V6, 546, 547),
                 ] {
-                    let mut conditions = [std::mem::zeroed::<FWPM_FILTER_CONDITION0>(); 3];
-                    conditions[0].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
-                    conditions[0].conditionValue.r#type = FWP_UINT8;
-                    conditions[0].conditionValue.Anonymous.uint8 = 17;
-                    conditions[1].fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
-                    conditions[1].conditionValue.r#type = FWP_UINT16;
-                    conditions[1].conditionValue.Anonymous.uint16 = local;
-                    conditions[2].fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
-                    conditions[2].conditionValue.r#type = FWP_UINT16;
-                    conditions[2].conditionValue.Anonymous.uint16 = remote;
+                    let mut conditions = dhcp_conditions(local, remote);
                     permit(e.0, offset, layer, name.as_mut_ptr(), &mut conditions)?;
                 }
                 // Local maintenance/discovery and office traffic stay on Ethernet/Wi-Fi.
@@ -295,9 +286,39 @@ unsafe fn permit(
     )
 }
 
+fn dhcp_conditions(local: u16, remote: u16) -> [FWPM_FILTER_CONDITION0; 3] {
+    // No destination restriction: both discovery broadcast and unicast lease
+    // renewal use these ports. No blanket UDP permit is introduced.
+    let mut conditions = unsafe { [std::mem::zeroed::<FWPM_FILTER_CONDITION0>(); 3] };
+    conditions[0].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+    conditions[0].conditionValue.r#type = FWP_UINT8;
+    conditions[0].conditionValue.Anonymous.uint8 = 17;
+    conditions[1].fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
+    conditions[1].conditionValue.r#type = FWP_UINT16;
+    conditions[1].conditionValue.Anonymous.uint16 = local;
+    conditions[2].fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+    conditions[2].conditionValue.r#type = FWP_UINT16;
+    conditions[2].conditionValue.Anonymous.uint16 = remote;
+    conditions
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dhcp_discovery_and_renewal_share_port_scoped_wfp_conditions() {
+        for (local, remote) in [(68, 67), (546, 547)] {
+            let conditions = dhcp_conditions(local, remote);
+            assert_eq!(conditions.len(), 3);
+            assert_eq!(conditions[0].fieldKey.data1, FWPM_CONDITION_IP_PROTOCOL.data1);
+            assert_eq!(conditions[1].fieldKey.data1, FWPM_CONDITION_IP_LOCAL_PORT.data1);
+            assert_eq!(conditions[2].fieldKey.data1, FWPM_CONDITION_IP_REMOTE_PORT.data1);
+            unsafe {
+                assert_eq!(conditions[0].conditionValue.Anonymous.uint8, 17);
+                assert_eq!(conditions[1].conditionValue.Anonymous.uint16, local);
+                assert_eq!(conditions[2].conditionValue.Anonymous.uint16, remote);
+            }
+        }
+    }
     #[test]
     fn lan_exceptions_do_not_allow_public_or_fake_ip_destinations() {
         let allowed = |ip: &str| {

@@ -25,6 +25,95 @@ fn isolated_core() -> Core {
     core
 }
 
+#[test]
+fn direct_dns_survives_a_dead_vpn_with_real_core() {
+    // Exercise the generated TUN DNS policy with TUN disabled in this fixture.
+    // Both DNS and the HTTP origin are loopback-only; the VPN port is closed.
+    let dns = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    dns.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let dns_address = dns.local_addr().unwrap();
+    let responder = thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        let (size, peer) = dns.recv_from(&mut buffer).unwrap();
+        let mut end = 12;
+        while buffer[end] != 0 { end += 1 + buffer[end] as usize; }
+        end += 5;
+        assert!(end <= size);
+        assert_eq!(&buffer[end - 4..end - 2], &[0, 1]); // A question
+        let mut answer = buffer[..end].to_vec();
+        answer[2..4].copy_from_slice(&[0x81, 0x80]);
+        answer[6..8].copy_from_slice(&[0, 1]);
+        answer[8..12].fill(0);
+        answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, 1]);
+        dns.send_to(&answer, peer).unwrap();
+    });
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let origin_port = origin.local_addr().unwrap().port();
+    let origin_worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok((mut stream, _)) = origin.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut data = [0; 4096];
+                let _ = stream.read(&mut data);
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                return;
+            }
+            assert!(Instant::now() < deadline, "DIRECT never reached origin");
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let mut core = isolated_core();
+    let mut settings = Settings::default();
+    settings.selected = "dead-vpn".into();
+    settings.default_route = Route::Direct;
+    settings.dns.servers = vec!["1.1.1.1".into()];
+    settings.subscriptions.push(Subscription {
+        id: "fixture".into(), name: "fixture".into(), masked_url: "hidden".into(),
+        updated_at: 0, error: None,
+        servers: vec![json!({"name":"dead-vpn","type":"ss","server":"127.0.0.1",
+            "port":1,"cipher":"aes-128-gcm","password":"fixture"})],
+    });
+    let mut doc: Value = serde_yaml::from_str(&config::generate(&settings, &core.secret).unwrap()).unwrap();
+    doc["tun"]["enable"] = json!(false);
+    doc["mixed-port"] = json!(core.ports[0]);
+    doc["external-controller"] = json!(format!("127.0.0.1:{}", core.ports[1]));
+    doc["dns"]["listen"] = json!(format!("127.0.0.1:{}", core.ports[2]));
+    // Substitute only the resolver address, retaining the generated proxy suffix.
+    for field in ["nameserver", "direct-nameserver"] {
+        for value in doc["dns"][field].as_array_mut().unwrap() {
+            *value = json!(value.as_str().unwrap().replace("1.1.1.1", &format!("udp://{dns_address}")));
+        }
+    }
+    doc["dns"]["default-nameserver"] = json!(["127.0.0.1"]);
+    doc["dns"]["proxy-server-nameserver"] = json!(["127.0.0.1"]);
+    doc["proxy-groups"].as_array_mut().unwrap().retain(|group| group["name"] == "ATLAS");
+    doc["proxy-groups"][0]["proxies"] = json!(["dead-vpn"]);
+    let path = core.directory.join("dns-fixture.yaml");
+    std::fs::write(&path, serde_yaml::to_string(&doc).unwrap()).unwrap();
+    let child = core.command().arg("-d").arg(&core.directory).arg("-f").arg(path).spawn().unwrap();
+    core.job = Some(crate::job::Job::attach(&child).unwrap());
+    core.child = Some(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while core.api("GET", "/version", None).is_err() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(25));
+    }
+    let http = reqwest::blocking::Client::builder().no_proxy()
+        .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{}", core.ports[0])).unwrap())
+        .timeout(Duration::from_secs(5)).build().unwrap();
+    let response = http.get(format!("http://direct-fixture.invalid:{origin_port}/")).send().unwrap();
+    assert_eq!(response.status(), 200, "DIRECT must not use the failed VPN for DNS");
+    assert_eq!(response.text().unwrap(), "ok");
+    responder.join().unwrap();
+    origin_worker.join().unwrap();
+    core.stop().unwrap();
+    let directory = core.directory.clone();
+    drop(core);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn start_server(core: &mut Core, port: u16, id: &str) {
     let path = core.directory.join("server.yaml");
     let config = json!({
@@ -78,7 +167,7 @@ fn request(proxy_port: u16, origin_port: u16) -> std::io::Result<String> {
     let mut body = String::new();
     socket.read_to_string(&mut body)?;
     if !body.starts_with("HTTP/1.1 200") {
-        return Err(std::io::Error::other("origin did not answer"));
+        return Err(std::io::Error::other(format!("origin did not answer: {body:?}")));
     }
     Ok(body.split_once("\r\n\r\n").unwrap().1.to_owned())
 }
@@ -113,7 +202,7 @@ fn independent_clients_share_vless_server_and_recover_after_its_restart() {
         while !worker_done.load(Ordering::SeqCst) {
             if let Ok((mut stream, _)) = origin.accept() {
                 // One slow peer's half-close must not hold up the other clients.
-                // This origin receives concurrent traffic through three proxies.
+                // This origin receives concurrent traffic through eight proxies.
                 connections.push(thread::spawn(move || {
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))

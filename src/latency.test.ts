@@ -1,5 +1,20 @@
 import { expect, test, vi } from "vitest";
-import { boundedLatency, latencyLabel, testPool, type Latency } from "./latency";
+import { boundedLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+
+test("ответ старой сессии и её очередь не затрагивают новую проверку", () => {
+  const epoch = new LatencyEpoch();
+  epoch.update("session-1");
+  const old = epoch.begin("session-1", "Berlin")!;
+  expect(epoch.begin("session-1", "Berlin")).toBeUndefined();
+  epoch.update("session-2");
+  expect(epoch.current("Berlin", old)).toBe(false);
+  expect(epoch.begin("session-1", "Paris")).toBeUndefined();
+  const current = epoch.begin("session-2", "Berlin")!;
+  epoch.finish("Berlin", old);
+  expect(epoch.current("Berlin", current)).toBe(true);
+  epoch.finish("Berlin", current);
+  expect(epoch.current("Berlin", current)).toBe(false);
+});
 
 test("ошибка контроллера не означает недоступность сервера", () => {
   expect(latencyLabel()).toBe("—");

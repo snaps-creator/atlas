@@ -46,7 +46,7 @@ import { trafficRate, type TrafficSample } from "./traffic";
 import { ActiveServer } from "./ActiveServer";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { boundedLatency, latencyLabel, testPool, type Latency } from "./latency";
+import { boundedLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel } from "./protection";
@@ -105,7 +105,7 @@ function App() {
   const [name, setName] = useState("");
   const [latencies, setLatencies] = useState<Record<string, Latency>>({});
   const [testingAll, setTestingAll] = useState(false);
-  const activeTests = useRef(new Set<string>());
+  const latencyEpoch = useRef(new LatencyEpoch());
   const [connections, setConnections] = useState<Connection[]>([]);
   const [traffic, setTraffic] = useState({ up: 0, down: 0 });
   const [samples, setSamples] = useState<TrafficSample[]>([]);
@@ -331,6 +331,7 @@ function App() {
   const s = data?.settings;
   const servers = s?.subscriptions.flatMap((v) => v.servers) ?? [];
   const connected = data?.running ?? false;
+  const connecting = data?.status === "Connecting";
   const header = (
     eyebrow: string,
     title: string,
@@ -369,23 +370,29 @@ function App() {
       Добавить подписку
     </button>
   );
+  const latencyContext = JSON.stringify([data?.revision, data?.running, data?.settings.selected,
+    data?.settings.subscriptions.map(sub => [sub.id, sub.updatedAt, sub.servers])]);
+  useEffect(() => {
+    if (latencyEpoch.current.update(latencyContext)) setLatencies({});
+    return () => { latencyEpoch.current.update("unmounted"); };
+  }, [latencyContext]);
   async function test(name: string) {
-    if (activeTests.current.has(name)) return;
-    activeTests.current.add(name);
+    const token = latencyEpoch.current.begin(latencyContext, name);
+    if (!token) return;
     setLatencies((l) => ({
       ...l,
       [name]: { status: "testing", delay: null, attempts: 0 },
     }));
     try {
       const r = await boundedLatency(request<Latency>("latency", { name }));
-      setLatencies((l) => ({ ...l, [name]: r }));
+      if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({ ...l, [name]: r }));
     } catch (e) {
-      setLatencies((l) => ({
+      if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({
         ...l,
         [name]: { status: "error", delay: null, attempts: 0, error: String(e) },
       }));
     } finally {
-      activeTests.current.delete(name);
+      latencyEpoch.current.finish(name, token);
     }
   }
   return (
@@ -609,8 +616,8 @@ function App() {
                     <div className="hero-top">
                       <span className="badge">
                         <i className={connected ? "dot online" : "dot"} />
-                        {connected
-                          ? "СОЕДИНЕНИЕ АКТИВНО"
+                        {connecting ? "ПОДКЛЮЧЕНИЕ…" : data.status === "Disconnecting" ? "ОТКЛЮЧЕНИЕ…" : connected
+                          ? "ТУННЕЛЬ ЗАПУЩЕН"
                           : data.status === "Error"
                             ? "ОШИБКА ПОДКЛЮЧЕНИЯ"
                             : "ГОТОВ К ПОДКЛЮЧЕНИЮ"}
@@ -625,14 +632,14 @@ function App() {
                     <div className="hero-main">
                       <button
                         aria-label={
-                          connected ? "Отключить VPN" : "Подключить VPN"
+                          connecting ? "Отменить подключение" : connected ? "Отключить VPN" : "Подключить VPN"
                         }
                         className="power"
-                        disabled={busy || !servers.length}
+                        disabled={(busy && !connecting) || !servers.length}
                         onClick={() =>
                           run(() =>
                             act(
-                              connected || data?.guardActive
+                              connected || connecting || data?.guardActive
                                 ? "disconnect"
                                 : "connect",
                             ),
@@ -646,27 +653,27 @@ function App() {
                         )}
                       </button>
                       <div>
-                        <h2>{connected ? "Подключено" : "Отключено"}</h2>
+                        <h2>{connecting ? "Подключение…" : data.status === "Disconnecting" ? "Отключение…" : connected ? "Туннель запущен" : "Отключено"}</h2>
                         <p>
                           {connected
-                            ? "Правила применены"
+                            ? protection.detail
                             : "Выберите сервер и подключитесь"}
                         </p>
                       </div>
                       <button
                         className="primary connect-btn"
-                        disabled={busy || !servers.length}
+                        disabled={(busy && !connecting) || !servers.length}
                         onClick={() =>
                           run(() =>
                             act(
-                              connected || data?.guardActive
+                              connected || connecting || data?.guardActive
                                 ? "disconnect"
                                 : "connect",
                             ),
                           )
                         }
                       >
-                        {connected ? "Отключить" : "Подключить"}
+                        {connecting ? "Отменить" : connected ? "Отключить" : "Подключить"}
                         <ArrowUpRight size={17} />
                       </button>
                     </div>

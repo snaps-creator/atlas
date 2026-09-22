@@ -43,9 +43,16 @@ fn nonblocking(file: &File) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn write_bytes(file: &mut File, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+    write_bytes_cancellable(file, bytes, deadline, None)
+}
+fn write_bytes_cancellable(file: &mut File, bytes: &[u8], deadline: Instant, running: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
     let mut offset = 0;
     while offset < bytes.len() {
+        if running.is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err("Подключение отменено".into());
+        }
         if Instant::now() >= deadline || crate::service::is_stopping() {
             return Err("Время записи в канал сетевой службы истекло".into());
         }
@@ -64,17 +71,23 @@ fn write_bytes(file: &mut File, bytes: &[u8], deadline: Instant) -> Result<(), S
     Ok(())
 }
 fn send(file: &mut File, value: &Value) -> Result<(), String> {
+    send_cancellable(file, value, None)
+}
+fn send_cancellable(file: &mut File, value: &Value, running: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|_| "Ошибка кодирования команды")?;
     if bytes.len() > LIMIT {
         return Err("Команда превышает 16 МБ".into());
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    write_bytes(file, &(bytes.len() as u32).to_le_bytes(), deadline)?;
-    write_bytes(file, &bytes, deadline)
+    write_bytes_cancellable(file, &(bytes.len() as u32).to_le_bytes(), deadline, running)?;
+    write_bytes_cancellable(file, &bytes, deadline, running)
 }
-fn read_bytes(file: &mut File, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
+fn read_bytes_cancellable(file: &mut File, buffer: &mut [u8], deadline: Instant, running: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
     let mut offset = 0;
     while offset < buffer.len() {
+        if running.is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err("Подключение отменено".into());
+        }
         if Instant::now() >= deadline || crate::service::is_stopping() {
             return Err("Время ожидания сетевой службы истекло".into());
         }
@@ -107,28 +120,32 @@ fn read_bytes(file: &mut File, buffer: &mut [u8], deadline: Instant) -> Result<(
     Ok(())
 }
 fn receive(file: &mut File, timeout: Duration) -> Result<Value, String> {
+    receive_cancellable(file, timeout, None)
+}
+fn receive_cancellable(file: &mut File, timeout: Duration, running: Option<&std::sync::atomic::AtomicBool>) -> Result<Value, String> {
     let deadline = Instant::now() + timeout;
     let mut len = [0; 4];
-    read_bytes(file, &mut len, deadline)?;
+    read_bytes_cancellable(file, &mut len, deadline, running)?;
     let len = u32::from_le_bytes(len) as usize;
     if len > LIMIT {
         return Err("Ответ сетевой службы превышает лимит".into());
     }
     let mut data = vec![0; len];
-    read_bytes(file, &mut data, deadline)?;
+    read_bytes_cancellable(file, &mut data, deadline, running)?;
     serde_json::from_slice(&data).map_err(|_| "Некорректный ответ сетевой службы".into())
 }
 pub struct Broker {
     pipe: Mutex<Option<File>>,
 }
 impl Broker {
-    pub fn launch() -> Result<Self, String> {
-        Self::connect_service()
-    }
-    fn connect_service() -> Result<Self, String> {
+    pub fn launch() -> Result<Self, String> { Self::launch_cancellable(None) }
+    pub fn launch_cancellable(running: Option<&std::sync::atomic::AtomicBool>) -> Result<Self, String> {
         // A cold Windows service start can be delayed by signature/AV checks.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
+            if running.is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err("Подключение отменено".into());
+            }
             // A previous session may still be shutting down when StartService
             // reports ALREADY_RUNNING. Retry startup until the new pipe exists.
             let start_error = crate::service::start_on_demand().err();
@@ -145,7 +162,7 @@ impl Broker {
                 }
                 crate::service::verify_server_pid(server_pid)?;
                 nonblocking(&file)?;
-                let hello = receive(&mut file, Duration::from_secs(10))?;
+                let hello = receive_cancellable(&mut file, Duration::from_secs(10), running)?;
                 if hello["ready"] != true {
                     return Err("Сетевая служба не готова".into());
                 }
@@ -183,8 +200,14 @@ impl Broker {
         }
     }
     pub fn call(&self, op: &str, payload: Value) -> Result<Value, String> {
+        self.call_cancellable(op, payload, None)
+    }
+    pub fn call_cancellable(&self, op: &str, payload: Value, running: Option<&std::sync::atomic::AtomicBool>) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut slot = loop {
+            if running.is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err("Подключение отменено".into());
+            }
             match self.pipe.try_lock() {
                 Ok(slot) => break slot,
                 Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
@@ -195,15 +218,16 @@ impl Broker {
         };
         let file = slot.as_mut().ok_or("Канал сетевой службы закрыт")?;
         let reply = (|| {
-            send(file, &json!({"op":op,"payload":payload}))?;
+            send_cancellable(file, &json!({"op":op,"payload":payload}), running)?;
             // Starting can include driver installation; its IPC deadline must outlive readiness.
-            receive(
+            receive_cancellable(
                 file,
                 Duration::from_secs(if matches!(op, "start" | "apply") {
                     120
                 } else {
                     15
                 }),
+                running,
             )
         })();
         let reply = match reply {
@@ -360,9 +384,42 @@ fn allowed_api(method: &str, path: &str) -> bool {
     }
     false
 }
+struct PipeWatch {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+impl PipeWatch {
+    fn start(pipe: &File, running: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Self, String> {
+        let pipe = pipe.try_clone().map_err(|e| e.to_string())?;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = done.clone();
+        let worker = thread::Builder::new().name("atlas-pipe-watch".into()).spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut available = 0;
+                let alive = unsafe { PeekNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut(), 0,
+                    std::ptr::null_mut(), &mut available, std::ptr::null_mut()) } != 0;
+                if !alive || crate::service::is_stopping() {
+                    running.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }).map_err(|e| e.to_string())?;
+        Ok(Self { done, thread: Some(worker) })
+    }
+}
+impl Drop for PipeWatch {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(worker) = self.thread.take() { let _ = worker.join(); }
+    }
+}
 fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), String> {
     let directory = secure_directory()?;
     let mut core = Core::privileged(directory.join("mihomo.exe"), directory.clone());
+    let session_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _watch = PipeWatch::start(&pipe, session_running.clone())?;
+    core.continue_running = Some(session_running);
     send(&mut pipe, &json!({"ready":true}))?;
     let mut configured = false;
     let mut cleanup_observer: Option<std::process::Child> = None;
@@ -371,18 +428,22 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut active_settings: Option<Settings> = None;
     let mut last_health = Instant::now();
     let mut health_failures = 0;
+    let mut health_probe = crate::background_probe::Probe::default();
     let mut tun_identity = network_guard::tun_identity();
-    let mut delays: std::collections::HashMap<
-        String,
-        (Instant, std::sync::mpsc::Receiver<Result<Value, String>>),
-    > = std::collections::HashMap::new();
+    let mut queries = crate::query_jobs::QueryJobs::default();
     loop {
-        if crate::service::is_stopping() {
+        if crate::service::is_stopping() || core.cancelled() {
             break;
         }
         if let Some(parent) = parent_handle {
             if unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0 {
                 break;
+            }
+        }
+        if configured {
+            if let Some(healthy) = health_probe.poll() {
+                health_failures = if healthy { 0 } else { health_failures + 1 };
+                if health_failures >= 3 { break; }
             }
         }
         if configured && last_health.elapsed() >= Duration::from_secs(5) {
@@ -412,14 +473,8 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
             if !core.running() {
                 break;
             }
-            if !guard_ready || core.api("GET", "/version", None).is_err() {
-                health_failures += 1;
-            } else {
-                health_failures = 0;
-            }
-            if health_failures >= 3 {
-                break;
-            }
+            let client = core.client();
+            health_probe.start(move || guard_ready && client.api("GET", "/version", None).is_ok());
             last_health = Instant::now();
         }
         let mut available = 0;
@@ -450,41 +505,21 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
         let op = request["op"].as_str().unwrap_or("");
         let payload = &request["payload"];
         let result: Result<Value, String> = (|| match op {
-            "delay" => {
+            "delay" | "query" => {
                 let path = payload["path"].as_str().ok_or("Нет пути")?;
-                if !path.contains("/delay?") || !allowed_api("GET", path) {
+                if (op == "delay" && !path.contains("/delay?")) || !allowed_api("GET", path) {
                     return Err("Проверка сервера не разрешена".into());
                 }
-                delays.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(30));
-                if delays.len() >= 16 {
-                    return Err("Слишком много проверок серверов".into());
-                }
-                let id = uuid::Uuid::new_v4().to_string();
-                let (tx, rx) = std::sync::mpsc::channel();
                 let client = core.client();
                 let path = path.to_owned();
-                thread::Builder::new()
-                    .name("atlas-delay".into())
-                    .spawn(move || {
-                        let _ = tx.send(client.api("GET", &path, None));
-                    })
-                    .map_err(|_| "Не удалось запустить проверку")?;
-                delays.insert(id.clone(), (Instant::now(), rx));
+                let id = queries.start(path.contains("/delay?"), move || client.api("GET", &path, None))?;
                 Ok(json!({"id":id}))
             }
             "delay_result" => {
                 let id = payload["id"].as_str().ok_or("Нет проверки")?;
-                let (_, rx) = delays.get(id).ok_or("Проверка истекла")?;
-                match rx.try_recv() {
-                    Ok(result) => {
-                        delays.remove(id);
-                        result.map(|v| json!({"done":true,"value":v}))
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => Ok(json!({"done":false})),
-                    Err(_) => {
-                        delays.remove(id);
-                        Err("Проверка прервана".into())
-                    }
+                match queries.poll(id)? {
+                    Some(value) => Ok(json!({"done":true,"value":value})),
+                    None => Ok(json!({"done":false})),
                 }
             }
             "start" => {
@@ -504,7 +539,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 }
                 let deadline = Instant::now() + Duration::from_secs(60);
                 loop {
-                    if crate::service::is_stopping()
+                    if crate::service::is_stopping() || core.cancelled()
                         || parent_handle.is_some_and(
                             |parent| unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0,
                         )
@@ -525,6 +560,8 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                     }
                 }
                 configured = true;
+                health_probe = Default::default();
+                health_failures = 0;
                 active_settings = Some(s);
                 last_health = Instant::now();
                 tun_identity = network_guard::tun_identity();
@@ -550,7 +587,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                         }
                         Err(_) => thread::sleep(Duration::from_millis(100)),
                     }
-                    if crate::service::is_stopping()
+                    if crate::service::is_stopping() || core.cancelled()
                         || parent_handle.is_some_and(
                             |parent| unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0,
                         )
@@ -563,6 +600,8 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 }
                 active_settings = Some(s);
                 tun_identity = network_guard::tun_identity();
+                health_probe = Default::default();
+                health_failures = 0;
                 last_health = Instant::now();
                 Ok(json!({}))
             }
@@ -728,6 +767,27 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancel_interrupts_start_reply_and_reaches_service_without_another_command() {
+        let (server, client) = pipe_pair();
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _watch = PipeWatch::start(&server, running.clone()).unwrap();
+        let broker = std::sync::Arc::new(Broker { pipe: Mutex::new(Some(client)) });
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_broker = broker.clone();
+        let worker_cancel = cancellation.clone();
+        let worker = thread::spawn(move || worker_broker.call_cancellable("start", Value::Null, Some(&worker_cancel)));
+        let mut server = server;
+        assert_eq!(receive(&mut server, Duration::from_secs(2)).unwrap()["op"], "start");
+        let started = Instant::now();
+        cancellation.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(worker.join().unwrap().is_err());
+        while running.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!broker.alive());
+    }
     fn pipe_pair() -> (File, File) {
         let name = wide(&format!(r"\\.\pipe\atlas-test-{}", uuid::Uuid::new_v4()));
         unsafe {
