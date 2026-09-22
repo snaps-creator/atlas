@@ -1,5 +1,7 @@
 mod applications;
+mod background_probe;
 mod broker;
+mod cancellation;
 mod config;
 mod core;
 mod country;
@@ -11,6 +13,9 @@ mod latency;
 mod model;
 mod network_guard;
 mod portable;
+mod published_state;
+mod process_stop;
+mod query_jobs;
 mod rule_probe;
 mod rules;
 mod service;
@@ -26,6 +31,9 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 struct App {
+    revision: u64,
+    published: published_state::PublishedState,
+    cancellation: cancellation::Cancellation,
     settings: Settings,
     store: storage::Store,
     core: core::Core,
@@ -57,7 +65,11 @@ impl App {
                 *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p)});
             }
         }
-        json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs})
+        let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs});
+        let mut value = value;
+        value["revision"] = json!(self.revision);
+        self.published.set(value.clone());
+        value
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
         next.mode = "tun".into();
@@ -101,6 +113,7 @@ impl App {
             return Err(e);
         }
         self.settings = next;
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
     fn connect(&mut self) -> Result<(), String> {
@@ -108,7 +121,15 @@ impl App {
             return Ok(());
         }
         self.status = "Connecting".into();
+        self.revision = self.revision.wrapping_add(1);
         self.error = None;
+        self.snapshot();
+        self.core.continue_running = Some(self.cancellation.begin());
+        if !self.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
+            self.status = "Disconnected".into();
+            self.core.continue_running = None;
+            return Err("Подключение отменено".into());
+        }
         self.settings.mode = "tun".into();
         let result = windows::restore(&self.core.directory.join("proxy-restore.json"))
             .and_then(|_| self.core.start(&self.settings));
@@ -139,8 +160,9 @@ impl App {
             }
             Err(e) => {
                 let _ = self.core.stop();
+                self.core.continue_running = None;
                 let _ = windows::restore(&self.core.directory.join("proxy-restore.json"));
-                self.status = "Error".into();
+                self.status = if self.reconnect.load(std::sync::atomic::Ordering::SeqCst) { "Error" } else { "Disconnected" }.into();
                 self.error = Some(e.clone());
                 self.log("ERROR", &e);
                 Err(e)
@@ -148,9 +170,11 @@ impl App {
         }
     }
     fn disconnect(&mut self) -> Result<(), String> {
+        self.revision = self.revision.wrapping_add(1);
         self.reconnect
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let stopped = self.core.stop();
+        self.core.continue_running = None;
         let restored = windows::restore(&self.core.directory.join("proxy-restore.json"));
         self.status = "Disconnected".into();
         self.settings.was_connected = false;
@@ -446,10 +470,22 @@ async fn request(
     payload: Option<Value>,
 ) -> Result<Value, String> {
     let shared = state.inner().clone();
+    if action == "snapshot" {
+        return Ok(app.state::<published_state::PublishedState>().get());
+    }
     if action == "connect" || action == "disconnect" {
         app.state::<ConnectionIntent>()
             .0
             .store(action == "connect", std::sync::atomic::Ordering::SeqCst);
+        if action == "disconnect" {
+            app.state::<cancellation::Cancellation>().cancel();
+            if shared.try_lock().is_err() {
+                let published = app.state::<published_state::PublishedState>();
+                let mut value = published.get();
+                value["status"] = json!("Disconnecting");
+                published.set(value.clone());
+            }
+        }
     }
     if app
         .state::<ShuttingDown>()
@@ -643,13 +679,19 @@ async fn request(
         .map_err(|e| e.to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut a = shared
-            .try_lock()
-            .map_err(|_| "Atlas занят, повторите операцию")?;
+        let mut a = if action == "disconnect" {
+            // The caller awaits actual cleanup (the updater relies on this).
+            // Cancellation above already interrupted the pending network operation.
+            shared.lock().map_err(|_| "Состояние Atlas недоступно")?
+        } else {
+            shared.try_lock().map_err(|_| "Atlas занят, повторите операцию")?
+        };
         if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
             return Err("Atlas завершает работу".into());
         }
-        a.dispatch(&app, &action, payload.unwrap_or(Value::Null))
+        let result = a.dispatch(&app, &action, payload.unwrap_or(Value::Null));
+        a.snapshot();
+        result
     })
     .await
     .map_err(|e| e.to_string())?
@@ -697,7 +739,14 @@ pub fn run() {
             }
             let intent = Arc::new(std::sync::atomic::AtomicBool::new(auto));
             app.manage(ConnectionIntent(intent.clone()));
+            let published = published_state::PublishedState::default();
+            app.manage(published.clone());
+            let cancellation = cancellation::Cancellation::default();
+            app.manage(cancellation.clone());
             let shared = Arc::new(Mutex::new(App {
+                revision: 0,
+                published,
+                cancellation,
                 settings,
                 store,
                 core,
@@ -706,6 +755,7 @@ pub fn run() {
                 logs: vec![],
                 reconnect: intent.clone(),
             }));
+            shared.lock().unwrap().snapshot();
             app.manage(shared.clone());
             let shutdown: ShuttingDown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.manage(shutdown.clone());
@@ -737,6 +787,9 @@ pub fn run() {
                         if action == "connect" || action == "disconnect" || action == "quit" {
                             app.state::<ConnectionIntent>().0.store(action == "connect", std::sync::atomic::Ordering::SeqCst);
                         }
+                        if action == "disconnect" || action == "quit" {
+                            app.state::<cancellation::Cancellation>().cancel();
+                        }
                         if action == "quit" {
                             if app.state::<ShuttingDown>().swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
                             // Never leave Exit queued behind a driver/configuration timeout.
@@ -764,6 +817,7 @@ pub fn run() {
                                     }
                                 } else {
                                     let _ = a.dispatch(&handle, &action, Value::Null);
+                                    a.snapshot();
                                 }
                             };
                         });
@@ -788,6 +842,7 @@ pub fn run() {
                     }
                     if !intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Connected" {
                         let _ = a.disconnect();
+                        a.snapshot();
                         continue;
                     }
                     if a.status == "Connected" && !a.core.running() {
@@ -806,6 +861,7 @@ pub fn run() {
                         else { failures = failures.saturating_add(1); }
                         retry_at = std::time::Instant::now() + std::time::Duration::from_secs(retry_delay(failures));
                     }
+                    a.snapshot();
                 }
             });
             Ok(())

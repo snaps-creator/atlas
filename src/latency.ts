@@ -5,6 +5,28 @@ export type Latency = {
   error?: string | null;
 };
 
+// Results and queued batch work belong to one connection/configuration epoch.
+export class LatencyEpoch {
+  private key = "";
+  private active = new Map<string, symbol>();
+  update(key: string): boolean {
+    if (key === this.key) return false;
+    this.key = key;
+    this.active.clear();
+    return true;
+  }
+  begin(key: string, name: string): symbol | undefined {
+    if (key !== this.key || this.active.has(name)) return;
+    const token = Symbol(name);
+    this.active.set(name, token);
+    return token;
+  }
+  current(name: string, token: symbol): boolean { return this.active.get(name) === token; }
+  finish(name: string, token: symbol): void {
+    if (this.current(name, token)) this.active.delete(name);
+  }
+}
+
 export function latencyLabel(value?: Latency): string {
   if (value?.status === "ok" && value.delay !== null)
     return `${value.delay} мс`;

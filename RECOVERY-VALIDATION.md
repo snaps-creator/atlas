@@ -117,3 +117,109 @@ observe the server outage concurrently, reconnect after its restart, and keep
 working when one client stops. This exercises real cores without TUN/WFP on the
 host. It does not simulate DHCP lease expiry or eight physical office PCs.
 Final logs: temp/lan-policy-final.log and temp/lan-policy-build.log.
+
+### Four-report follow-up (2026-09-22)
+
+The four startup reports show VPN dial timeouts followed by DIRECT DNS failures.
+The generated `direct-nameserver` incorrectly inherited `#ATLAS`; it now uses
+`#DIRECT` and does not follow proxy DNS policy. The proxy/default resolvers remain
+separate. A real bundled-core regression uses a closed VPN port, local UDP DNS
+and a local HTTP origin: a domain-based DIRECT request must return HTTP 200.
+Only resolver addresses and listener ports are substituted; the generated DNS
+proxy suffixes are retained. TUN and OS networking are not enabled in this test.
+
+The top-level IPv6 option now follows the user setting instead of being forced
+on. This prevents IPv6 outbound resolution/dialing when IPv6 is disabled. The
+Windows core's strict-route IPv6 blocking remains in force when no IPv6 TUN
+address is configured; this is not a promise of IPv6 LAN/DHCPv6 connectivity in
+IPv6-disabled mode. IPv4 DHCP exclusions/UDP 68-to-67 permission remain intact.
+
+Service health checks now use one bounded background probe rather than waiting
+on HTTP inside the command loop. GET requests for statistics, connections and
+diagnostics use bounded background jobs as delay probes already did. The command
+loop can handle stop/select while those reads wait. The local HTTP client reuses
+connections, has a one-second connect deadline and a three-second ordinary request
+deadline (12 seconds for URL tests). At most 16 outstanding query jobs are retained;
+they expire after 30 seconds. Pending health results are discarded on reconfigure.
+Three failed local core health checks still terminate the broken session so the
+existing recovery controller can restart it. A remote VPN failure alone does not
+restart TUN. AUTO/FAILOVER recovery remains the core's responsibility and manual
+server selection remains manual.
+
+The main page now describes process readiness as “Туннель запущен” and displays
+the existing real protection-check detail rather than implying that a live local
+controller proves internet availability. No new periodic network scan was added.
+
+Validation: 69 Rust tests and 18 frontend tests passed; frontend production build
+passed. This includes eight concurrent clients sharing one VLESS identity, server
+restart recovery, the isolated process-exit chain, and the new DNS regression.
+These reports were captured after startup, not during the office outage. They do
+not establish its sole cause, and this run does not establish physical DHCP lease
+renewal, sleep/resume, interface switching, or multi-day office stability.
+
+### Sequential hardening follow-up
+
+1. UI snapshots now read a separate published-state store. The network mutation
+   lock still serializes changes, but a blocked start/recovery does not prevent
+   reading state. Connecting is published before the blocking operation; the
+   recovery worker publishes completion/error and refreshes state every two seconds.
+2. Every connection attempt has its own cancellation token. Disconnect/Exit cancel
+   it without acquiring the network lock. Validation, service launch and pipe
+   reads/writes observe cancellation. Closing the cancelled pipe also cancels
+   service startup via an independent pipe watcher. The UI exposes Cancel during
+   Connecting. Disconnect still awaits cleanup, including for updater callers.
+   A real named-pipe test stalls the start reply, cancels it, and verifies that
+   the service watcher receives cancellation within a two-second test deadline.
+3. Reconfiguration captures the live selector and old configuration bytes before
+   applying changes. Runtime or disk-commit failure restores both, checks the core,
+   TUN enabled flag and selector, and restores the files. An unverified rollback
+   stops the session. The real-core test deliberately makes previous.yaml a
+   directory to fail the commit after application; it verifies restoration of a
+   manual selector that differs from the old YAML default. A second injected disk
+   failure prevents rollback and verifies that the core is stopped.
+4. Published revisions change on save/connect/disconnect. Latency results and
+   queued batch work belong to a connection/configuration epoch. A late result or
+   finally block from an earlier epoch cannot overwrite/unlock the new test.
+5. URL tests and controller reads have separate admission limits of eight each.
+   Stop/select use neither quota; local health has its own single probe. A stalled
+   URL-test saturation test verifies that state queries still complete. Controller
+   requests retain their existing deadlines; this does not spawn unbounded workers.
+
+DHCP regression inspects the exact conditions used to install Atlas WFP permits:
+UDP 68-to-67 and 546-to-547, without a destination condition, covering broadcast
+discovery and unicast renewal in Atlas's own policy. This does not exercise the
+Windows DHCP client, other filters, or actual lease renewal. Existing tests cover
+TUN identity Keep/Rebind/Missing decisions, not live sleep or Ethernet/Wi-Fi changes.
+No production adapter, installed client or network setting was modified.
+
+An intermediate full run had 73 passes and one failure in the eight-client
+recovery fixture: one SOCKS request after server restart returned no valid HTTP
+status. The core log showed prior outage refusals; the restarted server log showed
+successful DIRECT routing. This is not enough to assign the failure to production
+recovery or the fixture. Inspection also found generated background health URLs
+were public in test cores. Test-only configuration now substitutes a loopback URL
+for every group's health URL; production configuration is unchanged. Three
+consecutive eight-client runs then passed with no per-request retry added.
+The isolation defect is corrected; the isolated failure's cause is unconfirmed.
+Evidence: temp/sequential-fixes-final.log and temp/multi-repeat-{1,2,3}.log.
+
+Final verification: temp/sequential-verified-tests.log has 74 Rust passes, zero
+failures; 19 frontend tests passed and the frontend production build completed.
+The Windows release build completed (temp/sequential-release-build.log). The
+installed executable was not replaced and these changes have not been released.
+
+### Bounded owned-process termination
+
+Core stop/drop no longer use an unbounded Child::wait after ignoring kill errors.
+They request termination, release KILL_ON_JOB_CLOSE before waiting, and confirm
+exit on the owned process handle with a two-second deadline. Unconfirmed exit
+returns an error including the kill failure and retains the child in Core::stop
+for a subsequent cleanup attempt. Drop also uses bounded cleanup and records any
+failure. The deadline is for process-exit confirmation, not the entire TUN/API/IPC
+shutdown chain. Configuration validation cancellation/timeout uses the same bounded
+exit helper. This change does not make spawn/Job assignment atomic.
+
+The full suite passed 76 tests before the additional fallback-process fixture;
+all three termination-helper tests then passed, including a real isolated process
+terminated through Job close with kill failure injected. No installed process was
+stopped. Logs: temp/stop-fix.log and temp/stop-fallback.log.

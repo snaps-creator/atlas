@@ -72,7 +72,8 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
                 node["udp"] = json!(true);
             }
         }
-        doc["ipv6"] = json!(true);
+        // Honor the user's IPv6 policy for outbound dialing as well as DNS.
+        // Windows strict-route blocks uncaptured IPv6 when Inet6Address is absent.
         // Clash Verge's Windows default. Avoid the system TCP stack's additional
         // inbound-firewall dependency while keeping Mihomo's routing/DNS policy.
         doc["tun"]["stack"] = json!("gvisor");
@@ -110,7 +111,12 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         // Capture all destinations; DIRECT/PROXY/REJECT are decided inside the core.
         // Preserve the user's default route rather than replacing MATCH unconditionally.
         doc["tun"]["disable-icmp-forwarding"] = json!(true);
-        doc["dns"]["direct-nameserver"] = doc["dns"]["nameserver"].clone();
+        // DIRECT must remain usable when the selected VPN cannot connect.
+        // Never inherit #ATLAS here: that makes direct traffic depend on VPN DNS.
+        doc["dns"]["direct-nameserver"] = json!(s.dns.servers.iter()
+            .map(|server| format!("{}#DIRECT", server.split('#').next().unwrap()))
+            .collect::<Vec<_>>());
+        doc["dns"]["direct-nameserver-follow-policy"] = json!(false);
         let rules = doc["rules"].as_array_mut().unwrap();
         if !s.dns.ipv6 {
             rules.insert(0, json!("IP-CIDR6,::/0,REJECT,no-resolve"));
@@ -178,7 +184,7 @@ mod tests {
         }
         assert_eq!(tun["dns"]["fake-ip-range"], "198.19.0.1/16");
         assert_eq!(tun["tun"]["inet6-address"][0], "fd72:6174:6c61::1/126");
-        assert_eq!(tun["ipv6"], true); // Keep IPv6 captured even when resolution is disabled.
+        assert_eq!(tun["ipv6"], false);
         assert_eq!(tun["rules"][0], "IP-CIDR6,::/0,REJECT,no-resolve");
         assert_eq!(
             tun["rules"].as_array().unwrap().last().unwrap(),
@@ -204,6 +210,7 @@ mod tests {
         );
         s.dns.ipv6 = true;
         let v6: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
+        assert_eq!(v6["ipv6"], true);
         assert_ne!(v6["rules"][0], "IP-CIDR6,::/0,REJECT,no-resolve");
         s.routing_mode = RoutingMode::Global;
         let global: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
@@ -217,6 +224,9 @@ mod tests {
             .unwrap()
             .ends_with("#DIRECT"));
         for config in [&tun, &global, &direct] {
+            assert!(config["dns"]["direct-nameserver"].as_array().unwrap().iter()
+                .all(|v| v.as_str().unwrap().ends_with("#DIRECT")));
+            assert_eq!(config["dns"]["direct-nameserver-follow-policy"], false);
             let networks: Vec<ipnet::IpNet> = config["tun"]["route-exclude-address"]
                 .as_array().unwrap().iter().map(|v| v.as_str().unwrap().parse().unwrap()).collect();
             for ip in ["255.255.255.255", "fe80::1", "ff02::1:2", "224.0.0.251", "fd12::5"] {

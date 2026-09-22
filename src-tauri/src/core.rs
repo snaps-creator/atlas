@@ -11,6 +11,7 @@ use std::{
 #[path = "multi_client_tests.rs"]
 mod multi_client_tests;
 pub struct Core {
+    pub continue_running: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub binary: PathBuf,
     pub directory: PathBuf,
     pub child: Option<Child>,
@@ -25,6 +26,7 @@ pub struct Core {
 impl Core {
     pub fn new(binary: PathBuf, directory: PathBuf) -> Self {
         Self {
+            continue_running: None,
             binary,
             directory,
             child: None,
@@ -62,6 +64,10 @@ impl Core {
             doc["mixed-port"] = json!(self.ports[0]);
             doc["external-controller"] = json!(format!("127.0.0.1:{}", self.ports[1]));
             doc["dns"]["listen"] = json!(format!("127.0.0.1:{}", self.ports[2]));
+            // Isolated core tests must never perform the generated public URL tests.
+            for group in doc["proxy-groups"].as_array_mut().unwrap() {
+                group["url"] = json!("http://127.0.0.1:1/fixture-health");
+            }
             serde_yaml::to_string(&doc).map_err(|e| e.to_string())?
         };
         let path = self.directory.join("candidate.yaml");
@@ -77,6 +83,10 @@ impl Core {
             .map_err(|_| "Не удалось запустить Mihomo; проверьте наличие ядра")?;
         let start = Instant::now();
         loop {
+            if self.cancelled() {
+                crate::process_stop::stop(&mut c, || {}, Duration::from_secs(2))?;
+                return Err("Подключение отменено".into());
+            }
             if let Some(status) = c.try_wait().map_err(|e| e.to_string())? {
                 if status.success() {
                     return Ok(path);
@@ -84,8 +94,7 @@ impl Core {
                 return Err("Mihomo отклонил конфигурацию. Проверьте параметры серверов и DNS; предыдущая версия сохранена.".into());
             }
             if start.elapsed() > Duration::from_secs(20) {
-                let _ = c.kill();
-                let _ = c.wait();
+                crate::process_stop::stop(&mut c, || {}, Duration::from_secs(2))?;
                 return Err("Проверка конфигурации Mihomo превысила 20 секунд".into());
             }
             thread::sleep(Duration::from_millis(50));
@@ -122,13 +131,14 @@ impl Core {
         }
     }
     pub fn start(&mut self, s: &Settings) -> Result<(), String> {
+        if self.cancelled() { return Err("Подключение отменено".into()); }
         if self.running() {
             return Ok(());
         }
         if s.mode == "tun" && !self.elevated {
             crate::broker::validate_settings(s)?;
             self.validate(s)?;
-            let broker = std::sync::Arc::new(crate::broker::Broker::launch()?);
+            let broker = std::sync::Arc::new(crate::broker::Broker::launch_cancellable(self.continue_running.as_deref())?);
             std::fs::write(
                 self.directory.join("tun-guard.active"),
                 b"Atlas persistent network guard",
@@ -136,7 +146,7 @@ impl Core {
             .map_err(|e| e.to_string())?;
             self.broker = Some(broker.clone());
             if let Err(error) =
-                broker.call("start", serde_json::to_value(s).map_err(|e| e.to_string())?)
+                broker.call_cancellable("start", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())
             {
                 let _ = self.stop();
                 return Err(error);
@@ -197,6 +207,10 @@ impl Core {
         // A false enable flag during that interval is pending, not a failure.
         let deadline = Instant::now() + Duration::from_secs(if s.mode == "tun" { 60 } else { 5 });
         while Instant::now() < deadline {
+            if self.cancelled() {
+                self.stop()?;
+                return Err("Подключение отменено".into());
+            }
             if s.mode == "tun"
                 && self.logs.lock().is_ok_and(|logs| {
                     logs.iter()
@@ -255,6 +269,9 @@ impl Core {
         std::fs::copy(path, &last).map_err(|e| e.to_string())?;
         Ok(())
     }
+    pub(crate) fn cancelled(&self) -> bool {
+        self.continue_running.as_ref().is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst))
+    }
     fn tun_error(&self) -> String {
         let detail = self.logs.lock().ok().and_then(|logs| {
             logs.iter()
@@ -274,7 +291,7 @@ impl Core {
     pub fn apply(&mut self, s: &Settings) -> Result<(), String> {
         if let Some(broker) = &self.broker {
             crate::broker::validate_settings(s)?;
-            broker.call("apply", serde_json::to_value(s).map_err(|e| e.to_string())?)?;
+            broker.call_cancellable("apply", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())?;
             return Ok(());
         }
         let path = self.validate(s)?;
@@ -282,6 +299,9 @@ impl Core {
             return Ok(());
         }
         let old = self.directory.join("last-working.yaml");
+        let previous = std::fs::read(&old).map_err(|e| format!("Не удалось сохранить конфигурацию для отката: {e}"))?;
+        let selected = self.api("GET", "/proxies/ATLAS", None)?["now"]
+            .as_str().ok_or("Не удалось сохранить выбранный сервер для отката")?.to_owned();
         let result = self
             .api("PUT", "/configs?force=true", Some(json!({"path":path})))
             .and_then(|_| self.api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected}))))
@@ -292,14 +312,34 @@ impl Core {
                 } else {
                     Ok(config)
                 }
-            });
+            }).and_then(|_| self.commit(&path));
         if let Err(e) = result {
-            if old.exists() {
-                self.api("PUT", "/configs?force=true", Some(json!({"path":old})))?;
+            let rollback = (|| {
+                // A failed commit may already have overwritten current/last-working.
+                // Use the pre-transaction bytes and the live selector, not its old default.
+                let rollback_path = self.directory.join("rollback.yaml");
+                std::fs::write(&rollback_path, &previous).map_err(|e| e.to_string())?;
+                self.api("PUT", "/configs?force=true", Some(json!({"path":rollback_path})))?;
+                self.api("PUT", "/proxies/ATLAS", Some(json!({"name":selected})))?;
+                self.api("GET", "/version", None)?;
+                let restored = self.api("GET", "/configs", None)?;
+                let expected: Value = serde_yaml::from_slice(&previous).map_err(|e| e.to_string())?;
+                if restored["tun"]["enable"] != expected["tun"]["enable"]
+                    || self.api("GET", "/proxies/ATLAS", None)?["now"] != selected {
+                    return Err("Ядро не подтвердило восстановление конфигурации и сервера".to_owned());
+                }
+                std::fs::write(self.directory.join("current.yaml"), &previous).map_err(|e| e.to_string())?;
+                std::fs::write(&old, &previous).map_err(|e| e.to_string())?;
+                let _ = std::fs::remove_file(rollback_path);
+                Ok::<(), String>(())
+            })();
+            if let Err(rollback_error) = rollback {
+                let _ = self.stop();
+                return Err(format!("{e}. Откат не подтверждён: {rollback_error}. Сессия остановлена."));
             }
             return Err(e);
         }
-        self.commit(&path)
+        Ok(())
     }
     pub fn select(&self, name: &str) -> Result<(), String> {
         if let Some(broker) = &self.broker {
@@ -325,8 +365,12 @@ impl Core {
             let _ = self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}})));
         }
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            let job = self.job.take();
+            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(2)) {
+                self.child = Some(c);
+                if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
+                return Err(error);
+            }
         }
         self.started = None;
         self.job = None;
@@ -338,8 +382,11 @@ impl Drop for Core {
     fn drop(&mut self) {
         // Closing the IPC session releases the broker's dynamic WFP filters.
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let job = self.job.take();
+            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(2)) {
+                if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
+                eprintln!("{error}");
+            }
         }
         self.broker = None;
         self.job = None;
@@ -499,6 +546,19 @@ mod integration_tests {
             working
         );
         assert!(core.api("GET", "/version", None).is_ok());
+        // Force a disk commit failure AFTER the real core applied the candidate.
+        // The live manual choice differs from the selector default in the old YAML.
+        core.select("fixture").unwrap();
+        let previous_path = directory.join("previous.yaml");
+        if previous_path.exists() { std::fs::remove_file(&previous_path).unwrap(); }
+        std::fs::create_dir(&previous_path).unwrap();
+        let mut changed = settings.clone();
+        changed.selected = "AUTO".into();
+        assert!(core.apply(&changed).is_err());
+        assert!(core.running());
+        assert_eq!(core.api("GET", "/proxies/ATLAS", None).unwrap()["now"], "fixture");
+        assert_eq!(std::fs::read(directory.join("last-working.yaml")).unwrap(), working);
+        std::fs::remove_dir(previous_path).unwrap();
         use std::io::{Read, Write};
         use std::sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -601,6 +661,13 @@ mod integration_tests {
         core.start(&settings).unwrap();
         assert!(core.running());
         assert!(core.api("GET", "/version", None).is_ok());
+        // If rollback itself cannot be persisted, do not keep an unknown session alive.
+        std::fs::remove_file(directory.join("previous.yaml")).unwrap();
+        std::fs::create_dir(directory.join("previous.yaml")).unwrap();
+        std::fs::create_dir(directory.join("rollback.yaml")).unwrap();
+        let error = core.apply(&settings).unwrap_err();
+        assert!(error.contains("Откат не подтверждён"));
+        assert!(!core.running());
         core.stop().unwrap();
         assert!(!core.running());
         drop(core);
@@ -631,8 +698,11 @@ impl ApiClient {
     }
     pub fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         if let Some(broker) = &self.broker {
-            if method == "GET" && path.contains("/delay?") {
-                let job = broker.call("delay", json!({"path":path}))?;
+            if method == "GET" {
+                // Reads, including connections/status, must not hold the command
+                // loop while the core is stalled. Stop/select retain access to IPC.
+                let delay = path.contains("/delay?");
+                let job = broker.call(if delay { "delay" } else { "query" }, json!({"path":path}))?;
                 let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
                     if Instant::now() >= deadline {
@@ -642,21 +712,21 @@ impl ApiClient {
                     if result["done"] == true {
                         return Ok(result["value"].clone());
                     }
-                    thread::sleep(Duration::from_millis(150));
+                    thread::sleep(Duration::from_millis(if delay { 150 } else { 30 }));
                 }
             }
             return broker.call("api", json!({"method":method,"path":path}));
         }
-        let client = reqwest::blocking::Client::builder()
+        // Reuse connections to the local controller across status/traffic polls.
+        // Authentication remains per request, so sessions never share credentials.
+        static HTTP: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+            std::sync::OnceLock::new();
+        let client = HTTP.get_or_init(|| reqwest::blocking::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(1))
-            .timeout(Duration::from_secs(if path.contains("/delay?") {
-                12
-            } else {
-                3
-            }))
-            .build()
-            .map_err(|e| e.to_string())?;
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(15))
+            .build().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
         let method =
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "Некорректный метод")?;
         let mut req = client
@@ -664,7 +734,8 @@ impl ApiClient {
                 method,
                 format!("http://127.0.0.1:{}{path}", self.controller_port),
             )
-            .bearer_auth(&self.secret);
+            .bearer_auth(&self.secret)
+            .timeout(Duration::from_secs(if path.contains("/delay?") { 12 } else { 3 }));
         if let Some(b) = body {
             req = req.json(&b)
         }
