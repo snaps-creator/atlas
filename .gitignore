@@ -70,5 +70,8 @@ cache.db-*
 /proxy-restore.json
 /tun-guard.active
 
+# Local release installers; the bundled VPN core remains tracked.
+/Atlas*Setup.exe
+
 # Keep package-lock.json, Cargo.lock, build configuration, icons,
 # src-tauri/resources and third_party: these are required build inputs.
