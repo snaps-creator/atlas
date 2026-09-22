@@ -89,45 +89,6 @@ pub fn tun_identity() -> Option<u64> {
     }
 }
 
-/// Read IPv4/IPv6 default routes without changing Windows. Ignore Atlas's own
-/// routes so reloading the TUN cannot trigger a reload loop.
-pub fn route_signature() -> Result<Vec<(u32, u16, [u8; 16], u32)>, String> {
-    use windows_sys::Win32::{
-        NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2},
-        Networking::WinSock::{AF_INET, AF_UNSPEC},
-    };
-    unsafe {
-        let mut table = ptr::null_mut();
-        checked(
-            GetIpForwardTable2(AF_UNSPEC, &mut table),
-            "чтение маршрутов",
-        )?;
-        let mut tun: NET_LUID_LH = std::mem::zeroed();
-        let _ = ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut tun);
-        let mut routes =
-            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
-                .iter()
-                .filter(|r| {
-                    r.DestinationPrefix.PrefixLength == 0 && r.InterfaceLuid.Value != tun.Value
-                })
-                .map(|r| {
-                    let family = r.NextHop.si_family;
-                    let mut address = [0; 16];
-                    if family == AF_INET {
-                        address[..4]
-                            .copy_from_slice(&r.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes());
-                    } else {
-                        address = r.NextHop.Ipv6.sin6_addr.u.Byte;
-                    }
-                    (r.InterfaceIndex, family, address, r.Metric)
-                })
-                .collect::<Vec<_>>();
-        FreeMibTable(table.cast());
-        routes.sort_unstable();
-        Ok(routes)
-    }
-}
-
 /// A competing full-tunnel must be disconnected by its owner before Atlas connects.
 /// Reading routes has no side effects; never delete another client's routes/filters.
 pub fn check_competing_routes() -> Result<(), String> {

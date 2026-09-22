@@ -333,7 +333,6 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut explicit_stop = false;
     let mut active_settings: Option<Settings> = None;
     let mut last_health = Instant::now();
-    let mut routes = network_guard::route_signature().unwrap_or_default();
     let mut health_failures = 0;
     let mut tun_identity = network_guard::tun_identity();
     let mut delays: std::collections::HashMap<
@@ -350,33 +349,27 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
             }
         }
         if configured && last_health.elapsed() >= Duration::from_secs(5) {
-            let resumed = last_health.elapsed() > Duration::from_secs(30);
-            let observed = network_guard::route_signature();
-            if resumed
-                || network_guard::tun_identity() != tun_identity
-                || observed.as_ref().is_ok_and(|value| *value != routes)
-            {
-                if let Some(settings) = &active_settings {
-                    // Re-evaluate the physical egress and rebind WFP to the new TUN
-                    // LUID after sleep or a route/interface change. A failed repair
-                    // closes the session; the desktop retries with bounded backoff.
-                    if core.apply(settings).is_err()
-                        || guard
-                            .as_ref()
-                            .is_none_or(|g| g.install(&core.binary).is_err())
-                    {
-                        break;
+            // Mihomo v1.19.31 already subscribes to Windows route/interface
+            // notifications and resets resolver connections. Do not reload TUN
+            // when DHCP, sleep or the physical egress changes.
+            let observed = network_guard::tun_identity();
+            let guard_ready = match tun_guard_action(tun_identity, observed) {
+                TunGuardAction::Keep => true,
+                TunGuardAction::Missing => false,
+                TunGuardAction::Rebind => {
+                    let ready = guard
+                        .as_ref()
+                        .is_some_and(|g| g.install(&core.binary).is_ok());
+                    if ready {
+                        tun_identity = observed;
                     }
+                    ready
                 }
-                if let Ok(value) = observed {
-                    routes = value;
-                }
-                tun_identity = network_guard::tun_identity();
-            }
+            };
             if !core.running() {
                 break;
             }
-            if core.api("GET", "/version", None).is_err() {
+            if !guard_ready || core.api("GET", "/version", None).is_err() {
                 health_failures += 1;
             } else {
                 health_failures = 0;
@@ -487,7 +480,6 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 }
                 configured = true;
                 active_settings = Some(s);
-                routes = network_guard::route_signature().unwrap_or_default();
                 last_health = Instant::now();
                 tun_identity = network_guard::tun_identity();
                 Ok(json!({"running":true}))
@@ -524,7 +516,6 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                     }
                 }
                 active_settings = Some(s);
-                routes = network_guard::route_signature().unwrap_or_default();
                 tun_identity = network_guard::tun_identity();
                 last_health = Instant::now();
                 Ok(json!({}))
@@ -707,4 +698,35 @@ fn busy_channel_is_not_reported_as_a_crashed_core() {
     drop(lock);
     assert!(!broker.alive());
     assert!(broker.call("status", Value::Null).is_err());
+}
+
+#[derive(Debug, PartialEq)]
+enum TunGuardAction {
+    Keep,
+    Rebind,
+    Missing,
+}
+fn tun_guard_action(previous: Option<u64>, current: Option<u64>) -> TunGuardAction {
+    match current {
+        None => TunGuardAction::Missing,
+        Some(_) if previous == current => TunGuardAction::Keep,
+        Some(_) => TunGuardAction::Rebind,
+    }
+}
+#[cfg(test)]
+mod tun_guard_tests {
+    use super::*;
+    #[test]
+    fn unchanged_adapter_preserves_the_session() {
+        assert_eq!(tun_guard_action(Some(7), Some(7)), TunGuardAction::Keep);
+    }
+    #[test]
+    fn replacement_adapter_requires_filter_rebinding_only() {
+        assert_eq!(tun_guard_action(Some(7), Some(8)), TunGuardAction::Rebind);
+    }
+    #[test]
+    fn missing_adapter_is_not_treated_as_healthy() {
+        assert_eq!(tun_guard_action(Some(7), None), TunGuardAction::Missing);
+        assert_eq!(tun_guard_action(None, None), TunGuardAction::Missing);
+    }
 }

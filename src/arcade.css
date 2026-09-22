@@ -182,3 +182,5 @@ button[aria-label="Закрыть"],
   .auto-options { grid-template-columns: 1fr; }
   .settings-section { padding: 25px; }
 }
+
+.privacy.unknown { color: #929aa7; }
