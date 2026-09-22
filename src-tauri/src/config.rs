@@ -82,6 +82,10 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         doc["dns"]["fake-ip-range"] = json!("198.19.0.1/16");
         doc["tun"]["inet6-address"] = json!(["fd72:6174:6c61::1/126"]);
         doc["tun"]["route-address"] = json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
+        // Office networks must remain on the physical interface even in Global
+        // mode and while the VPN core is recovering. Match the guard's LAN policy.
+        doc["tun"]["route-exclude-address"] =
+            json!(crate::lan_policy::route_exclusions());
         doc["tun"]["dns-hijack"] = json!(["any:53", "tcp://any:53"]);
         doc["tun"]["udp-timeout"] = json!(300);
         doc["tun"]["mtu"] = json!(1500);
@@ -157,6 +161,21 @@ mod tests {
         assert_eq!(tun["tun"]["stack"], "gvisor");
         assert_eq!(tun["tun"]["strict-route"], true);
         assert_eq!(tun["tun"]["device"], "Atlas-TUN");
+        let exclusions = tun["tun"]["route-exclude-address"].as_array().unwrap();
+        let networks: Vec<ipnet::IpNet> = exclusions
+            .iter()
+            .map(|v| v.as_str().unwrap().parse().unwrap())
+            .collect();
+        for ip in ["10.1.2.3", "172.31.255.254", "192.168.1.1"] {
+            assert!(networks
+                .iter()
+                .any(|n| n.contains(&ip.parse::<std::net::IpAddr>().unwrap())));
+        }
+        for ip in ["1.1.1.1", "198.19.0.1", "172.32.0.1"] {
+            assert!(!networks
+                .iter()
+                .any(|n| n.contains(&ip.parse::<std::net::IpAddr>().unwrap())));
+        }
         assert_eq!(tun["dns"]["fake-ip-range"], "198.19.0.1/16");
         assert_eq!(tun["tun"]["inet6-address"][0], "fd72:6174:6c61::1/126");
         assert_eq!(tun["ipv6"], true); // Keep IPv6 captured even when resolution is disabled.
@@ -197,6 +216,16 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("#DIRECT"));
+        for config in [&tun, &global, &direct] {
+            let networks: Vec<ipnet::IpNet> = config["tun"]["route-exclude-address"]
+                .as_array().unwrap().iter().map(|v| v.as_str().unwrap().parse().unwrap()).collect();
+            for ip in ["255.255.255.255", "fe80::1", "ff02::1:2", "224.0.0.251", "fd12::5"] {
+                assert!(networks.iter().any(|n| n.contains(&ip.parse::<std::net::IpAddr>().unwrap())),
+                    "{} captures local maintenance {ip}", config["mode"]);
+            }
+            assert_eq!(config["allow-lan"], false);
+            assert_eq!(config["bind-address"], "127.0.0.1");
+        }
         let mut legacy = serde_json::to_value(&s).unwrap();
         legacy.as_object_mut().unwrap().remove("routingMode");
         assert_eq!(

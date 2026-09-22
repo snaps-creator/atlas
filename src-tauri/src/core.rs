@@ -7,6 +7,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(test)]
+#[path = "multi_client_tests.rs"]
+mod multi_client_tests;
 pub struct Core {
     pub binary: PathBuf,
     pub directory: PathBuf,
@@ -206,6 +209,17 @@ impl Core {
                 break;
             }
             if self.api("GET", "/version", None).is_ok() {
+                // The controller can answer before inbound listeners finish
+                // starting. Do not publish Connected during that interval.
+                if std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], self.ports[0])),
+                    Duration::from_millis(100),
+                )
+                .is_err()
+                {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 if s.mode == "tun" {
                     let ready = self
                         .api("GET", "/configs", None)
@@ -304,6 +318,12 @@ impl Core {
             result = broker.call("stop", Value::Null).map(|_| ());
             let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         }
+        if self.elevated && self.child.is_some() {
+            // Run sing-tun's real Close path (adapter, routes, DNS cache) before
+            // TerminateProcess. The local API has a 3-second deadline; a hung
+            // core still falls through to owned-process termination.
+            let _ = self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}})));
+        }
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -330,6 +350,61 @@ impl Drop for Core {
 mod integration_tests {
     use super::*;
     use crate::model::{Route, Rule, RuleGroup, Subscription};
+    #[test]
+    fn privileged_stop_closes_tun_before_terminating_owned_process() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawHandle;
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut core = Core::privileged(
+            PathBuf::from("unused.exe"),
+            std::env::temp_dir().join(format!("atlas-stop-order-{}", uuid::Uuid::new_v4())),
+        );
+        core.ports[1] = api.local_addr().unwrap().port();
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ])
+            .creation_flags(0x08000000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        core.job = Some(crate::job::Job::attach(&child).unwrap());
+        let handle = child.as_raw_handle() as usize;
+        core.child = Some(child);
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = api.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut part = [0; 1024];
+            while !request.ends_with(b"}}") {
+                let n = socket.read(&mut part).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&part[..n]);
+                assert!(request.len() < 8192);
+            }
+            assert!(request.starts_with(b"PATCH /configs "));
+            assert!(String::from_utf8_lossy(&request).contains("\"tun\":{\"enable\":false}"));
+            assert_eq!(
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(handle as _, 0)
+                },
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT
+            );
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        core.stop().unwrap();
+        worker.join().unwrap();
+        assert!(core.child.is_none());
+        assert!(!core.running());
+    }
     #[test]
     fn disconnected_stop_does_not_launch_a_broker_for_a_stale_marker() {
         let directory =

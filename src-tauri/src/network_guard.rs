@@ -1,5 +1,5 @@
 //! Session-owned WFP policy. Only the owned core, loopback and the TUN interface
-//! can originate internet traffic. DHCP and private IPv4 LAN destinations are
+//! can originate internet traffic. DHCP and local IPv4/IPv6 destinations are
 //! permitted so that the host can keep its address and reach office resources.
 //! Windows releases dynamic filters if the helper dies, restoring prior policy.
 use std::{path::Path, ptr};
@@ -56,7 +56,7 @@ impl Drop for Engine {
     }
 }
 unsafe fn erase(engine: HANDLE) -> Result<(), String> {
-    for i in 0..13 {
+    for i in 0..(10 + crate::lan_policy::PREFIXES.len() as u128) {
         let r = FwpmFilterDeleteByKey0(engine, &key(i));
         if r != 0 && r != 0x80320003 {
             return Err(format!("Не удалось удалить фильтр Атласа: {r:#x}"));
@@ -225,19 +225,35 @@ impl Guard {
                     conditions[2].conditionValue.Anonymous.uint16 = remote;
                     permit(e.0, offset, layer, name.as_mut_ptr(), &mut conditions)?;
                 }
-                // Existing, more-specific Windows LAN routes stay on Ethernet/Wi-Fi.
-                // Allow their RFC1918 destinations without permitting public internet
+                // Local maintenance/discovery and office traffic stay on Ethernet/Wi-Fi.
+                // Use the same scoped destinations as TUN, without permitting public internet
                 // on those interfaces. Do not change routes or disable DNS leak filters.
-                for (index, (addr, mask)) in LAN_V4.iter().copied().enumerate() {
-                    let mut subnet = FWP_V4_ADDR_AND_MASK { addr, mask };
+                for (index, prefix) in crate::lan_policy::PREFIXES.iter().enumerate() {
+                    let network: ipnet::IpNet = prefix.parse().map_err(|e| format!("LAN prefix: {e}"))?;
                     let mut condition: FWPM_FILTER_CONDITION0 = std::mem::zeroed();
                     condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-                    condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
-                    condition.conditionValue.Anonymous.v4AddrMask = &mut subnet;
+                    let mut v4: FWP_V4_ADDR_AND_MASK = std::mem::zeroed();
+                    let mut v6: FWP_V6_ADDR_AND_MASK = std::mem::zeroed();
+                    let layer = match network {
+                        ipnet::IpNet::V4(n) => {
+                            v4.addr = u32::from(n.network());
+                            v4.mask = u32::from(n.netmask());
+                            condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
+                            condition.conditionValue.Anonymous.v4AddrMask = &mut v4;
+                            FWPM_LAYER_ALE_AUTH_CONNECT_V4
+                        }
+                        ipnet::IpNet::V6(n) => {
+                            v6.addr = n.network().octets();
+                            v6.prefixLength = n.prefix_len();
+                            condition.conditionValue.r#type = FWP_V6_ADDR_MASK;
+                            condition.conditionValue.Anonymous.v6AddrMask = &mut v6;
+                            FWPM_LAYER_ALE_AUTH_CONNECT_V6
+                        }
+                    };
                     permit(
                         e.0,
                         10 + index as u128,
-                        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                        layer,
                         name.as_mut_ptr(),
                         std::slice::from_mut(&mut condition),
                     )?;
@@ -252,12 +268,6 @@ impl Guard {
         }
     }
 }
-
-const LAN_V4: [(u32, u32); 3] = [
-    (0x0a000000, 0xff000000),
-    (0xac100000, 0xfff00000),
-    (0xc0a80000, 0xffff0000),
-];
 
 unsafe fn permit(
     engine: HANDLE,
@@ -291,8 +301,8 @@ mod tests {
     #[test]
     fn lan_exceptions_do_not_allow_public_or_fake_ip_destinations() {
         let allowed = |ip: &str| {
-            let ip = u32::from(ip.parse::<std::net::Ipv4Addr>().unwrap());
-            LAN_V4.iter().any(|(network, mask)| ip & mask == *network)
+            let ip = ip.parse::<std::net::IpAddr>().unwrap();
+            crate::lan_policy::PREFIXES.iter().any(|network| network.parse::<ipnet::IpNet>().unwrap().contains(&ip))
         };
         for ip in ["192.168.1.1", "10.1.2.3", "172.16.0.1", "172.31.255.254"] {
             assert!(allowed(ip), "{ip}");

@@ -1,13 +1,32 @@
-import { expect, test } from "vitest";
-import { latencyLabel, testPool } from "./latency";
+import { expect, test, vi } from "vitest";
+import { boundedLatency, latencyLabel, testPool, type Latency } from "./latency";
 
 test("ошибка контроллера не означает недоступность сервера", () => {
   expect(latencyLabel()).toBe("—");
-  expect(latencyLabel({ status: "error", delay: null, attempts: 0 })).toBe("—");
+  expect(latencyLabel({ status: "error", delay: null, attempts: 0 })).toBe("Ошибка проверки");
   expect(
     latencyLabel({ status: "unreachable", delay: null, attempts: 4 }),
-  ).toBe("Недоступен");
+  ).toBe("Нет ответа");
   expect(latencyLabel({ status: "ok", delay: 0, attempts: 1 })).toBe("0 мс");
+});
+
+test("зависший native-запрос освобождает очередь, поздний ответ не меняет результат", async () => {
+  vi.useFakeTimers();
+  try {
+    let finish!: (value: Latency) => void;
+    const hanging = new Promise<Latency>((resolve) => { finish = resolve; });
+    const results: Latency[] = [];
+    const work = testPool([hanging, Promise.resolve<Latency>({ status: "ok", delay: 20, attempts: 1 })], async (p) => {
+      results.push(await boundedLatency(p, 100));
+    }, 1);
+    await vi.advanceTimersByTimeAsync(101);
+    await work;
+    expect(results.map(r => r.status)).toEqual(["error", "ok"]);
+    finish({ status: "ok", delay: 100, attempts: 1 });
+    await Promise.resolve();
+    expect(results[0].status).toBe("error");
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
 });
 
 test("проверки ограничены и результаты поступают до завершения очереди", async () => {

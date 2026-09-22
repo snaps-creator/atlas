@@ -33,3 +33,40 @@ impl Drop for Job {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    #[test]
+    fn closing_job_terminates_only_owned_child() {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ])
+            .creation_flags(0x08000000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let job = Job::attach(&child).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("job close did not terminate owned child");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

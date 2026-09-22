@@ -46,7 +46,7 @@ import { trafficRate, type TrafficSample } from "./traffic";
 import { ActiveServer } from "./ActiveServer";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { latencyLabel, testPool, type Latency } from "./latency";
+import { boundedLatency, latencyLabel, testPool, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel } from "./protection";
@@ -375,7 +375,7 @@ function App() {
       [name]: { status: "testing", delay: null, attempts: 0 },
     }));
     try {
-      const r = await request<Latency>("latency", { name });
+      const r = await boundedLatency(request<Latency>("latency", { name }));
       setLatencies((l) => ({ ...l, [name]: r }));
     } catch (e) {
       setLatencies((l) => ({

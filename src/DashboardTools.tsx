@@ -13,8 +13,8 @@ import type { Settings } from "./types";
 import "./dashboard.css";
 import type { TrafficSample } from "./traffic";
 const megabytes = (n: number) => `${(n / 1_000_000).toFixed(2)} МБ`;
-const megabitsPerSecond = (n: number) =>
-  `${((n * 8) / 1_000_000).toFixed(2)} Мбит/с`;
+const kilobytesPerSecond = (n: number) =>
+  `${(n / 1024).toFixed(1)} КБ/с`;
 const sites = [
   ["chatgpt", "ChatGPT"],
   ["grok", "Grok"],
@@ -183,7 +183,7 @@ export function DashboardTools({
             <ArrowDown size={14} />
             Скачивание
           </span>
-          <span>До {megabitsPerSecond(maximum)}</span>
+          <span>До {kilobytesPerSecond(maximum)}</span>
         </div>
         <div className="traffic-chart">
           <svg
@@ -228,13 +228,13 @@ export function DashboardTools({
             [
               "Скорость отправки",
               latest && connected && !error
-                ? megabitsPerSecond(latest.up)
+                ? kilobytesPerSecond(latest.up)
                 : "—",
             ],
             [
               "Скорость скачивания",
               latest && connected && !error
-                ? megabitsPerSecond(latest.down)
+                ? kilobytesPerSecond(latest.down)
                 : "—",
             ],
             ["Активные соединения", connected && !error ? connections : "—"],
