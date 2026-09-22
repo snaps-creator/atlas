@@ -72,6 +72,9 @@ cache.db-*
 
 # Local release installers; the bundled VPN core remains tracked.
 /Atlas*Setup.exe
+/Atlas*Setup.exe.sig
+/.impeccable/
+incident-history.ndjson
 
 # Keep package-lock.json, Cargo.lock, build configuration, icons,
 # src-tauri/resources and third_party: these are required build inputs.

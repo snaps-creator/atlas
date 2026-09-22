@@ -1,5 +1,16 @@
 //! React to new outbound failures without waiting for scheduled URL tests.
 #[derive(Default)]
+pub struct Cooldown { last: Option<std::time::Instant> }
+impl Cooldown {
+    pub fn allow(&mut self, now: std::time::Instant) -> bool {
+        if self.last.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(30)) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+#[derive(Default)]
 pub struct Trigger { last: Option<String> }
 impl Trigger {
     pub fn observe(&mut self, selected: &str, lines: &[String]) -> bool {
@@ -15,6 +26,14 @@ impl Trigger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_failure_is_immediate_but_failure_storm_is_bounded() {
+        let mut gate = Cooldown::default();
+        let start = std::time::Instant::now();
+        assert!(gate.allow(start));
+        for seconds in 1..30 { assert!(!gate.allow(start + std::time::Duration::from_secs(seconds))); }
+        assert!(gate.allow(start + std::time::Duration::from_secs(30)));
+    }
     #[test]
     fn first_failure_triggers_once_manual_choice_is_preserved() {
         let mut t = Trigger::default();

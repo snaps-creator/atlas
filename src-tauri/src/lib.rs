@@ -25,6 +25,8 @@ mod shutdown;
 mod storage;
 mod subscriptions;
 mod support_report;
+mod support_probes;
+mod incident_history;
 mod windows;
 use model::*;
 use serde_json::{json, Value};
@@ -34,6 +36,7 @@ use tauri_plugin_autostart::ManagerExt;
 struct App {
     revision: u64,
     published: published_state::PublishedState,
+    diagnostic_access: support_report::Access,
     cancellation: cancellation::Cancellation,
     settings: Settings,
     store: storage::Store,
@@ -45,6 +48,7 @@ struct App {
 }
 impl App {
     fn log(&mut self, level: &str, message: &str) {
+        incident_history::record("application_event", json!({"level":level,"message":message}), &[]);
         self.logs
             .push(json!({"time":model::now(),"level":level,"message":message}));
         if self.logs.len() > 1000 {
@@ -53,6 +57,7 @@ impl App {
     }
     fn snapshot(&mut self) -> Value {
         let running = self.core.running();
+        self.diagnostic_access.update(self.revision,&self.settings,self.core.client());
         let mut s = self.settings.clone();
         for group in &mut s.groups {
             for rule in &mut group.rules {
@@ -563,17 +568,24 @@ async fn request(
             Ok(a) => {
                 let mut secrets = Vec::new();
                 support_report::collect_secrets(&serde_json::to_value(&a.settings).map_err(|e| e.to_string())?, &mut secrets);
-                let context = json!({"status":a.status,"mode":a.settings.mode,
+                let context = json!({"capturedAt":model::now(),"revision":a.revision,"status":a.status,"mode":a.settings.mode,
                     "routingMode":a.settings.routing_mode,"tunStack":a.settings.tun_stack,
                     "selected":a.settings.selected,"autoTestIntervalSeconds":a.settings.auto_test_interval_seconds,
                     "error":a.error,"logs":a.logs,
+                    "connectionConfiguration":support_report::configuration_evidence(&a.settings),
                     "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});
                 (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
             }
-            Err(_) => ("Atlas занят: состояние приложения и его журнал недоступны. Снимок Windows собирается независимо.".into(), None, Vec::new()),
+            Err(_) => match app.state::<support_report::Access>().get() {
+                Some(cached) => (json!({"stateRead":"cached: application lock busy","capturedAt":cached.captured_at,
+                    "revision":cached.revision,"connectionConfiguration":cached.configuration,
+                    "publishedState":app.state::<published_state::PublishedState>().get()}).to_string(),Some(cached.client),cached.secrets),
+                None => ("Atlas занят: кэш диагностической сессии недоступен. Снимок Windows собирается независимо.".into(),None,Vec::new()),
+            },
         };
+        let diagnostic_access = app.state::<support_report::Access>().inner().clone();
         return tauri::async_runtime::spawn_blocking(move || {
-            support_report::save(context, client, secrets).map(|saved| json!({"saved":saved}))
+            support_report::save(context, client, secrets, diagnostic_access).map(|saved| json!({"saved":saved}))
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "connections" || action == "proxies" {
@@ -723,6 +735,17 @@ async fn request(
         .await
         .map_err(|e| e.to_string())?;
     }
+    if action == "latency_batch" {
+        let (client, names, revision) = {
+            let a = shared.try_lock().map_err(|_| "Atlas занят, повторите проверку")?;
+            if a.status != "Connected" { return Err("Atlas не подключён".into()); }
+            (a.core.client(), a.settings.servers().iter()
+                .filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(), a.revision)
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            latency::batch(client, &names).map(|results| json!({"revision":revision,"results":results}))
+        }).await.map_err(|e| e.to_string())?;
+    }
     if action == "latency" {
         let name = payload
             .as_ref()
@@ -794,6 +817,9 @@ pub fn run() {
                 }
             }
             let binary = app.path().resource_dir()?.join("resources/mihomo.exe");
+            let history_path = dir.join("incident-history.ndjson");
+            incident_history::load(&history_path);
+            incident_history::record("application_start", json!({"version":env!("CARGO_PKG_VERSION")}), &[]);
             let core = core::Core::new(binary, dir);
             let auto = settings.startup.auto_connect
                 || (settings.startup.restore_connection && settings.was_connected);
@@ -807,11 +833,14 @@ pub fn run() {
             app.manage(ConnectionIntent(intent.clone()));
             let published = published_state::PublishedState::default();
             app.manage(published.clone());
+            let diagnostic_access = support_report::Access::default();
+            app.manage(diagnostic_access.clone());
             let cancellation = cancellation::Cancellation::default();
             app.manage(cancellation.clone());
             let shared = Arc::new(Mutex::new(App {
                 revision: 0,
                 published,
+                diagnostic_access,
                 cancellation,
                 settings,
                 store,
@@ -825,6 +854,36 @@ pub fn run() {
             app.manage(shared.clone());
             let shutdown: ShuttingDown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.manage(shutdown.clone());
+            {
+                let shared = shared.clone();
+                let shutdown = shutdown.clone();
+                std::thread::spawn(move || {
+                    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                        let captured = shared.try_lock().ok().map(|a| {
+                            let mut secrets = Vec::new();
+                            if let Ok(settings) = serde_json::to_value(&a.settings) { support_report::collect_secrets(&settings,&mut secrets); }
+                            (a.status.clone(),a.revision,a.error.clone(),a.settings.selected.clone(),a.core.client(),secrets)
+                        });
+                        if let Some((status,revision,error,selected,client,secrets)) = captured {
+                            let evidence = if status == "Connected" {
+                                support_report::passive_sample(&client)
+                            } else { json!({"skipped":"No connected session"}) };
+                            incident_history::record("passive_sample",json!({"status":status,"revision":revision,
+                                "error":error,"selected":selected,"core":evidence}),&secrets);
+                        } else {
+                            incident_history::record("sample_skipped",json!({"reason":"Application state lock busy"}),&[]);
+                        }
+                        if let Err(e) = incident_history::flush(&history_path) {
+                            incident_history::record("history_write_error",json!({"error":e}),&[]);
+                        }
+                        for _ in 0..15 {
+                            if shutdown.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                    let _ = incident_history::flush(&history_path);
+                });
+            }
             use tauri::menu::{Menu, MenuItem};
             let show = MenuItem::with_id(app, "show", "Открыть Атлас", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Подключить", true, None::<&str>)?;

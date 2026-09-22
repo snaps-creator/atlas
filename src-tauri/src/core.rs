@@ -686,6 +686,19 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    pub fn support_snapshot(&self) -> Result<Value, String> {
+        if let Some(broker) = &self.broker {
+            let job = broker.call("support_snapshot", Value::Null)?;
+            let deadline = Instant::now() + Duration::from_secs(28);
+            loop {
+                if Instant::now() >= deadline { return Err("Privileged snapshot exceeded 28 seconds".into()); }
+                let result = broker.call("delay_result", json!({"id":job["id"]}))?;
+                if result["done"] == true { return Ok(result["value"].clone()); }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+        Err("No privileged service session; WFP evidence unavailable".into())
+    }
     pub fn logs(&self) -> Result<Vec<String>, String> {
         if let Some(b) = &self.broker {
             return serde_json::from_value(b.call("logs", Value::Null)?)

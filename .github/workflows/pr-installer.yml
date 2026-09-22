@@ -1,0 +1,60 @@
+name: Build signed PR installer
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'scripts/**'
+      - 'package*.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'index.html'
+      - '.github/workflows/pr-installer.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    # Never expose signing material to a fork or pull_request_target context.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm test
+      - run: node --test scripts/verify-installer.check.cjs
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - name: Build signed installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Updater signing key is not configured.' }
+          npm run tauri -- build --bundles nsis
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }
+          ./scripts/copy-installer.ps1
+          node scripts/verify-installer.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Updater signature verification failed.' }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: atlas-signed-installer
+          path: |
+            Atlas*Setup.exe
+            Atlas*Setup.exe.sig
+          if-no-files-found: error
+          retention-days: 14

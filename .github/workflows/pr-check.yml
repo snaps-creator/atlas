@@ -10,10 +10,10 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -31,6 +31,19 @@ jobs:
 
       - name: Test frontend
         run: npm test
+
+      - name: Test updater signature verification
+        run: node --test scripts/verify-installer.check.cjs
+
+      - name: Verify checked-in installer when present
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version -replace '^1\.0\.0-beta\.', ''
+          $installer = "Atlas Beta $version Setup.exe"
+          if (Test-Path -LiteralPath $installer) {
+            node scripts/verify-installer.cjs $installer
+            if ($LASTEXITCODE -ne 0) { throw 'Checked-in installer signature is invalid.' }
+          }
 
       - name: Test backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib

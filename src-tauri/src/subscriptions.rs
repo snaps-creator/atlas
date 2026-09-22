@@ -107,6 +107,17 @@ pub fn parse(text: &str) -> Result<Vec<Value>, String> {
                     p["client-fingerprint"] =
                         json!(q.get("fp").cloned().unwrap_or("chrome".into()));
                 }
+                // URI transport parameters apply to ordinary TLS too, not just
+                // Reality. Dropping them changes the ClientHello and ALPN offer.
+                if p["tls"] == true {
+                    if let Some(fp) = q.get("fp").filter(|v| !v.is_empty()) {
+                        p["client-fingerprint"] = json!(fp);
+                    }
+                    if let Some(alpn) = q.get("alpn") {
+                        let protocols: Vec<&str> = alpn.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
+                        if !protocols.is_empty() { p["alpn"] = json!(protocols); }
+                    }
+                }
                 if let Some(net) = q.get("type") {
                     match net.as_str() {
                         "tcp" => {}
@@ -222,5 +233,19 @@ mod tests {
     #[test]
     fn invalid() {
         assert!(parse("invalid").is_err())
+    }
+    #[test]
+    fn tls_uri_preserves_fingerprint_and_alpn_outside_reality() {
+        let nodes = parse("vless://00000000-0000-0000-0000-000000000001@example.com:443?security=tls&type=ws&fp=firefox&alpn=h2%2Chttp%2F1.1&sni=tls.example&host=ws.example&path=%2Fsocket#TLS").unwrap();
+        let node = &nodes[0];
+        assert_eq!(node["client-fingerprint"], "firefox");
+        assert_eq!(node["alpn"], json!(["h2","http/1.1"]));
+        assert_eq!(node["servername"], "tls.example");
+        assert_eq!(node["ws-opts"]["path"], "/socket");
+        assert_eq!(node["ws-opts"]["headers"]["Host"], "ws.example");
+        assert!(node.get("skip-cert-verify").is_none());
+        let plain = parse("vless://id@example.com:443?security=none&fp=firefox&alpn=h2#plain").unwrap();
+        assert!(plain[0].get("client-fingerprint").is_none());
+        assert!(plain[0].get("alpn").is_none());
     }
 }
