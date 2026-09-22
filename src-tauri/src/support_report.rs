@@ -1,5 +1,6 @@
-//! Manual offline support export. Never changes network state or runs a probe.
+//! Incident export: passive evidence first, then explicitly requested bounded probes.
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     io::Read,
     os::windows::process::CommandExt,
@@ -9,6 +10,119 @@ use std::{
 };
 
 const LIMIT: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct Capture {
+    pub revision: u64,
+    pub captured_at: u64,
+    pub client: crate::core::ApiClient,
+    pub secrets: Vec<String>,
+    pub configuration: Value,
+}
+#[derive(Clone, Default)]
+pub(crate) struct Access(std::sync::Arc<std::sync::RwLock<Option<Capture>>>);
+impl Access {
+    pub fn update(&self, revision: u64, settings: &crate::model::Settings, client: crate::core::ApiClient) {
+        let Ok(mut cached) = self.0.try_write() else { return; };
+        if let Some(cached) = cached.as_mut().filter(|v|v.revision == revision) {
+            cached.client = client;
+            cached.captured_at = crate::model::now();
+            return;
+        }
+        let mut secrets = Vec::new();
+        if let Ok(value) = serde_json::to_value(settings) { collect_secrets(&value,&mut secrets); }
+        *cached = Some(Capture {revision,captured_at:crate::model::now(),client,secrets,configuration:configuration_evidence(settings)});
+    }
+    pub fn get(&self) -> Option<Capture> { self.0.try_read().ok().and_then(|v|v.clone()) }
+}
+
+pub(crate) fn privileged_snapshot() -> Result<String, String> {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUSY.swap(true,std::sync::atomic::Ordering::SeqCst) { return Err("Privileged collector already running".into()); }
+    struct Release;
+    impl Drop for Release { fn drop(&mut self) { BUSY.store(false,std::sync::atomic::Ordering::SeqCst); } }
+    let _release = Release;
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_privileged.ps1")]);
+    run_bounded(command, Duration::from_secs(24))
+}
+pub(crate) fn passive_sample(client: &crate::core::ApiClient) -> Value {
+    let started = crate::model::now();
+    let proxies = client.api("GET","/proxies",None).map(|v| {
+        let nodes: Vec<Value> = v["proxies"].as_object().into_iter().flat_map(|v|v.iter()).map(|(name,node)| {
+            serde_json::json!({"name":name,"now":node.get("now"),"alive":node.get("alive"),
+                "last":node["history"].as_array().and_then(|h|h.last())})
+        }).collect();
+        serde_json::json!({"nodes":nodes})
+    }).unwrap_or_else(|e|serde_json::json!({"error":e}));
+    let logs = client.logs().map(|lines| lines.into_iter().rev().take(32).collect::<Vec<_>>())
+        .map(|lines|serde_json::json!({"evidence":failure_evidence(&lines),"lines":lines}))
+        .unwrap_or_else(|e|serde_json::json!({"error":e}));
+    serde_json::json!({"startedAt":started,"completedAt":crate::model::now(),"proxies":proxies,"logs":logs})
+}
+fn core_snapshot(client: Option<&crate::core::ApiClient>) -> Value {
+    let Some(c) = client else { return serde_json::json!({"error":"No captured core session"}); };
+    let started = crate::model::now();
+    let version = c.api("GET","/version",None).unwrap_or_else(|e|serde_json::json!({"error":e}));
+    let proxies = c.api("GET","/proxies",None).map(|v|proxy_evidence(&v))
+        .unwrap_or_else(|e|serde_json::json!({"error":e}));
+    let logs = c.logs().map(|lines|serde_json::json!({"evidence":failure_evidence(&lines),"lines":lines}))
+        .unwrap_or_else(|e|serde_json::json!({"error":e}));
+    serde_json::json!({"startedAt":started,"completedAt":crate::model::now(),"version":version,"proxies":proxies,"logs":logs})
+}
+
+fn conclusions(parts: &serde_json::Map<String, Value>) -> Vec<Value> {
+    let mut results = Vec::new();
+    let active = parts.get("active").unwrap_or(&Value::Null);
+    if let Some(http) = active["http"].as_array() {
+        for proxy in http.iter().filter(|r|r["path"]=="local_mixed_proxy" && r["controlSucceeded"]==true) {
+            if http.iter().any(|r|r["path"]=="windows_default_path" && r["endpoint"]==proxy["endpoint"] && r["controlSucceeded"]==false) {
+                results.push(serde_json::json!({"code":"PATHS_DIFFER","confirmed":"Контрольный запрос успешен через локальный прокси, но не обычным путём Windows",
+                    "scope":"Проверить TUN, DNS, WFP и различие правил; это не доказательство конкретного фильтра"}));
+            }
+        }
+    }
+    let successes = active["nodeTests"]["results"].as_array().into_iter().flatten().filter(|node| {
+        node["checks"].as_array().into_iter().flatten().any(|c|c["result"]["delay"].as_u64().is_some())
+    }).count();
+    if successes > 0 { results.push(serde_json::json!({"code":"VPN_PATH_WORKS","confirmed":"Есть успешный запрос через VPN-узел на этом ПК","nodes":successes})); }
+    if parts.get("before").is_some_and(|v|v["version"].get("error").is_some()) {
+        results.push(serde_json::json!({"code":"LOCAL_CONTROL_ERROR","confirmed":"Запрос к локальному ядру завершился ошибкой",
+            "scope":"Ошибка контроллера/IPC не является доказательством отказа VPN-серверов"}));
+    }
+    results.push(serde_json::json!({"code":"EVIDENCE_SCOPE","rule":"Таймаут не доказывает отказ удалённого сервера. Для различения silent drop по пути и отказа сервера нужны события блокировки или независимые данные другой стороны. Наличие фильтра не означает, что именно он заблокировал пакет."}));
+    results
+}
+
+pub(crate) fn failure_evidence(lines: &[String]) -> Value {
+    let tcp_dial = lines.iter().filter(|s| s.contains("dial tcp ") && s.contains("error:")).count();
+    let established_read = lines.iter().filter(|s| s.contains("read tcp ") && s.contains("error:")).count();
+    let ambiguous_connect = lines.iter().filter(|s| s.contains("connect error:") &&
+        !s.contains("dial tcp ") && !s.contains("read tcp ")).count();
+    serde_json::json!({"tcpDialErrors":tcp_dial,"establishedSocketReadErrors":established_read,
+        "unspecifiedConnectOrHandshakeErrors":ambiguous_connect,
+        "scope":"Bounded core log window; not independent probes and not proof of provider outage",
+        "interpretation":"Mihomo connect error includes TCP and TLS/VLESS handshake. A read tcp error means a socket had been established."})
+}
+
+pub(crate) fn configuration_evidence(settings: &crate::model::Settings) -> Value {
+    let subscriptions: Vec<Value> = settings.subscriptions.iter().map(|sub| {
+        let nodes: Vec<Value> = sub.servers.iter().map(|node| {
+            let mut safe = serde_json::Map::new();
+            let mut identity = node.clone();
+            if let Some(fields) = identity.as_object_mut() { fields.remove("name"); fields.remove("country"); }
+            safe.insert("configurationId".into(),Value::String(format!("{:x}",Sha256::digest(identity.to_string().as_bytes()))));
+            for field in ["name", "type", "server", "port", "network", "tls", "flow",
+                "client-fingerprint", "servername", "sni", "alpn", "packet-encoding", "interface-name", "dialer-proxy", "ip-version"] {
+                if let Some(value) = node.get(field) { safe.insert(field.into(), value.clone()); }
+            }
+            Value::Object(safe)
+        }).collect();
+        serde_json::json!({"name":sub.name,"updatedAt":sub.updated_at,"nodes":nodes})
+    }).collect();
+    serde_json::json!({"subscriptions":subscriptions,
+        "meaning":"Endpoints and transport settings, not credentials. Matching names do not imply matching endpoints."})
+}
 
 pub(crate) fn collect_secrets(value: &Value, result: &mut Vec<String>) {
     match value {
@@ -136,8 +250,14 @@ fn collect_child(mut child: std::process::Child, timeout: Duration) -> Result<St
 pub(crate) fn save(
     context: String,
     client: Option<crate::core::ApiClient>,
-    secrets: Vec<String>,
+    mut secrets: Vec<String>,
+    access: Access,
 ) -> Result<bool, String> {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUSY.swap(true,std::sync::atomic::Ordering::SeqCst) { return Err("Отчёт уже собирается".into()); }
+    struct Release;
+    impl Drop for Release { fn drop(&mut self) { BUSY.store(false,std::sync::atomic::Ordering::SeqCst); } }
+    let _release = Release;
     let path = rfd::FileDialog::new()
         .set_title("Сохранить диагностику Atlas")
         .set_file_name(format!("atlas-diagnostics-{}.txt", crate::model::now()))
@@ -146,31 +266,50 @@ pub(crate) fn save(
     let Some(path) = path else {
         return Ok(false);
     };
-    let mut command = Command::new("powershell.exe");
-    command.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        include_str!("support_snapshot.ps1"),
-    ]);
-    let os = run_bounded(command, Duration::from_secs(25))
-        .unwrap_or_else(|e| format!("Windows snapshot unavailable: {e}"));
-    let selection = client.as_ref().map(|c| {
-        c.api("GET", "/proxies", None).map(|value| proxy_evidence(&value).to_string())
-    }).unwrap_or_else(|| Err("Atlas занят: выбор ядра недоступен".into()))
-        .unwrap_or_else(|e| format!("Proxy selection unavailable: {e}"));
-    let logs = client
-        .map(|c| c.logs().map(|lines| lines.join("\n")))
-        .unwrap_or_else(|| Err("Atlas занят: журнал ядра недоступен".into()))
-        .unwrap_or_else(|e| format!("Core logs unavailable: {e}"));
+    let started = crate::model::now();
+    let history = crate::incident_history::snapshot();
+    let deadline = Instant::now() + Duration::from_secs(85);
+    let (tx, rx) = mpsc::channel();
+    let os_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_snapshot.ps1")]);
+        let result = run_bounded(command,Duration::from_secs(25));
+        let _ = os_tx.send(("windows",serde_json::json!({"text":result.unwrap_or_else(|e|format!("Windows snapshot unavailable: {e}"))})));
+    });
+    let privileged_tx = tx.clone();
+    let privileged_client = client.clone();
+    std::thread::spawn(move || {
+        let result = privileged_client.map(|c|c.support_snapshot()).unwrap_or_else(||Err("No service client captured".into()));
+        let _ = privileged_tx.send(("privileged",result.unwrap_or_else(|e|serde_json::json!({"error":e}))));
+    });
+    std::thread::spawn(move || {
+        let _ = tx.send(("before",core_snapshot(client.as_ref())));
+        if Instant::now() < deadline { let _ = tx.send(("active",crate::support_probes::run(client.clone(),deadline))); }
+        if Instant::now() < deadline { let _ = tx.send(("after",core_snapshot(client.as_ref()))); }
+    });
+    let mut parts = serde_json::Map::new();
+    while parts.len() < 5 {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((name,value)) => { parts.insert(name.into(),value); }
+            Err(_) => break,
+        }
+    }
+    let missing: Vec<_> = ["windows","privileged","before","active","after"].into_iter().filter(|k|!parts.contains_key(*k)).collect();
+    let final_context = access.get().map(|cached| {
+        secrets.extend(cached.secrets);
+        serde_json::json!({"capturedAt":cached.captured_at,"revision":cached.revision,"configuration":cached.configuration})
+    }).unwrap_or_else(||serde_json::json!({"error":"No final cached context"}));
+    let analysis = conclusions(&parts);
+    let evidence = serde_json::to_string_pretty(&parts).map_err(|e|e.to_string())?;
     let text = format!(
-        "Atlas diagnostic report\nVersion: {}\nTimestamp (Unix UTC): {}\n\
-        Read-only snapshot. Local IP addresses and adapter names are included.\n\
-        No automatic network repair or internet probes were performed.\n\n\
-        === Atlas state and logs ===\n{context}\n\n=== Proxy selection and health history ===\n{selection}\n\n=== Core logs ===\n{logs}\n\n{os}\n",
+        "Atlas incident report / schema 2\nVersion: {}\nStarted (Unix UTC): {started}\nCompleted: {}\n\
+        Limited active probes requested by export. Selectors, routes, DNS settings and WFP policy were not changed.\n\
+        Probe histories can change during URL tests and automatic recovery can still run. Samples are timestamped, not atomic.\n\
+        Missing sections: {missing:?}\n\n=== Confirmed observations and interpretation ===\n{}\n\n\
+        === Atlas state at request ===\n{context}\n\n=== Last cached configuration at completion (compare revisions) ===\n{final_context}\n\n=== History before export ===\n{history}\n\n=== Incident evidence ===\n{evidence}\n",
         env!("CARGO_PKG_VERSION"),
-        crate::model::now()
+        crate::model::now(),serde_json::to_string_pretty(&analysis).map_err(|e|e.to_string())?
     );
     std::fs::write(path, format!("\u{feff}{}", redact(&text, &secrets)))
         .map_err(|e| format!("Не удалось сохранить отчёт: {e}"))?;
@@ -183,8 +322,18 @@ fn proxy_evidence(value: &Value) -> Value {
     if let Some(proxies) = value["proxies"].as_object() {
         for (name, node) in proxies {
             let mut safe = serde_json::Map::new();
-            for field in ["type", "now", "all", "alive", "history", "udp"] {
+            for field in ["type", "now", "all", "alive", "history", "udp", "testUrl", "interface", "dialer-proxy"] {
                 if let Some(v) = node.get(field) { safe.insert(field.into(), v.clone()); }
+            }
+            if let Some(url) = node.get("testUrl").and_then(Value::as_str) {
+                safe.insert("testUrlId".into(), Value::String(format!("{:x}", Sha256::digest(url.as_bytes()))));
+            }
+            if let Some(extra) = node.get("extra").and_then(Value::as_object) {
+                let histories: Vec<Value> = extra.iter().map(|(url, state)| {
+                    serde_json::json!({"testUrl":url,"testUrlId":format!("{:x}",Sha256::digest(url.as_bytes())),
+                        "alive":state.get("alive"),"history":state.get("history")})
+                }).collect();
+                safe.insert("perUrlHealth".into(), Value::Array(histories));
             }
             nodes.insert(name.clone(), Value::Object(safe));
         }
@@ -196,15 +345,57 @@ fn proxy_evidence(value: &Value) -> Value {
 mod tests {
     use super::*;
     #[test]
+    fn report_conclusions_do_not_turn_timeouts_or_http_errors_into_provider_outage() {
+        let parts = serde_json::json!({"active":{"http":[
+            {"path":"local_mixed_proxy","endpoint":"https://test","httpResponded":true,"controlSucceeded":false,"status":502},
+            {"path":"windows_default_path","endpoint":"https://test","httpResponded":false,"controlSucceeded":false}],
+            "nodeTests":{"results":[{"checks":[{"result":{"error":"Mihomo API: HTTP 504"}}]}]}}});
+        let result = conclusions(parts.as_object().unwrap());
+        assert_eq!(result.len(),1); // Only scope, no invented diagnosis.
+        assert_eq!(result[0]["code"],"EVIDENCE_SCOPE");
+        let mut parts = parts;
+        parts["active"]["http"][0]["controlSucceeded"] = Value::Bool(true);
+        parts["active"]["nodeTests"]["results"][0]["checks"][0]["result"] = serde_json::json!({"delay":0});
+        let result = conclusions(parts.as_object().unwrap());
+        assert!(result.iter().any(|v|v["code"]=="PATHS_DIFFER"));
+        assert!(result.iter().any(|v|v["code"]=="VPN_PATH_WORKS"));
+    }
+    #[test]
+    fn connect_wrapper_is_not_misreported_as_a_tcp_dial_failure() {
+        let evidence = failure_evidence(&[
+            "error: host connect error: context deadline exceeded".into(),
+            "error: host connect error: read tcp 192.0.2.1:5->192.0.2.2:443: timeout".into(),
+            "error: host connect error: dial tcp 192.0.2.2:443: i/o timeout".into(),
+        ]);
+        assert_eq!(evidence["tcpDialErrors"], 1);
+        assert_eq!(evidence["establishedSocketReadErrors"], 1);
+        assert_eq!(evidence["unspecifiedConnectOrHandshakeErrors"], 1);
+    }
+    #[test]
+    fn endpoint_comparison_omits_credentials_and_subscription_urls() {
+        let mut s = crate::model::Settings::default();
+        s.subscriptions.push(crate::model::Subscription { id:"id".into(), name:"office".into(),
+            masked_url:"https://private-subscription".into(), updated_at:123, error:None,
+            servers:vec![serde_json::json!({"name":"node","type":"vless","server":"192.0.2.1","port":443,
+                "uuid":"private-uuid","password":"private-pass","reality-opts":{"public-key":"private-key"}})] });
+        let evidence = configuration_evidence(&s).to_string();
+        assert!(evidence.contains("192.0.2.1"));
+        assert!(evidence.contains("123"));
+        assert!(!evidence.contains("private-"));
+    }
+    #[test]
     fn proxy_report_preserves_auto_choice_without_node_secrets() {
         let result = proxy_evidence(&serde_json::json!({"proxies":{
             "ATLAS":{"now":"AUTO", "secret":"hidden"},
-            "AUTO":{"now":"node-b","all":["node-a","node-b"]},
-            "node-b":{"alive":true,"history":[{"delay":42}],"password":"hidden"}
+            "AUTO":{"now":"node-b","all":["node-a","node-b"],"testUrl":"https://control.test"},
+            "node-b":{"alive":true,"history":[{"delay":42}],"password":"hidden",
+                "extra":{"https://control.test":{"alive":false,"history":[{"delay":0}],"password":"hidden"}}}
         }}));
         assert_eq!(result["ATLAS"]["now"], "AUTO");
         assert_eq!(result["AUTO"]["now"], "node-b");
         assert_eq!(result["node-b"]["history"][0]["delay"], 42);
+        assert_eq!(result["node-b"]["perUrlHealth"][0]["alive"], false);
+        assert_eq!(result["AUTO"]["testUrlId"], result["node-b"]["perUrlHealth"][0]["testUrlId"]);
         assert!(!result.to_string().contains("hidden"));
     }
     #[test]
@@ -296,8 +487,17 @@ function Get-CimInstance { param($ClassName,$Filter)
  else { [pscustomobject]@{Description='fixture'; DHCPEnabled=$true; DHCPServer='192.168.1.1'; DHCPLeaseObtained='2026-09-22T01:00:00'; DHCPLeaseExpires='2026-09-23T01:00:00'} }
 }
 function Get-NetAdapter { param([switch]$IncludeHidden) [pscustomobject]@{Name='fixture';Status='Up'} }
+function Get-NetAdapterStatistics { [pscustomobject]@{Name='fixture';ReceivedPacketErrors=0} }
+function Get-NetNeighbor { [pscustomobject]@{InterfaceIndex=4;IPAddress='192.168.1.1';State='Reachable'} }
+function Get-NetConnectionProfile { [pscustomobject]@{InterfaceAlias='fixture';IPv4Connectivity='Internet'} }
+function Get-Process { [pscustomobject]@{ProcessName='atlas-vpn';Id=123;CPU=0;Threads=@()} }
 function Get-DnsClientServerAddress { [pscustomobject]@{InterfaceAlias='fixture';ServerAddresses=@('192.168.1.1')} }
 function Get-NetRoute { throw 'fixture route unavailable' }
+function Get-NetTCPConnection { param($State) [pscustomobject]@{OwningProcess=456;LocalAddress='192.168.1.2';LocalPort=53;RemoteAddress='192.0.2.1';State='SynSent'} }
+function Get-NetUDPEndpoint { [pscustomobject]@{OwningProcess=456;LocalAddress='::';LocalPort=53} }
+function Get-ItemProperty { param($Path) [pscustomobject]@{ProxyEnable=0;ProxyServer='127.0.0.1:7897'} }
+function w32tm.exe { 'fixture time synchronization' }
+function Find-NetRoute { param($RemoteIPAddress) [pscustomobject]@{InterfaceIndex=4;NextHop='192.168.1.1'} }
 function Get-NetIPInterface { [pscustomobject]@{InterfaceAlias='fixture';Dhcp='Enabled'} }
 function Get-WinEvent { param($FilterHashtable,$MaxEvents) [pscustomobject]@{Id=1001;Message='fixture DHCP event'} }
 "#;

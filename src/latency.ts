@@ -3,7 +3,29 @@ export type Latency = {
   delay: number | null;
   attempts: number;
   error?: string | null;
+  measuredAt?: number;
 };
+
+export type ProxyHealth = { alive?: boolean; history?: {time:string; delay:number}[]; extra?: Record<string, {alive?:boolean;history?:{time:string;delay:number}[]}> };
+export function historyLatency(proxy?: ProxyHealth, testUrl?: string): Latency | undefined {
+  // AUTO chooses using the history of its own URL. A successful test against
+  // another URL must not conceal a failed AUTO check.
+  if (testUrl && proxy?.extra?.[testUrl]) proxy = proxy.extra[testUrl];
+  const last = proxy?.history?.at(-1);
+  const measuredAt = last ? Date.parse(last.time) : NaN;
+  if (!last || !Number.isFinite(measuredAt) || !Number.isFinite(last.delay)) return;
+  if (proxy?.alive === false) return {status:"unreachable",delay:null,attempts:1,measuredAt};
+  if (proxy?.alive === true && last.delay >= 0) return {status:"ok",delay:last.delay,attempts:1,measuredAt};
+}
+
+export async function boundedBatch<T>(request: Promise<T>, timeoutMs = 18000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([request, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Atlas не завершил групповую проверку за 18 секунд")), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 // Results and queued batch work belong to one connection/configuration epoch.
 export class LatencyEpoch {

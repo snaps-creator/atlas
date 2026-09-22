@@ -1,0 +1,21 @@
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const {verifySignature} = require('./verify-installer.cjs');
+test('verify exact installer bytes, key and trusted comment; reject tampering',()=>{
+  const {privateKey,publicKey}=crypto.generateKeyPairSync('ed25519');
+  const id=crypto.randomBytes(8),data=Buffer.from('fixture installer');
+  const key=Buffer.concat([Buffer.from('Ed'),id,publicKey.export({format:'der',type:'spki'}).subarray(-32)]);
+  const encodedKey=Buffer.from('untrusted comment: fixture\n'+key.toString('base64')+'\n').toString('base64');
+  const signature=crypto.sign(null,crypto.createHash('blake2b512').update(data).digest(),privateKey);
+  const packet=Buffer.concat([Buffer.from('ED'),id,signature]);
+  const comment='timestamp:1\tfile:fixture.exe\thashed';
+  const global=crypto.sign(null,Buffer.concat([signature,Buffer.from(comment)]),privateKey);
+  const text=`untrusted comment: fixture\n${packet.toString('base64')}\ntrusted comment: ${comment}\n${global.toString('base64')}\n`;
+  const encoded=Buffer.from(text).toString('base64');
+  assert.equal(verifySignature(data,encoded,encodedKey).bytes,data.length);
+  assert.throws(()=>verifySignature(Buffer.from('modified installer'),encoded,encodedKey));
+  assert.throws(()=>verifySignature(data,Buffer.from(text.replace('timestamp:1','timestamp:2')).toString('base64'),encodedKey));
+  key[2]^=1;
+  assert.throws(()=>verifySignature(data,encoded,Buffer.from('comment\n'+key.toString('base64')).toString('base64')));
+});

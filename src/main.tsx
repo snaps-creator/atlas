@@ -48,7 +48,7 @@ import { ActiveServer } from "./ActiveServer";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { boundedLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+import { boundedLatency, boundedBatch, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel, connectionProtection, afterConnectionReady } from "./protection";
@@ -381,6 +381,55 @@ function App() {
     if (latencyEpoch.current.update(latencyContext)) setLatencies({});
     return () => { latencyEpoch.current.update("unmounted"); };
   }, [latencyContext]);
+  useEffect(() => {
+    if (!data?.running || page !== "Servers") return;
+    let alive = true, pending = false;
+    const read = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const result = await request<{proxies:Record<string, Parameters<typeof historyLatency>[0]>}>("proxies");
+        if (!alive) return;
+        setLatencies(previous => {
+          const next = {...previous};
+          for (const node of servers) {
+            const value = historyLatency(result.proxies[node.name]);
+            const old = previous[node.name];
+            if (value && old?.status !== "testing" && (!old ||
+                (old.measuredAt !== undefined && value.measuredAt! > old.measuredAt))) next[node.name] = value;
+          }
+          return next;
+        });
+      } catch { /* Keep existing measurements; a controller error is not a server timeout. */ }
+      finally { pending = false; }
+    };
+    void read();
+    const timer = setInterval(() => { void read(); }, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [latencyContext, page]);
+  async function testAll() {
+    const entries = servers.map(n => ({name:n.name, token:latencyEpoch.current.begin(latencyContext, n.name)}))
+      .filter(entry => entry.token !== undefined);
+    if (!entries.length) return;
+    setTestingAll(true);
+    setLatencies(previous => ({...previous, ...Object.fromEntries(entries.map(({name}) =>
+      [name, {status:"testing" as const, delay:null, attempts:0}]))}));
+    let results: Record<string, Latency> = {};
+    try {
+      const response = await boundedBatch(request<{revision:number; results:Record<string, Latency>}>("latency_batch"));
+      if (response.revision !== data?.revision) throw new Error("Конфигурация изменилась во время проверки");
+      results = Object.fromEntries(Object.entries(response.results).map(([name,result]) => [name,{...result,measuredAt:Date.now()}]));
+    } catch (error) {
+      results = Object.fromEntries(entries.map(({name}) => [name,
+        {status:"error",delay:null,attempts:0,error:String(error)}]));
+    } finally {
+      const current = entries.filter(({name,token}) => latencyEpoch.current.current(name, token!));
+      setLatencies(previous => ({...previous, ...Object.fromEntries(current.map(({name}) => [name,
+        results[name] ?? {status:"error",delay:null,attempts:0,error:"Нет результата ядра"}]))}));
+      for (const {name,token} of entries) latencyEpoch.current.finish(name,token!);
+      setTestingAll(false);
+    }
+  }
   async function test(name: string) {
     const token = latencyEpoch.current.begin(latencyContext, name);
     if (!token) return;
@@ -390,7 +439,7 @@ function App() {
     }));
     try {
       const r = await boundedLatency(request<Latency>("latency", { name }));
-      if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({ ...l, [name]: r }));
+      if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({ ...l, [name]: {...r,measuredAt:Date.now()} }));
     } catch (e) {
       if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({
         ...l,
@@ -778,7 +827,7 @@ function App() {
                         run(async () => {
                           setTestingAll(true);
                           try {
-                            await testPool(servers, (n) => test(n.name));
+                            await testAll();
                           } finally {
                             setTestingAll(false);
                           }
@@ -1128,7 +1177,7 @@ function App() {
                     <h2>Отчёт для разбора сбоя</h2>
                     <p className={poolHealth.phase === "all_timeout" || poolHealth.phase === "local_error" ? "pool-error" : ""} role="status">{poolHealth.text}</p>
                     <button disabled={!connected || poolHealth.phase === "checking" || poolHealth.phase === "refreshing"} onClick={checkPool}>Проверить все подписки и восстановить</button>
-                    <p>Журналы Atlas, состояние службы и ядра, маршруты, DNS и DHCP-аренда этого компьютера. Работает без интернета. Сохраните отчёт до перезагрузки.</p>
+                    <p>История до сбоя, журналы ядра, маршруты, DNS, DHCP и фильтры Windows. При сохранении выполняются короткие сетевые проверки через разные пути и выборку VPN-узлов. Сохраните отчёт во время сбоя, до перезагрузки.</p>
                     <p className="footnote">Ключи и ссылки подписок скрываются. Локальные IP-адреса и названия адаптеров остаются в отчёте.</p>
                     <button disabled={reportBusy} onClick={async () => {
                       setReportBusy(true);
@@ -1144,7 +1193,7 @@ function App() {
                     }}>
                       {reportBusy ? "Собираем отчёт…" : "Скачать отчёт TXT"}
                     </button>
-                    <p role="status">{reportSaved ? "Отчёт сохранён." : reportBusy ? "Выберите файл для сохранения. Сбор данных может занять до минуты." : ""}</p>
+                    <p role="status">{reportSaved ? "Отчёт сохранён." : reportBusy ? "Выберите файл для сохранения. Сбор данных — до 90 секунд; недоступные проверки будут отмечены в TXT." : ""}</p>
                   </section>
                   {checks.length ? (
                     <div className="list">

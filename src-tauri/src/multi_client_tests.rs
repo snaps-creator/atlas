@@ -26,6 +26,71 @@ fn isolated_core() -> Core {
 }
 
 #[test]
+fn batch_62_nodes_finishes_with_three_successes_and_59_timeouts() { check_batch_62(3); }
+#[test]
+fn batch_62_nodes_all_timeout_finishes() { check_batch_62(0); }
+fn check_batch_62(healthy: usize) {
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let origin_port = origin.local_addr().unwrap().port();
+    let blackhole = TcpListener::bind("127.0.0.1:0").unwrap();
+    blackhole.set_nonblocking(true).unwrap();
+    let blackhole_port = blackhole.local_addr().unwrap().port();
+    let done = Arc::new(AtomicBool::new(false));
+    let worker_done = done.clone();
+    let worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut held = Vec::new();
+        while !worker_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            if let Ok((stream, _)) = blackhole.accept() { held.push(stream); }
+            if let Ok((mut stream, _)) = origin.accept() {
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let mut bytes = [0; 4096];
+                let _ = stream.read(&mut bytes);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        held.len()
+    });
+    let mut core = isolated_core();
+    let names: Vec<String> = (0..62).map(|i| format!("node-{i}")).collect();
+    let nodes: Vec<Value> = names.iter().enumerate().map(|(i, name)| {
+        if i < healthy { json!({"name":name,"type":"direct"}) }
+        else { json!({"name":name,"type":"socks5","server":"127.0.0.1","port":blackhole_port}) }
+    }).collect();
+    let config = json!({"external-controller":format!("127.0.0.1:{}",core.ports[1]),
+        "secret":core.secret,"proxies":nodes,"rules":["MATCH,DIRECT"],
+        "proxy-groups":[{"name":"AUTO","type":"url-test","proxies":names,
+        "url":format!("http://127.0.0.1:{origin_port}/"),"interval":0,"lazy":true}]});
+    let path = core.directory.join("batch.yaml");
+    std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let child = core.command().arg("-d").arg(&core.directory).arg("-f").arg(path).spawn().unwrap();
+    core.job = Some(crate::job::Job::attach(&child).unwrap());
+    core.child = Some(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while core.api("GET", "/version", None).is_err() {
+        assert!(Instant::now() < deadline, "batch fixture readiness");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let started = Instant::now();
+    let result = crate::latency::batch_at(core.client(), &names, &format!("http://127.0.0.1:{origin_port}/")).unwrap();
+    let elapsed = started.elapsed();
+    done.store(true, Ordering::SeqCst);
+    let accepted = worker.join().unwrap();
+    core.stop().unwrap();
+    let directory = core.directory.clone(); drop(core);
+    std::fs::remove_dir_all(directory).unwrap();
+    assert!(elapsed < Duration::from_secs(10), "62 nodes took {elapsed:?}");
+    assert!(accepted >= 62 - healthy, "all stalled nodes must actually be contacted: {accepted}");
+    assert_eq!(result.as_object().unwrap().len(), 62);
+    assert_eq!(result.as_object().unwrap().values().filter(|r| r["status"] == "ok").count(), healthy);
+    assert_eq!(result.as_object().unwrap().values().filter(|r| r["status"] == "unreachable").count(), 62 - healthy);
+    eprintln!("62 nodes, {healthy} healthy endpoints: {elapsed:?}");
+}
+
+#[test]
 fn direct_dns_survives_a_dead_vpn_with_real_core() {
     // Exercise the generated TUN DNS policy with TUN disabled in this fixture.
     // Both DNS and the HTTP origin are loopback-only; the VPN port is closed.
@@ -63,10 +128,21 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok((mut stream, _)) = origin.accept() {
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut data = [0; 4096];
-                let _ = stream.read(&mut data);
+                // TCP reads are not HTTP message boundaries. Closing after the
+                // first fragment can reset unread headers and fabricate a 502.
+                let mut headers = Vec::new();
+                while !headers.windows(4).any(|v| v == b"\r\n\r\n") {
+                    assert!(headers.len() < 16384, "fixture header limit");
+                    let size = stream.read(&mut data).unwrap();
+                    assert!(size > 0, "fixture peer closed before HTTP headers");
+                    headers.extend_from_slice(&data[..size]);
+                }
                 stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                while stream.read(&mut data).is_ok_and(|size| size > 0) {}
                 return;
             }
             assert!(Instant::now() < deadline, "DIRECT never reached origin");
@@ -101,7 +177,9 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
     doc["proxy-groups"][0]["proxies"] = json!(["dead-vpn"]);
     let path = core.directory.join("dns-fixture.yaml");
     std::fs::write(&path, serde_yaml::to_string(&doc).unwrap()).unwrap();
-    let child = core.command().arg("-d").arg(&core.directory).arg("-f").arg(path).spawn().unwrap();
+    let log_path = core.directory.join("fixture.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let child = core.command().stdout(log.try_clone().unwrap()).stderr(log).arg("-d").arg(&core.directory).arg("-f").arg(path).spawn().unwrap();
     core.job = Some(crate::job::Job::attach(&child).unwrap());
     core.child = Some(child);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -113,7 +191,7 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
         .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{}", core.ports[0])).unwrap())
         .timeout(Duration::from_secs(5)).build().unwrap();
     let response = http.get(format!("http://direct-fixture.invalid:{origin_port}/")).send().unwrap();
-    assert_eq!(response.status(), 200, "DIRECT must not use the failed VPN for DNS");
+    assert_eq!(response.status(), 200, "DIRECT must not use the failed VPN for DNS: {}", std::fs::read_to_string(&log_path).unwrap_or_default());
     assert_eq!(response.text().unwrap(), "ok");
     dns_done.store(true, Ordering::SeqCst);
     responder.join().unwrap();
@@ -214,6 +292,9 @@ fn independent_clients_share_vless_server_and_recover_after_its_restart() {
                 // One slow peer's half-close must not hold up the other clients.
                 // This origin receives concurrent traffic through eight proxies.
                 connections.push(thread::spawn(move || {
+                    // Windows accept inherits the listener's nonblocking mode.
+                    // A read timeout alone does not turn WSAEWOULDBLOCK into a wait.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();

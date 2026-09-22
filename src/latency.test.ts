@@ -1,5 +1,25 @@
 import { expect, test, vi } from "vitest";
-import { boundedLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+import { boundedLatency, boundedBatch, historyLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+
+test("карточка использует историю ядра, отсутствие истории не становится таймаутом", () => {
+  expect(historyLatency({alive:false,history:[]})).toBeUndefined();
+  expect(historyLatency({alive:true,history:[{time:"2026-09-22T12:00:00Z",delay:42}]})).toMatchObject({status:"ok",delay:42});
+  expect(historyLatency({alive:false,history:[{time:"2026-09-22T12:00:00Z",delay:0}]})).toMatchObject({status:"unreachable",delay:null});
+});
+
+test("групповая проверка не зависает при потере IPC и не принимает поздний ответ", async () => {
+  vi.useFakeTimers();
+  try {
+    let finish!: (v: number) => void;
+    const request = new Promise<number>(resolve => { finish = resolve; });
+    const result = boundedBatch(request).catch(error => String(error));
+    await vi.advanceTimersByTimeAsync(18000);
+    expect(await result).toContain("18 секунд");
+    finish(42);
+    expect(await result).toContain("18 секунд");
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
 
 test("ответ старой сессии и её очередь не затрагивают новую проверку", () => {
   const epoch = new LatencyEpoch();

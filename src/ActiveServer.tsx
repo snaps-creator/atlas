@@ -1,9 +1,19 @@
 import { useEffect, useState } from "react";
 import { request } from "./api";
-import type { Latency } from "./latency";
+import { historyLatency, type Latency, type ProxyHealth } from "./latency";
 import type { PoolHealth } from "./usePoolRecovery";
 
-type Proxies = Record<string, { now?: string }>;
+type Proxies = Record<string, ProxyHealth & { now?: string; testUrl?:string }>;
+export function selectedLatency(proxies: Proxies): Latency | undefined {
+  const server = resolveServer(proxies);
+  if (!server) return;
+  let name = "ATLAS", testUrl: string | undefined;
+  while (proxies[name]?.now) {
+    testUrl = proxies[name].testUrl ?? testUrl;
+    name = proxies[name].now!;
+  }
+  return historyLatency(proxies[server], testUrl);
+}
 export function resolveServer(proxies: Proxies): string | null {
   let name = "ATLAS";
   const visited = new Set<string>();
@@ -24,34 +34,27 @@ export function ActiveServer({
   onChange?: (name: string | null) => void;
   poolHealth?: PoolHealth;
 }) {
-  const [value, setValue] = useState<{ name: string; delay: number | null } | null>(null);
+  const [value, setValue] = useState<{ name: string; delay: number | null; status?:Latency["status"] } | null>(null);
+  const [controlError, setControlError] = useState(false);
   useEffect(() => {
     setValue(null);
+    setControlError(false);
     onChange?.(null);
     if (!connected) return;
-    let alive = true, pending = false, measured = "", measuredAt = 0;
+    let alive = true, pending = false;
     const poll = async () => {
       if (pending) return;
       pending = true;
       try {
         const response = await request<{ proxies: Proxies }>("proxies");
         if (!alive) return;
+        setControlError(false);
         const name = resolveServer(response.proxies);
         if (!name) { setValue(null); onChange?.(null); return; }
         onChange?.(name);
-        setValue(old => old?.name === name ? old : { name, delay: null });
-        if (name !== measured || Date.now() - measuredAt >= 30000) {
-          try {
-            const result = await request<Latency>("latency", { name });
-            if (!alive) return;
-            setValue({ name, delay: result.status === "ok" ? result.delay : null });
-          } catch {
-            if (alive) setValue({ name, delay: null });
-          }
-          measured = name;
-          measuredAt = Date.now();
-        }
-      } catch { if (alive) { setValue(null); onChange?.(null); } }
+        const result = selectedLatency(response.proxies);
+        setValue({name,delay:result?.delay ?? null,status:result?.status});
+      } catch { if (alive) { setControlError(true); setValue(null); onChange?.(null); } }
       finally { pending = false; }
     };
     void poll();
@@ -60,6 +63,6 @@ export function ActiveServer({
   }, [connected, onChange]);
   return <div className="active-server" title={value?.name}>
     <strong>{connected ? value?.name ?? "—" : "—"}</strong>
-    <small className={connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "pool-error" : ""} title={poolHealth?.text}>{connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "Все серверы — таймаут" : connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
+    <small className={connected && (controlError || value?.status === "unreachable" || poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "pool-error" : ""} title={poolHealth?.text}>{connected && controlError ? "Нет связи с ядром Atlas" : connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "Все проверки — таймаут" : connected && value?.status === "unreachable" ? "Таймаут выбранного сервера" : connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
   </div>;
 }

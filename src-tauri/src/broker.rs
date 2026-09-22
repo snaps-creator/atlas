@@ -429,6 +429,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
     let mut recovery_trigger = crate::auto_recovery::Trigger::default();
     let mut recovery_probe = crate::background_probe::Probe::default();
     let mut recovery_pending = false;
+    let mut recovery_cooldown = crate::auto_recovery::Cooldown::default();
     let mut last_recovery_scan = Instant::now();
     let mut last_health = Instant::now();
     let mut health_failures = 0;
@@ -443,7 +444,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 // Consume failures during a check too, preventing a retry storm.
                 let lines = core.client().logs().unwrap_or_default();
                 let failed = recovery_trigger.observe(&settings.selected, &lines);
-                if failed && !recovery_pending {
+                if failed && !recovery_pending && recovery_cooldown.allow(Instant::now()) {
                     let client = core.client();
                     let group = settings.selected.clone();
                     recovery_pending = recovery_probe.start(move || {
@@ -528,6 +529,10 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
         let op = request["op"].as_str().unwrap_or("");
         let payload = &request["payload"];
         let result: Result<Value, String> = (|| match op {
+            "support_snapshot" => {
+                let id = queries.start(false, || crate::support_report::privileged_snapshot().map(|text| json!({"text":text})))?;
+                Ok(json!({"id":id}))
+            }
             "delay" | "query" => {
                 let path = payload["path"].as_str().ok_or("Нет пути")?;
                 if (op == "delay" && !path.contains("/delay?")) || !allowed_api("GET", path) {

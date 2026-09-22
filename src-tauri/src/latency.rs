@@ -1,5 +1,35 @@
 use crate::core::ApiClient;
 use serde::Serialize;
+use serde_json::{json, Value};
+
+// One native group request: Mihomo probes members concurrently under one deadline.
+pub fn batch(client: ApiClient, names: &[String]) -> Result<Value, String> {
+    batch_at(client, names, ENDPOINTS[0])
+}
+pub(crate) fn batch_at(client: ApiClient, names: &[String], endpoint: &str) -> Result<Value, String> {
+    client.api("GET", "/version", None)?;
+    let url: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
+    let delays = match client.api("GET", &format!("/group/AUTO/delay?timeout=5000&url={url}"), None) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => return Err("Некорректный ответ групповой проверки".into()),
+        Err(error) if error == "Mihomo API: HTTP 504" => json!({}),
+        Err(error) => return Err(error),
+    };
+    client.api("GET", "/version", None)?;
+    let mut results = serde_json::Map::new();
+    for name in names {
+        let result = match delays.get(name) {
+            Some(delay) => {
+                let delay = delay.as_u64().ok_or("Некорректная задержка ядра")?;
+                json!({"status":"ok","delay":delay,"attempts":1})
+            }
+            None => json!({"status":"unreachable","delay":null,"attempts":1,
+                "error":"Контрольный URL не ответил через сервер за 5 секунд"}),
+        };
+        results.insert(name.clone(), result);
+    }
+    Ok(Value::Object(results))
+}
 pub const ENDPOINTS: [&str; 2] = [
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
