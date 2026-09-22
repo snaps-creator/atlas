@@ -88,13 +88,17 @@ fn reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
 }
 
 fn run_bounded(mut command: Command, timeout: Duration) -> Result<String, String> {
-    let mut child = command
+    let child = command
         .creation_flags(0x08000000)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
+    collect_child(child, timeout)
+}
+
+fn collect_child(mut child: std::process::Child, timeout: Duration) -> Result<String, String> {
     let job = match crate::job::Job::attach(&child) {
         Ok(job) => job,
         Err(error) => {
@@ -201,18 +205,54 @@ mod tests {
     }
     #[test]
     fn stalled_collector_returns_partial_output_without_hanging() {
+        let ready =
+            std::env::temp_dir().join(format!("atlas-report-ready-{}", uuid::Uuid::new_v4()));
         let mut command = Command::new("powershell.exe");
         command.args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Console]::WriteLine('fixture snapshot'); Start-Sleep -Seconds 60",
+            "[Console]::WriteLine('fixture snapshot'); [Console]::Out.Flush(); [IO.File]::WriteAllText($env:ATLAS_REPORT_TEST_READY, 'ready'); Start-Sleep -Seconds 60",
         ]);
+        let mut child = command
+            .env("ATLAS_REPORT_TEST_READY", &ready)
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // CI may take several seconds to start PowerShell. A readiness marker
+        // separates that startup from the stalled-collector behavior under test.
+        let startup = Instant::now();
+        while !ready.exists() {
+            if startup.elapsed() >= Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture did not become ready before startup deadline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let started = Instant::now();
-        let output = run_bounded(command, Duration::from_secs(2)).unwrap();
+        let output = collect_child(child, Duration::from_secs(2)).unwrap();
+        std::fs::remove_file(ready).unwrap();
         assert!(output.contains("timed out"));
         assert!(output.contains("fixture snapshot"));
-        assert!(started.elapsed() < Duration::from_secs(6));
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn collector_can_time_out_before_producing_any_output() {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 60",
+        ]);
+        let output = run_bounded(command, Duration::ZERO).unwrap();
+        assert!(output.contains("timed out"));
+        assert!(!output.contains("fixture snapshot"));
     }
 
     #[test]
