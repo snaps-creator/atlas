@@ -431,6 +431,10 @@ fn recovery_requires_four_successes_and_encoded_names_work_on_real_vless() {
                     let refused=reject.load(Ordering::SeqCst) && String::from_utf8_lossy(&request).contains("/second");
                     let response=if refused {b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()}
                         else {b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice()};
+                    // Mihomo's delay API rejects a measured 0 ms with HTTP 503,
+                    // even if the origin responded. Give loopback a nonzero RTT
+                    // so this fixture tests HTTP status handling, not rounding.
+                    thread::sleep(Duration::from_millis(20));
                     let _=stream.write_all(response);let _=stream.shutdown(std::net::Shutdown::Write);
                     while stream.read(&mut buffer).is_ok_and(|n|n>0) {}
                 }));

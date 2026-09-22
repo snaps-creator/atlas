@@ -45,6 +45,7 @@ import { DashboardTools } from "./DashboardTools";
 import { trafficRate, type TrafficSample } from "./traffic";
 import { ServerCard } from "./ServerCard";
 import { ActiveServer } from "./ActiveServer";
+import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
@@ -1195,6 +1196,7 @@ function App() {
                     </button>
                     <p role="status">{reportSaved ? "Отчёт сохранён." : reportBusy ? "Выберите файл для сохранения. Сбор данных — до 90 секунд; недоступные проверки будут отмечены в TXT." : ""}</p>
                   </section>
+                  <LanDiagnostics />
                   {checks.length ? (
                     <div className="list">
                       {checks.map((c) => (

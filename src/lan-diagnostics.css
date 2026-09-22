@@ -1,0 +1,62 @@
+.lan-diagnostics form,
+.lan-controls,
+.lan-heading,
+.lan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+.lan-heading {
+  align-items: center;
+  justify-content: space-between;
+}
+.lan-diagnostics label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 180px;
+}
+.lan-diagnostics input:not([type="checkbox"]) {
+  padding: 10px;
+  border: 1px solid var(--border, #555);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+}
+.lan-diagnostics .lan-toggle {
+  flex-direction: row;
+  align-items: center;
+  min-height: 40px;
+}
+.lan-peers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+.lan-peer,
+.lan-report {
+  border: 1px solid var(--border, #555);
+  border-radius: 12px;
+  padding: 16px;
+}
+.lan-peer label {
+  margin-bottom: 8px;
+}
+.lan-report {
+  margin-top: 16px;
+}
+.lan-report pre {
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.lan-diagnostics [role="alert"]:not(:empty) {
+  color: #ff7878;
+}
+.lan-diagnostics button {
+  min-height: 36px;
+}

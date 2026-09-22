@@ -30,6 +30,7 @@ mod support_report;
 mod support_probes;
 mod incident_history;
 mod interface_evidence;
+mod lan_diagnostics;
 mod windows;
 use model::*;
 use serde_json::{json, Value};
@@ -482,6 +483,11 @@ async fn request(
     payload: Option<Value>,
 ) -> Result<Value, String> {
     let shared = state.inner().clone();
+    if action.starts_with("lan_") {
+        let lan=app.state::<lan_diagnostics::Lan>().inner().clone();
+        return tauri::async_runtime::spawn_blocking(move || lan.command(&action,payload.unwrap_or(Value::Null)))
+            .await.map_err(|e|e.to_string())?;
+    }
     if action == "snapshot" {
         return Ok(app.state::<published_state::PublishedState>().get());
     }
@@ -828,7 +834,7 @@ pub fn run() {
             let history_path = dir.join("incident-history.ndjson");
             incident_history::load(&history_path);
             incident_history::record("application_start", json!({"version":env!("CARGO_PKG_VERSION")}), &[]);
-            let core = core::Core::new(binary, dir);
+            let core = core::Core::new(binary, dir.clone());
             let auto = settings.startup.auto_connect
                 || (settings.startup.restore_connection && settings.was_connected);
             let delay = settings.startup.delay_seconds.min(300);
@@ -862,6 +868,10 @@ pub fn run() {
             app.manage(shared.clone());
             let shutdown: ShuttingDown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.manage(shutdown.clone());
+            let lan=lan_diagnostics::Lan::new(dir.clone(),app.state::<support_report::Access>().inner().clone(),
+                app.state::<published_state::PublishedState>().inner().clone());
+            lan.start(shutdown.clone());
+            app.manage(lan);
             {
                 let shared = shared.clone();
                 let shutdown = shutdown.clone();
