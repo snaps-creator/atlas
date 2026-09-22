@@ -156,6 +156,10 @@ pub(crate) fn save(
     ]);
     let os = run_bounded(command, Duration::from_secs(25))
         .unwrap_or_else(|e| format!("Windows snapshot unavailable: {e}"));
+    let selection = client.as_ref().map(|c| {
+        c.api("GET", "/proxies", None).map(|value| proxy_evidence(&value).to_string())
+    }).unwrap_or_else(|| Err("Atlas занят: выбор ядра недоступен".into()))
+        .unwrap_or_else(|e| format!("Proxy selection unavailable: {e}"));
     let logs = client
         .map(|c| c.logs().map(|lines| lines.join("\n")))
         .unwrap_or_else(|| Err("Atlas занят: журнал ядра недоступен".into()))
@@ -164,7 +168,7 @@ pub(crate) fn save(
         "Atlas diagnostic report\nVersion: {}\nTimestamp (Unix UTC): {}\n\
         Read-only snapshot. Local IP addresses and adapter names are included.\n\
         No automatic network repair or internet probes were performed.\n\n\
-        === Atlas state and logs ===\n{context}\n\n=== Core logs ===\n{logs}\n\n{os}\n",
+        === Atlas state and logs ===\n{context}\n\n=== Proxy selection and health history ===\n{selection}\n\n=== Core logs ===\n{logs}\n\n{os}\n",
         env!("CARGO_PKG_VERSION"),
         crate::model::now()
     );
@@ -173,9 +177,36 @@ pub(crate) fn save(
     Ok(true)
 }
 
+// Whitelist operational fields; never export node configuration or credentials.
+fn proxy_evidence(value: &Value) -> Value {
+    let mut nodes = serde_json::Map::new();
+    if let Some(proxies) = value["proxies"].as_object() {
+        for (name, node) in proxies {
+            let mut safe = serde_json::Map::new();
+            for field in ["type", "now", "all", "alive", "history", "udp"] {
+                if let Some(v) = node.get(field) { safe.insert(field.into(), v.clone()); }
+            }
+            nodes.insert(name.clone(), Value::Object(safe));
+        }
+    }
+    Value::Object(nodes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn proxy_report_preserves_auto_choice_without_node_secrets() {
+        let result = proxy_evidence(&serde_json::json!({"proxies":{
+            "ATLAS":{"now":"AUTO", "secret":"hidden"},
+            "AUTO":{"now":"node-b","all":["node-a","node-b"]},
+            "node-b":{"alive":true,"history":[{"delay":42}],"password":"hidden"}
+        }}));
+        assert_eq!(result["ATLAS"]["now"], "AUTO");
+        assert_eq!(result["AUTO"]["now"], "node-b");
+        assert_eq!(result["node-b"]["history"][0]["delay"], 42);
+        assert!(!result.to_string().contains("hidden"));
+    }
     #[test]
     fn report_hides_credentials_but_keeps_network_evidence() {
         let mut secrets = vec![];

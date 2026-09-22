@@ -475,32 +475,6 @@ pub fn run(settings: &Settings, client: ApiClient) -> Vec<Value> {
         },
     ));
 
-    let observed = client
-        .api("GET", "/connections", None)
-        .ok()
-        .and_then(|value| value["connections"].as_array().cloned())
-        .unwrap_or_default();
-    let telegram: Vec<_> = observed
-        .iter()
-        .filter(|connection| {
-            connection["metadata"]["process"]
-                .as_str()
-                .is_some_and(|process| process.eq_ignore_ascii_case("telegram.exe"))
-        })
-        .collect();
-    let telegram_ok = !telegram.is_empty()
-        && telegram.iter().all(|connection| {
-            routed(connection) && connection["download"].as_u64().unwrap_or(0) > 0
-        });
-    results.push(check(
-        "Telegram Desktop",
-        if telegram.is_empty() { None } else { Some(telegram_ok) },
-        if telegram_ok {
-            "Есть полученные данные у наблюдаемых соединений Telegram через TUN → ATLAS."
-        } else {
-            "Трафик Telegram через TUN не подтверждён. Отключите встроенный прокси и создайте трафик перед проверкой."
-        },
-    ));
     results
 }
 

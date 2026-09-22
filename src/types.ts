@@ -24,6 +24,7 @@ export type Settings = {
   defaultRoute: Route;
   mode: string;
   routingMode: "rule" | "global" | "direct";
+  tunStack: "gvisor" | "mixed";
   dns: { servers: string[]; ipv6: boolean; fakeIp: boolean };
   startup: {
     launchWithWindows: boolean;
