@@ -30,22 +30,31 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
     // Exercise the generated TUN DNS policy with TUN disabled in this fixture.
     // Both DNS and the HTTP origin are loopback-only; the VPN port is closed.
     let dns = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    dns.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    dns.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
     let dns_address = dns.local_addr().unwrap();
+    let dns_done = Arc::new(AtomicBool::new(false));
+    let worker_done = dns_done.clone();
     let responder = thread::spawn(move || {
         let mut buffer = [0u8; 4096];
-        let (size, peer) = dns.recv_from(&mut buffer).unwrap();
-        let mut end = 12;
-        while buffer[end] != 0 { end += 1 + buffer[end] as usize; }
-        end += 5;
-        assert!(end <= size);
-        assert_eq!(&buffer[end - 4..end - 2], &[0, 1]); // A question
-        let mut answer = buffer[..end].to_vec();
-        answer[2..4].copy_from_slice(&[0x81, 0x80]);
-        answer[6..8].copy_from_slice(&[0, 1]);
-        answer[8..12].fill(0);
-        answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, 1]);
-        dns.send_to(&answer, peer).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !worker_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let (size, peer) = match dns.recv_from(&mut buffer) {
+                Ok(packet) => packet,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                Err(e) => panic!("fixture DNS receive: {e}"),
+            };
+            let mut end = 12;
+            while buffer[end] != 0 { end += 1 + buffer[end] as usize; }
+            end += 5;
+            assert!(end <= size);
+            assert_eq!(&buffer[end - 4..end - 2], &[0, 1]); // A question
+            let mut answer = buffer[..end].to_vec();
+            answer[2..4].copy_from_slice(&[0x81, 0x80]);
+            answer[6..8].copy_from_slice(&[0, 1]);
+            answer[8..12].fill(0);
+            answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, 1]);
+            dns.send_to(&answer, peer).unwrap();
+            }
     });
     let origin = TcpListener::bind("127.0.0.1:0").unwrap();
     origin.set_nonblocking(true).unwrap();
@@ -106,6 +115,7 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
     let response = http.get(format!("http://direct-fixture.invalid:{origin_port}/")).send().unwrap();
     assert_eq!(response.status(), 200, "DIRECT must not use the failed VPN for DNS");
     assert_eq!(response.text().unwrap(), "ok");
+    dns_done.store(true, Ordering::SeqCst);
     responder.join().unwrap();
     origin_worker.join().unwrap();
     core.stop().unwrap();
