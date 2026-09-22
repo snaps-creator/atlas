@@ -189,7 +189,7 @@ impl Core {
                 {
                     if let Ok(mut buffer) = logs.lock() {
                         buffer.push_back(line.chars().take(4096).collect());
-                        while buffer.len() > 256 {
+                        while buffer.len() > 4096 {
                             buffer.pop_front();
                         }
                     }
@@ -686,6 +686,13 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    pub(crate) fn event(&self, value: Value) {
+        // Service-side events travel through the existing authenticated logs pipe.
+        if let Ok(mut logs) = self.logs.lock() {
+            logs.push_back(format!("ATLAS_EVENT {}", value));
+            while logs.len() > 4096 { logs.pop_front(); }
+        }
+    }
     pub fn support_snapshot(&self) -> Result<Value, String> {
         if let Some(broker) = &self.broker {
             let job = broker.call("support_snapshot", Value::Null)?;
@@ -755,9 +762,15 @@ impl ApiClient {
         if let Some(b) = body {
             req = req.json(&b)
         }
-        let response = req.send().map_err(|_| "Mihomo API недоступен")?;
+        let response = req.send().map_err(|e| format!("Mihomo API недоступен: {}",crate::support_report::redact(&e.to_string(), &[self.secret.clone()])))?;
         let status = response.status();
         if !status.is_success() {
+            let detail = response.text().unwrap_or_default().chars().take(1024).collect::<String>();
+            self.event(json!({"at":crate::model::now(),"kind":"controller_http_failure","path":path,
+                "status":status.as_u16(),"detail":crate::support_report::redact(&detail,&[self.secret.clone()])}));
+            if path.starts_with("/dns/query?") {
+                return Err(format!("Mihomo API: HTTP {}: {}",status.as_u16(),crate::support_report::redact(&detail,&[self.secret.clone()])));
+            }
             return Err(format!("Mihomo API: HTTP {}", status.as_u16()));
         }
         let bytes = response.bytes().map_err(|_| "Ошибка чтения API")?;

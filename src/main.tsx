@@ -393,7 +393,7 @@ function App() {
         setLatencies(previous => {
           const next = {...previous};
           for (const node of servers) {
-            const value = historyLatency(result.proxies[node.name]);
+            const value = historyLatency(result.proxies[node.name]?.extra?.["http://cp.cloudflare.com/generate_204"]);
             const old = previous[node.name];
             if (value && old?.status !== "testing" && (!old ||
                 (old.measuredAt !== undefined && value.measuredAt! > old.measuredAt))) next[node.name] = value;
@@ -416,7 +416,7 @@ function App() {
       [name, {status:"testing" as const, delay:null, attempts:0}]))}));
     let results: Record<string, Latency> = {};
     try {
-      const response = await boundedBatch(request<{revision:number; results:Record<string, Latency>}>("latency_batch"));
+      const response = await boundedBatch(request<{revision:number; results:Record<string, Latency>}>("latency_batch"), Math.ceil(servers.length / 10) * 16000 + 5000);
       if (response.revision !== data?.revision) throw new Error("Конфигурация изменилась во время проверки");
       results = Object.fromEntries(Object.entries(response.results).map(([name,result]) => [name,{...result,measuredAt:Date.now()}]));
     } catch (error) {
@@ -1175,7 +1175,7 @@ function App() {
                   )}
                   <section className="settings-section">
                     <h2>Отчёт для разбора сбоя</h2>
-                    <p className={poolHealth.phase === "all_timeout" || poolHealth.phase === "local_error" ? "pool-error" : ""} role="status">{poolHealth.text}</p>
+                    <p className={poolHealth.phase === "all_timeout" || poolHealth.phase === "local_error" || poolHealth.phase === "degraded" ? "pool-error" : ""} role="status">{poolHealth.text}</p>
                     <button disabled={!connected || poolHealth.phase === "checking" || poolHealth.phase === "refreshing"} onClick={checkPool}>Проверить все подписки и восстановить</button>
                     <p>История до сбоя, журналы ядра, маршруты, DNS, DHCP и фильтры Windows. При сохранении выполняются короткие сетевые проверки через разные пути и выборку VPN-узлов. Сохраните отчёт во время сбоя, до перезагрузки.</p>
                     <p className="footnote">Ключи и ссылки подписок скрываются. Локальные IP-адреса и названия адаптеров остаются в отчёте.</p>

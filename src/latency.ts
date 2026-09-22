@@ -22,7 +22,7 @@ export async function boundedBatch<T>(request: Promise<T>, timeoutMs = 18000): P
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([request, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Atlas не завершил групповую проверку за 18 секунд")), timeoutMs);
+      timer = setTimeout(() => reject(new Error("Atlas не завершил групповую проверку за отведённое время")), timeoutMs);
     })]);
   } finally { clearTimeout(timer); }
 }

@@ -2,8 +2,24 @@ import { useEffect, useRef, useState } from "react";
 import { request } from "./api";
 import type { Snapshot } from "./types";
 
-export type PoolHealth = { phase: "idle" | "checking" | "refreshing" | "healthy" | "all_timeout" | "local_error"; text: string; checkedAt: number };
-type Proxy = { now?: string; alive?: boolean; history?: { delay: number }[] };
+export type PoolHealth = { phase: "idle" | "checking" | "refreshing" | "healthy" | "degraded" | "all_timeout" | "local_error"; text: string; checkedAt: number };
+type Proxy = { now?: string; testUrl?: string; alive?: boolean; history?: { delay: number; time?: string }[]; extra?: Record<string, Proxy> };
+export function observedHealth(names: string[], proxies: Record<string, Proxy>, maxAgeMs: number, now = Date.now()): PoolHealth {
+  let selected = "ATLAS", url: string | undefined;
+  const seen = new Set<string>();
+  while (proxies[selected]?.now && !seen.has(selected)) {
+    seen.add(selected); url = proxies[selected].testUrl ?? url; selected = proxies[selected].now!;
+  }
+  const state = (name: string) => {
+    const p = proxies[name]; const h = (url && p?.extra?.[url]) || p;
+    const t = Date.parse(h?.history?.at(-1)?.time ?? "");
+    return { alive: h?.alive, at: t, fresh: Number.isFinite(t) && now - t <= maxAgeMs && t <= now + 5000 };
+  };
+  const active = state(selected), working = names.filter(n => { const h=state(n); return h.fresh && h.alive === true; }).length;
+  if (!active.fresh) return {phase:"idle",text:"Нет свежей проверки выбранного сервера. Доступность не подтверждена.",checkedAt:0};
+  if (active.alive !== true) return {phase:"degraded",text:`Выбранный сервер не ответил. В пуле свежих успешных проверок: ${working}.`,checkedAt:active.at};
+  return {phase:"healthy",text:`Выбранный сервер ответил на контрольный запрос. В пуле свежих успешных проверок: ${working}.`,checkedAt:active.at};
+}
 export function exhausted(names: string[], proxies: Record<string, Proxy>): boolean {
   return names.length > 0 && names.every(name => proxies[name]?.alive === false && !!proxies[name]?.history?.length);
 }
@@ -24,6 +40,13 @@ export function usePoolRecovery(snapshot: Snapshot | null, update: (value: Snaps
     const publish = (value: PoolHealth) => { if (alive) setHealth(value); };
     const valid = (revision: number | undefined) => alive && latest.current?.running && latest.current.revision === revision;
     const probe = () => request<{ revision: number; delays: Record<string, number> }>("pool_probe");
+    const publishSelected = async (revision: number | undefined) => {
+      const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");
+      if (!valid(revision)) return;
+      const settings = latest.current!.settings;
+      publish(observedHealth(settings.subscriptions.flatMap(sub => sub.servers.map(server => server.name)), proxies,
+        Math.max(30000, (settings.autoTestIntervalSeconds ?? 300) * 2000)));
+    };
     const check = async (force = false) => {
       if (!alive || pending || (!force && Date.now() < nextCheck)) return;
       pending = true;
@@ -35,13 +58,15 @@ export function usePoolRecovery(snapshot: Snapshot | null, update: (value: Snaps
         if (!names.length) return;
         if (!force && !verifyAgain) {
           const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");
-          if (!valid(revision) || !exhausted(names, proxies)) return;
+          if (!valid(revision)) return;
+          publish(observedHealth(names, proxies, Math.max(30000, (initial.settings.autoTestIntervalSeconds ?? 300) * 2000)));
+          if (!exhausted(names, proxies)) return;
         }
         publish({ phase: "checking", text: "Проверяем серверы всех подписок…", checkedAt: Date.now() });
         let result = await probe();
         if (!valid(revision) || result.revision !== revision) return;
         let verdict = poolVerdict(result.delays, false);
-        if (verdict.phase === "healthy") { recovered = false; verifyAgain = false; publish(verdict); nextCheck = Date.now() + 30000; return; }
+        if (verdict.phase === "healthy") { recovered = false; verifyAgain = false; await publishSelected(revision); nextCheck = Date.now() + 30000; return; }
         verifyAgain = true;
         if (!recovered) {
           recovered = true;
@@ -55,7 +80,8 @@ export function usePoolRecovery(snapshot: Snapshot | null, update: (value: Snaps
           if (!valid(revision) || result.revision !== revision) return;
           verdict = poolVerdict(result.delays, refreshed.failedSubscriptions.length > 0);
         }
-        publish(verdict);
+        if (verdict.phase === "healthy") await publishSelected(revision);
+        else publish(verdict);
         if (verdict.phase === "healthy") { recovered = false; verifyAgain = false; }
         nextCheck = Date.now() + 60000;
       } catch (error) {

@@ -410,3 +410,105 @@ fn independent_clients_share_vless_server_and_recover_after_its_restart() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn recovery_requires_four_successes_and_encoded_names_work_on_real_vless() {
+    let origin=TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port=origin.local_addr().unwrap().port();origin.set_nonblocking(true).unwrap();
+    let done=Arc::new(AtomicBool::new(false));let done_worker=done.clone();
+    let reject=Arc::new(AtomicBool::new(false));let reject_worker=reject.clone();
+    let worker=thread::spawn(move || {
+        let mut jobs=Vec::new();
+        while !done_worker.load(Ordering::SeqCst) {
+            if let Ok((mut stream,_))=origin.accept() {
+                let reject=reject_worker.clone();
+                jobs.push(thread::spawn(move || {
+                    stream.set_nonblocking(false).unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let mut request=Vec::new();let mut buffer=[0;1024];
+                    while request.len()<8192 && !request.windows(4).any(|v|v==b"\r\n\r\n") {
+                        match stream.read(&mut buffer) {Ok(0)|Err(_)=>return,Ok(n)=>request.extend_from_slice(&buffer[..n])}
+                    }
+                    let refused=reject.load(Ordering::SeqCst) && String::from_utf8_lossy(&request).contains("/second");
+                    let response=if refused {b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()}
+                        else {b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice()};
+                    let _=stream.write_all(response);let _=stream.shutdown(std::net::Shutdown::Write);
+                    while stream.read(&mut buffer).is_ok_and(|n|n>0) {}
+                }));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        for j in jobs {j.join().unwrap();}
+    });
+    let reservation=TcpListener::bind("127.0.0.1:0").unwrap();let port=reservation.local_addr().unwrap().port();drop(reservation);
+    let id=uuid::Uuid::new_v4().to_string();let mut server=isolated_core();start_server(&mut server,port,&id);
+    let name="🇸🇪 Швеция + A/B · regression";
+    let mut settings=Settings::default();settings.mode="system".into();settings.selected=name.into();
+    settings.subscriptions.push(Subscription{id:"fixture".into(),name:"fixture".into(),masked_url:"".into(),updated_at:0,error:None,
+        servers:vec![json!({"name":name,"type":"vless","server":"127.0.0.1","port":port,"uuid":id,"tls":false})]});
+    let mut client=isolated_core();client.start(&settings).unwrap();
+    let first=format!("http://127.0.0.1:{origin_port}/first");let second=format!("http://127.0.0.1:{origin_port}/second");
+    let path=format!("/proxies/{}/delay?timeout=1000&expected=204&url={}",crate::latency::encode_name(name),crate::latency::encode_name(&first));
+    assert!(client.api("GET",&path,None).unwrap()["delay"].as_u64().is_some(),"names with spaces, plus and slash must resolve through real API");
+    let selected_before=client.api("GET","/proxies/ATLAS",None).unwrap()["now"].clone();
+    let verified=crate::resilient_selection::verify(&client.client(),&settings,&Default::default(),&[&first,&second]);
+    assert_eq!(verified["candidate"],name,"{verified}");assert_eq!(verified["results"][0]["checks"].as_array().unwrap().len(),4);
+    reject.store(true,Ordering::SeqCst);
+    let display = crate::latency::display_probe(&client.client(), name, &second, 10000);
+    assert_eq!(display.status,"ok","Clash-compatible latency records a received HTTP response: {display:?}");
+    assert_eq!(display.attempts,1);
+    let missing = crate::latency::display_probe(&client.client(), "missing + /", &first, 10000);
+    assert_eq!(missing.status,"error","404 is a controller error, not a server timeout");
+    let mut batch_names: Vec<String> = (0..12).map(|i|format!("missing {i}")).collect();
+    batch_names.push(name.into());
+    let batch = crate::latency::display_batch_at(client.client(), &batch_names, &first, 10000).unwrap();
+    assert_eq!(batch.as_object().unwrap().len(),13);
+    assert_eq!(batch[name]["status"],"ok","failed members must not hide a working node in a later batch slot");
+    assert_eq!(batch["missing 0"]["status"],"error");
+    let rejected=crate::resilient_selection::verify(&client.client(),&settings,&Default::default(),&[&first,&second]);
+    assert!(rejected["candidate"].is_null(),"one working control cannot hide another failed control: {rejected}");
+    assert_eq!(client.api("GET","/proxies/ATLAS",None).unwrap()["now"],selected_before,"worker must not mutate selector");
+    let mut recovery=crate::resilient_selection::Recovery::default();
+    let mut automatic=settings.clone();automatic.selected="AUTO".into();
+    client.select("AUTO").unwrap();
+    recovery.propose_for_test(verified.clone());
+    recovery.tick(client.client(),&automatic);
+    assert_eq!(client.api("GET","/proxies/ATLAS",None).unwrap()["now"],name,"service commits the verified candidate");
+    recovery.propose_for_test(verified);
+    recovery.invalidate();client.select("AUTO").unwrap();
+    recovery.tick(client.client(),&automatic);
+    assert_eq!(client.api("GET","/proxies/ATLAS",None).unwrap()["now"],"AUTO","stale verification cannot overwrite a newer selection");
+    done.store(true,Ordering::SeqCst);worker.join().unwrap();
+    for mut c in [client,server] {c.stop().unwrap();let dir=c.directory.clone();drop(c);std::fs::remove_dir_all(dir).unwrap();}
+}
+
+#[test]
+fn real_core_dns_evidence_distinguishes_nxdomain_from_servfail() {
+    let dns=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();dns.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let address=dns.local_addr().unwrap();let done=Arc::new(AtomicBool::new(false));let worker_done=done.clone();
+    let worker=thread::spawn(move || {
+        while !worker_done.load(Ordering::SeqCst) {
+            let mut packet=[0;4096];
+            if let Ok((size,peer))=dns.recv_from(&mut packet) {
+                let missing=packet.windows(7).any(|w|w==b"missing");
+                let mut response=packet[..size].to_vec();
+                response[2]=0x81;response[3]=if missing {0x83}else {0x82};response[6..12].fill(0);
+                let _=dns.send_to(&response,peer);
+            }
+        }
+    });
+    let mut core=isolated_core();
+    let config=json!({"external-controller":format!("127.0.0.1:{}",core.ports[1]),"secret":core.secret,
+        "dns":{"enable":true,"listen":format!("127.0.0.1:{}",core.ports[2]),"nameserver":[format!("udp://{address}")],"default-nameserver":["127.0.0.1"],"enhanced-mode":"fake-ip"},
+        "rules":["MATCH,DIRECT"]});
+    let path=core.directory.join("dns-evidence.yaml");std::fs::write(&path,serde_yaml::to_string(&config).unwrap()).unwrap();
+    let child=core.command().arg("-d").arg(&core.directory).arg("-f").arg(path).spawn().unwrap();
+    core.job=Some(crate::job::Job::attach(&child).unwrap());core.child=Some(child);
+    let deadline=Instant::now()+Duration::from_secs(5);
+    while core.api("GET","/version",None).is_err() {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(20));}
+    core.logs.lock().unwrap().push_back("[TCP] dial DIRECT --> missing.invalid:443 error: dns resolve failed".into());
+    let evidence=crate::support_probes::upstream_dns(&core.client());
+    let missing=evidence["results"].as_array().unwrap().iter().find(|v|v["name"]=="missing.invalid").unwrap();
+    assert_eq!(missing["classification"],"NXDOMAIN","{evidence}");
+    assert!(evidence["results"].as_array().unwrap().iter().any(|v|v["classification"] == "SERVFAIL"),"{evidence}; {:?}",core.client().logs());
+    done.store(true,Ordering::SeqCst);worker.join().unwrap();core.stop().unwrap();let dir=core.directory.clone();drop(core);std::fs::remove_dir_all(dir).unwrap();
+}

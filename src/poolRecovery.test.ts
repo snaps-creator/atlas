@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { exhausted, poolVerdict } from "./usePoolRecovery";
+import { exhausted, poolVerdict, observedHealth } from "./usePoolRecovery";
+it("never conceals a failed selected node behind healthy alternatives or stale history", () => {
+  const now = Date.now();
+  const p = {ATLAS:{now:"bad"},bad:{alive:false,history:[{delay:0,time:new Date(now).toISOString()}]},good:{alive:true,history:[{delay:30,time:new Date(now).toISOString()}]}};
+  expect(observedHealth(["bad","good"],p,30000,now).phase).toBe("degraded");
+  expect(observedHealth(["bad","good"],p,30000,now+60000).phase).toBe("idle");
+});
 describe("shared subscription pool", () => {
   it("does not confuse untested, missing, or empty nodes with total failure", () => {
     expect(exhausted([], {})).toBe(false);

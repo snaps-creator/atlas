@@ -46,19 +46,78 @@ pub(crate) fn privileged_snapshot() -> Result<String, String> {
     command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_privileged.ps1")]);
     run_bounded(command, Duration::from_secs(24))
 }
-pub(crate) fn passive_sample(client: &crate::core::ApiClient) -> Value {
-    let started = crate::model::now();
-    let proxies = client.api("GET","/proxies",None).map(|v| {
-        let nodes: Vec<Value> = v["proxies"].as_object().into_iter().flat_map(|v|v.iter()).map(|(name,node)| {
-            serde_json::json!({"name":name,"now":node.get("now"),"alive":node.get("alive"),
-                "last":node["history"].as_array().and_then(|h|h.last())})
-        }).collect();
-        serde_json::json!({"nodes":nodes})
-    }).unwrap_or_else(|e|serde_json::json!({"error":e}));
-    let logs = client.logs().map(|lines| lines.into_iter().rev().take(32).collect::<Vec<_>>())
-        .map(|lines|serde_json::json!({"evidence":failure_evidence(&lines),"lines":lines}))
-        .unwrap_or_else(|e|serde_json::json!({"error":e}));
-    serde_json::json!({"startedAt":started,"completedAt":crate::model::now(),"proxies":proxies,"logs":logs})
+#[derive(Default)]
+pub(crate) struct Recorder { last_log: Option<String>, counters: crate::interface_evidence::Counters,
+    previous_connections: Option<std::collections::HashMap<String,u64>> }
+impl Recorder {
+    pub fn sample(&mut self, client: &crate::core::ApiClient) -> (Value, bool) {
+        let started = crate::model::now();
+        let proxies = client.api("GET", "/proxies", None).map(|v| {
+            let p = &v["proxies"];
+            let mut name = "ATLAS".to_owned();
+            let mut chain = Vec::new();
+            for _ in 0..8 {
+                chain.push(name.clone());
+                match p[&name]["now"].as_str() { Some(next) if !chain.iter().any(|n|n == next) => name = next.into(), _ => break }
+            }
+            let all = p.as_object();
+            let members = p["AUTO"]["all"].as_array().cloned().unwrap_or_default();
+            let healthy = members.iter().filter(|n|p[n.as_str().unwrap_or("")]["alive"] == true).count();
+            let selected = all.and_then(|p|p.get(&name)).cloned().unwrap_or(Value::Null);
+            // Full inventory is captured on incidents/export. Normal samples retain
+            // selection and its URL history, not 124 repeated names every 15 seconds.
+            serde_json::json!({"chain":chain,"selected":name,"selectedHealth":proxy_evidence(&serde_json::json!({"proxies":{name:selected}})),
+                "poolMembers":members.len(),"poolAlive":healthy,"poolOther":members.len()-healthy})
+        }).unwrap_or_else(|e|serde_json::json!({"error":e}));
+        let mut incident = false;
+        let logs = client.logs().map(|lines| {
+            let position = self.last_log.as_ref().and_then(|last|lines.iter().rposition(|l|l == last));
+            let gap = self.last_log.is_some() && position.is_none();
+            let fresh = &lines[position.map_or(0, |i|i+1)..];
+            incident = fresh.iter().any(|l| !l.starts_with("ATLAS_EVENT") && (l.contains("connect error:") || l.contains("resolve failed") || l.contains("can't resolve ip")));
+            self.last_log = lines.last().cloned();
+            serde_json::json!({"newLines":fresh.iter().rev().take(512).collect::<Vec<_>>(),
+                "gap":gap,"omittedNewLines":fresh.len().saturating_sub(512),"evidence":failure_evidence(fresh)})
+        }).unwrap_or_else(|e|serde_json::json!({"error":e}));
+        let traffic = client.api("GET","/connections",None).map(|v| {
+            let connections=v["connections"].as_array().cloned().unwrap_or_default();
+            let mut next=std::collections::HashMap::new();
+            let mut progress=Vec::new();
+            for c in connections.iter().take(2048) {
+                let id=c["id"].as_str().unwrap_or("").to_owned();let downloaded=c["download"].as_u64().unwrap_or(0);
+                let increase=self.previous_connections.as_ref().map(|old|downloaded.saturating_sub(old.get(&id).copied().unwrap_or(0)));
+                next.insert(id,downloaded);
+                if increase.is_some_and(|n|n>0) && progress.len()<32 {
+                    progress.push(serde_json::json!({"chains":c["chains"],"rule":c["rule"],"rulePayload":c["rulePayload"],
+                        "process":c["metadata"]["process"],"host":c["metadata"]["host"],"downloadDelta":increase}));
+                }
+            }
+            let baseline=self.previous_connections.is_none();self.previous_connections=Some(next);
+            serde_json::json!({"baselineOnly":baseline,"connections":connections.len(),"downloadTotal":v["downloadTotal"],
+                "uploadTotal":v["uploadTotal"],"observedProgress":progress,
+                "scope":"At most 32 connections with received-byte growth; short connections between samples can be missed. A transfer is not proof of application-level success."})
+        }).unwrap_or_else(|e|serde_json::json!({"error":e}));
+        (serde_json::json!({"startedAt":started,"completedAt":crate::model::now(),"proxies":proxies,"logs":logs,"traffic":traffic,"interfaces":self.counters.sample()}), incident)
+    }
+}
+
+pub(crate) fn automatic_incident(client: crate::core::ApiClient, secrets: Vec<String>, revision: u64) {
+    let before = core_snapshot(Some(&client));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (active, privileged, windows) = std::thread::scope(|scope| {
+        let p = scope.spawn(||client.support_snapshot().unwrap_or_else(|e|serde_json::json!({"error":e})));
+        let w = scope.spawn(|| {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_snapshot.ps1")]);
+            run_bounded(command, Duration::from_secs(25)).unwrap_or_else(|e|e)
+        });
+        let active = crate::support_probes::run(Some(client.clone()), deadline);
+        (active,p.join().unwrap_or(Value::Null),w.join().unwrap_or_default())
+    });
+    crate::incident_history::record("incident_summary",serde_json::json!({"revision":revision,"startedAt":before["startedAt"],
+        "completedAt":crate::model::now(),"failures":before["logs"]["evidence"],"http":active["http"],"upstreamDns":active["upstreamDns"]}),&secrets);
+    crate::incident_history::record("automatic_incident",serde_json::json!({"revision":revision,"before":before,
+        "active":active,"privileged":privileged,"windows":windows,"after":core_snapshot(Some(&client))}),&secrets);
 }
 fn core_snapshot(client: Option<&crate::core::ApiClient>) -> Value {
     let Some(c) = client else { return serde_json::json!({"error":"No captured core session"}); };
@@ -66,7 +125,8 @@ fn core_snapshot(client: Option<&crate::core::ApiClient>) -> Value {
     let version = c.api("GET","/version",None).unwrap_or_else(|e|serde_json::json!({"error":e}));
     let proxies = c.api("GET","/proxies",None).map(|v|proxy_evidence(&v))
         .unwrap_or_else(|e|serde_json::json!({"error":e}));
-    let logs = c.logs().map(|lines|serde_json::json!({"evidence":failure_evidence(&lines),"lines":lines}))
+    let logs = c.logs().map(|lines|serde_json::json!({"evidence":failure_evidence(&lines),"omittedLines":lines.len().saturating_sub(256),
+        "lines":lines.iter().rev().take(256).collect::<Vec<_>>()}))
         .unwrap_or_else(|e|serde_json::json!({"error":e}));
     serde_json::json!({"startedAt":started,"completedAt":crate::model::now(),"version":version,"proxies":proxies,"logs":logs})
 }
@@ -95,11 +155,16 @@ fn conclusions(parts: &serde_json::Map<String, Value>) -> Vec<Value> {
 }
 
 pub(crate) fn failure_evidence(lines: &[String]) -> Value {
+    let lines: Vec<_> = lines.iter().filter(|line|!line.starts_with("ATLAS_EVENT")).collect();
     let tcp_dial = lines.iter().filter(|s| s.contains("dial tcp ") && s.contains("error:")).count();
     let established_read = lines.iter().filter(|s| s.contains("read tcp ") && s.contains("error:")).count();
     let ambiguous_connect = lines.iter().filter(|s| s.contains("connect error:") &&
         !s.contains("dial tcp ") && !s.contains("read tcp ")).count();
     serde_json::json!({"tcpDialErrors":tcp_dial,"establishedSocketReadErrors":established_read,
+        "dnsResolutionErrors":lines.iter().filter(|s|s.contains("resolve failed") || s.contains("can't resolve ip")).count(),
+        "explicitTlsOrCertificateErrors":lines.iter().filter(|s|s.contains("tls:") || s.contains("x509:") || s.contains("certificate verify")).count(),
+        "explicitWebSocketUpgradeErrors":lines.iter().filter(|s|s.contains("websocket: bad handshake")).count(),
+        "connectionRefusedErrors":lines.iter().filter(|s|s.contains("connection refused") || s.contains("actively refused")).count(),
         "unspecifiedConnectOrHandshakeErrors":ambiguous_connect,
         "scope":"Bounded core log window; not independent probes and not proof of provider outage",
         "interpretation":"Mihomo connect error includes TCP and TLS/VLESS handshake. A read tcp error means a socket had been established."})
@@ -120,7 +185,8 @@ pub(crate) fn configuration_evidence(settings: &crate::model::Settings) -> Value
         }).collect();
         serde_json::json!({"name":sub.name,"updatedAt":sub.updated_at,"nodes":nodes})
     }).collect();
-    serde_json::json!({"subscriptions":subscriptions,
+    serde_json::json!({"subscriptions":subscriptions,"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
+        "compiledRules":crate::rules::compile(settings).ok(),"dns":settings.dns,"tunStack":settings.tun_stack,
         "meaning":"Endpoints and transport settings, not credentials. Matching names do not imply matching endpoints."})
 }
 
@@ -303,7 +369,7 @@ pub(crate) fn save(
     let analysis = conclusions(&parts);
     let evidence = serde_json::to_string_pretty(&parts).map_err(|e|e.to_string())?;
     let text = format!(
-        "Atlas incident report / schema 2\nVersion: {}\nStarted (Unix UTC): {started}\nCompleted: {}\n\
+        "Atlas incident report / schema 3\nVersion: {}\nStarted (Unix UTC): {started}\nCompleted: {}\n\
         Limited active probes requested by export. Selectors, routes, DNS settings and WFP policy were not changed.\n\
         Probe histories can change during URL tests and automatic recovery can still run. Samples are timestamped, not atomic.\n\
         Missing sections: {missing:?}\n\n=== Confirmed observations and interpretation ===\n{}\n\n\
