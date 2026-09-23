@@ -3,7 +3,7 @@
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
 
-Windows-приложение Atlas Beta 17.2 на React, TypeScript, Tauri 2, Rust и Mihomo.
+Windows-приложение Atlas Beta 18.1.2 на React, TypeScript, Tauri 2, Rust и Mihomo.
 Подробный статус реализации и подтверждённых проверок: [STATUS.md](STATUS.md).
 
 ## Сборка
@@ -18,8 +18,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run tauri build
 ```
 
-Готовый установщик находится в корне проекта: `Atlas Beta 17.2 Setup.exe`, рядом — его подпись `Atlas Beta 17.2 Setup.exe.sig`. Скрипт `scripts/build.ps1` автоматически включает текущую версию в название установщика.
-Исходный bundle после сборки: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.17.2_x64-setup.exe`.
+Актуальный установщик и соответствующая подпись `.sig` публикуются в [GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest) после успешной сборки. Устаревшие бинарные файлы из корня удалены.
+Исходный bundle после сборки: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.18.1.2_x64-setup.exe`.
 Ядро и локальная GeoIP-база включены в проект. Контрольные суммы находятся в `src-tauri/resources`.
 Дистрибутив пока не подписан издательским сертификатом, поэтому Windows показывает
 «Неизвестный издатель» при установке. При обычном запуске Atlas этот запрос больше

@@ -132,13 +132,24 @@ pub fn test(client: ApiClient, name: &str) -> TestResult {
     result
 }
 pub(crate) fn display_probe(client: &ApiClient, name: &str, endpoint: &str, timeout: u64) -> TestResult {
-    // Like Clash: one URL test, no expected-status filter or alternate URL.
-    // This measures latency, not application availability or download throughput.
-    let path = format!("/proxies/{}/delay?timeout={timeout}&url={}", encode_name(name), encode_name(endpoint));
-    match client.api("GET", &path, None).and_then(|v|v["delay"].as_u64().ok_or("Ядро не вернуло задержку".into())) {
-        Ok(delay) => TestResult { status:"ok".into(), delay:Some(delay), attempts:1, error:None },
-        Err(error) => TestResult { status:if matches!(error.as_str(), "Mihomo API: HTTP 503"|"Mihomo API: HTTP 504") { "unreachable" } else { "error" }.into(), delay:None, attempts:1, error:Some(error) },
+    display_attempts(endpoint, |url| {
+        let path = format!("/proxies/{}/delay?timeout={timeout}&url={}", encode_name(name), encode_name(url));
+        client.api("GET", &path, None).and_then(|v|v["delay"].as_u64().ok_or("Ядро не вернуло задержку".into()))
+    })
+}
+fn display_attempts(endpoint: &str, mut probe: impl FnMut(&str)->Result<u64,String>) -> TestResult {
+    let fallback = if endpoint == ENDPOINTS[0] { ENDPOINTS[1] } else { ENDPOINTS[0] };
+    for (index, url) in [endpoint, fallback].into_iter().enumerate() {
+        match probe(url) {
+            Ok(delay) => return TestResult {status:"ok".into(),delay:Some(delay),attempts:index as u8+1,error:None},
+            Err(error) if matches!(error.as_str(),"Mihomo API: HTTP 503"|"Mihomo API: HTTP 504") => {
+                if index == 1 { return TestResult {status:"unreachable".into(),delay:None,attempts:2,
+                    error:Some("Оба контрольных адреса не ответили через узел; это не означает отказ всех сайтов.".into())}; }
+            }
+            Err(error) => return TestResult {status:"error".into(),delay:None,attempts:index as u8+1,error:Some(error)},
+        }
     }
+    unreachable!()
 }
 pub(crate) fn encode_name(name: &str) -> String {
     // Form encoding uses '+' for spaces, but a URL path requires '%20'.
@@ -149,6 +160,13 @@ pub(crate) fn encode_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn display_falls_back_without_turning_local_errors_into_timeouts() {
+        let r=display_attempts(DISPLAY_URL, |url| if url==DISPLAY_URL { Err("Mihomo API: HTTP 504".into()) } else {Ok(122)});
+        assert_eq!(r.delay,Some(122)); assert_eq!(r.attempts,2);
+        let r=display_attempts(DISPLAY_URL, |_| Err("Очередь проверок серверов заполнена".into()));
+        assert_eq!(r.status,"error"); assert_eq!(r.attempts,1);
+    }
     #[test]
     fn server_name_is_a_path_segment_not_form_data() {
         assert_eq!(
