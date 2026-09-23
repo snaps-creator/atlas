@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     num::NonZeroU32,
     path::PathBuf,
     sync::{
@@ -23,6 +23,8 @@ const LIMIT: usize = 2 * 1024 * 1024;
 const REQUEST_AAD: &[u8] = b"atlas-lan-diagnostics/request/v1";
 const RESPONSE_AAD: &[u8] = b"atlas-lan-diagnostics/response/v1";
 const SALT: &[u8] = b"Atlas LAN diagnostics v1 password key";
+const DISCOVER_REQUEST: &[u8] = b"atlas-lan-discover/request/v1";
+const DISCOVER_RESPONSE: &[u8] = b"atlas-lan-discover/response/v1";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Peer {
@@ -60,6 +62,7 @@ struct State {
     capture_running: bool,
     capture_completed: Option<u64>,
     listener_error: Option<String>,
+    discovery_error: Option<String>,
     load_error: Option<String>,
 }
 #[derive(Clone)]
@@ -233,6 +236,7 @@ impl Lan {
                 capture_running: false,
                 capture_completed: None,
                 listener_error: None,
+                discovery_error: None,
                 load_error,
             })),
         }
@@ -248,6 +252,7 @@ impl Lan {
             .map_err(|e| e.to_string())
     }
     pub fn start(&self, shutdown: Arc<AtomicBool>) {
+        self.start_discovery(shutdown.clone());
         let this = self.clone();
         std::thread::spawn(move || {
             let active = Arc::new(AtomicUsize::new(0));
@@ -281,6 +286,7 @@ impl Lan {
                         let active = active.clone();
                         let this = this.clone();
                         std::thread::spawn(move || {
+                            let _ = stream.set_nonblocking(false);
                             let _ = this.serve(&mut stream);
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
@@ -289,6 +295,77 @@ impl Lan {
                 std::thread::sleep(Duration::from_millis(30));
             }
         });
+    }
+    fn start_discovery(&self, shutdown: Arc<AtomicBool>) {
+        let this=self.clone();
+        std::thread::spawn(move || {
+            let mut socket:Option<UdpSocket>=None;
+            let mut buffer=[0u8;1024];
+            while !shutdown.load(Ordering::SeqCst) {
+                let (enabled,key,id,device_name)={let s=this.state.lock().unwrap();
+                    (s.config.enabled,s.config.key,s.config.id.clone(),s.config.name.clone())};
+                if !enabled {socket=None;std::thread::sleep(Duration::from_millis(250));continue;}
+                if socket.is_none() {
+                    match UdpSocket::bind(("0.0.0.0",crate::lan_discovery::PORT)).and_then(|s|{s.set_nonblocking(true)?;Ok(s)}) {
+                        Ok(s)=>{socket=Some(s);this.state.lock().unwrap().discovery_error=None;}
+                        Err(e)=>{this.state.lock().unwrap().discovery_error=Some(e.to_string());std::thread::sleep(Duration::from_secs(2));continue;}
+                    }
+                }
+                if let (Some(socket),Some(key))=(&socket,key) {
+                    if let Ok((size,peer))=socket.recv_from(&mut buffer) {
+                        if local(peer.ip()) {
+                            if let Some(reply)=discovery_reply(&key,&buffer[..size],&id,&device_name) {let _=socket.send_to(&reply,peer);}
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+    fn discover(&self)->Result<Value,String> {
+        let (key,own_id)={let s=self.state.lock().unwrap();(s.config.key.ok_or("Нет пароля")?,s.config.id.clone())};
+        let request_id=uuid::Uuid::new_v4().to_string();
+        let packet=seal(&key,&json!({"id":request_id,"at":crate::model::now()}),DISCOVER_REQUEST)?;
+        let mut sockets=Vec::new();
+        for (ip,broadcast) in crate::lan_discovery::targets() {
+            if let Ok(s)=UdpSocket::bind((ip,0)) {
+                if s.set_broadcast(true).and_then(|_|s.set_nonblocking(true)).is_ok() {
+                    let _=s.set_ttl(1);
+                    if s.send_to(&packet,(broadcast,crate::lan_discovery::PORT)).is_ok() {sockets.push((s,broadcast));}
+                }
+            }
+        }
+        if sockets.is_empty() {return Err("Не найден доступный локальный IPv4-интерфейс для поиска".into());}
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let mut repeat=false;
+        let mut found=HashMap::<String,Peer>::new();
+        let mut buffer=[0u8;1024];
+        while Instant::now()<deadline {
+            if !repeat && deadline.saturating_duration_since(Instant::now())<Duration::from_secs(2) {
+                for (s,broadcast) in &sockets {let _=s.send_to(&packet,(*broadcast,crate::lan_discovery::PORT));} repeat=true;
+            }
+            for (socket,_) in &sockets {
+                // Bounded receive work even on a noisy LAN.
+                for _ in 0..32 {
+                    let Ok((size,peer))=socket.recv_from(&mut buffer) else {break};
+                    if !local(peer.ip()) || peer.port()!=crate::lan_discovery::PORT {continue;}
+                    let Ok(reply)=open(&key,&buffer[..size],DISCOVER_RESPONSE) else {continue};
+                    if reply["requestId"]!=request_id {continue;}
+                    let Some(id)=reply["id"].as_str().filter(|id|*id!=own_id && uuid::Uuid::parse_str(id).is_ok()) else {continue};
+                    let Ok(device_name)=name(reply["name"].as_str().unwrap_or("")) else {continue};
+                    if found.len()<256 {found.insert(id.into(),Peer{id:id.into(),address:peer.ip().to_string(),name:device_name.clone(),reported_name:device_name,last_seen:crate::model::now()});}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let mut s=self.state.lock().unwrap();
+        let mut config=s.config.clone();let mut changed=false;
+        for saved in &mut config.peers {if let Some(peer)=found.get(&saved.id) {
+            changed|=saved.address!=peer.address;saved.address=peer.address.clone();
+        }}
+        if changed {self.persist(&config)?;s.config=config;}
+        let mut peers:Vec<_>=found.into_values().collect();peers.sort_by(|a,b|a.name.cmp(&b.name));
+        Ok(json!({"peers":peers}))
     }
     fn serve(&self, stream: &mut TcpStream) -> Result<(), String> {
         let key = {
@@ -432,13 +509,14 @@ impl Lan {
             }
         }
         match action {
+            "lan_discover" => self.discover(),
             "lan_firewall" => {
                 use base64::Engine;
                 let exe = std::env::current_exe()
                     .map_err(|e| e.to_string())?
                     .to_string_lossy()
                     .replace('\'', "''");
-                let script=format!("$ErrorActionPreference='Stop'; Get-NetFirewallRule -Name 'Atlas-LAN-Diagnostics' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; New-NetFirewallRule -Name 'Atlas-LAN-Diagnostics' -DisplayName 'Atlas LAN diagnostics' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {PORT} -RemoteAddress LocalSubnet -Profile Private -Program '{exe}' | Out-Null");
+                let script=format!("$ErrorActionPreference='Stop'; Get-NetFirewallRule -Name 'Atlas-LAN-Diagnostics' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; New-NetFirewallRule -Name 'Atlas-LAN-Diagnostics' -DisplayName 'Atlas LAN diagnostics' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {PORT} -RemoteAddress LocalSubnet -Profile Private -Program '{exe}' | Out-Null; Get-NetFirewallRule -Name 'Atlas-LAN-Discovery' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; New-NetFirewallRule -Name 'Atlas-LAN-Discovery' -DisplayName 'Atlas LAN discovery' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 17944 -RemoteAddress LocalSubnet -Profile Private -Program '{exe}' | Out-Null");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(
                     script
                         .encode_utf16()
@@ -460,7 +538,7 @@ impl Lan {
             "lan_state" => {
                 let s = self.state.lock().unwrap();
                 Ok(
-                    json!({"id":s.config.id,"name":s.config.name,"enabled":s.config.enabled,"peers":s.config.peers,"listenerError":s.listener_error,"port":PORT}),
+                    json!({"id":s.config.id,"name":s.config.name,"enabled":s.config.enabled,"peers":s.config.peers,"listenerError":s.listener_error,"discoveryError":s.discovery_error,"port":PORT}),
                 )
             }
             "lan_save" => {
@@ -584,9 +662,27 @@ impl Lan {
     }
 }
 
+fn discovery_reply(key:&[u8;32],packet:&[u8],id:&str,device_name:&str)->Option<Vec<u8>> {
+    let request=open(key,packet,DISCOVER_REQUEST).ok()?;
+    if !request["at"].as_u64().is_some_and(|at|crate::model::now().abs_diff(at)<=120) ||
+        !request["id"].as_str().is_some_and(|v|uuid::Uuid::parse_str(v).is_ok()) {return None;}
+    seal(key,&json!({"requestId":request["id"],"id":id,"name":device_name}),DISCOVER_RESPONSE).ok()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_returns_only_authenticated_names_and_correlates_nonce() {
+        let key=[7;32];let id=uuid::Uuid::new_v4().to_string();
+        let packet=seal(&key,&json!({"id":id,"at":crate::model::now()}),DISCOVER_REQUEST).unwrap();
+        let reply=discovery_reply(&key,&packet,"device-id","Бухгалтерия").unwrap();
+        let decoded=open(&key,&reply,DISCOVER_RESPONSE).unwrap();
+        assert_eq!(decoded["name"],"Бухгалтерия");assert_eq!(decoded["requestId"],id);
+        assert!(discovery_reply(&[8;32],&packet,"id","Name").is_none());
+        assert!(discovery_reply(&key,&reply,"id","Name").is_none());
+        let stale=seal(&key,&json!({"id":id,"at":0}),DISCOVER_REQUEST).unwrap();
+        assert!(discovery_reply(&key,&stale,"id","Name").is_none());
+    }
     #[test]
     fn encrypted_frames_reject_wrong_password_tampering_and_reflection() {
         let key = derive("test-password").unwrap();

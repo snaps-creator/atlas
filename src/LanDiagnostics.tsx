@@ -15,6 +15,7 @@ type State = {
   enabled: boolean;
   peers: Peer[];
   listenerError?: string;
+  discoveryError?: string;
   port: number;
 };
 type Report = {
@@ -40,6 +41,9 @@ export function LanDiagnostics() {
     [report, setReport] = useState<Report>();
   const [cached, setCached] = useState(false),
     [online, setOnline] = useState<Record<string, boolean>>({});
+  const [discovered, setDiscovered] = useState<Peer[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const discoveryBusy = useRef(false);
   const liveToken = useRef("");
   const peers = useRef<Peer[]>([]);
   peers.current = state?.peers ?? [];
@@ -68,6 +72,17 @@ export function LanDiagnostics() {
     if (t !== liveToken.current) return;
     setState(s);
     if (initial) setLocalName(s.name);
+  }
+  async function discover() {
+    if (discoveryBusy.current) return;
+    discoveryBusy.current = true;
+    setDiscovering(true);
+    try {
+      const result = await call<{peers: Peer[]}>("lan_discover");
+      setDiscovered(result.peers);
+      await refresh();
+    } catch (e) { if (liveToken.current) setError(String(e)); }
+    finally { discoveryBusy.current = false; setDiscovering(false); }
   }
   async function run(task: () => Promise<void>) {
     setBusy(true);
@@ -121,6 +136,7 @@ export function LanDiagnostics() {
       if (pending) return;
       pending = true;
       try {
+        await discover();
         for (const p of peers.current) {
           if (cancelled) break;
           try {
@@ -164,6 +180,7 @@ export function LanDiagnostics() {
               setToken(v.token);
               setConfigured(true);
               await refresh(true);
+              void discover();
             });
           }}
         >
@@ -252,7 +269,7 @@ export function LanDiagnostics() {
         </label>
       </div>
       <p className="footnote">
-        Для входящих подключений используется TCP {state?.port ?? 17943}, только
+        Для входящих подключений используется TCP {state?.port ?? 17943} и UDP 17944 для поиска, только
         локальная сеть. Компьютер должен быть включён, Atlas — запущен;
         подключение VPN не обязательно.
       </p>
@@ -274,6 +291,20 @@ export function LanDiagnostics() {
       {state?.listenerError && (
         <p role="alert">Не удалось включить приём: {state.listenerError}</p>
       )}
+      {state?.enabled && state.discoveryError && <p role="alert">Не удалось включить обнаружение: {state.discoveryError}</p>}
+      <div className="lan-heading">
+        <h3>Найдены в сети</h3>
+        <button disabled={discovering} onClick={() => void discover()}>{discovering ? "Поиск…" : "Обновить список"}</button>
+      </div>
+      <p>Здесь появляются компьютеры с включённым обменом Atlas и одинаковым паролем. Выберите имя — IP вводить не нужно.</p>
+      <div className="lan-peers">
+        {discovered.map(p => <article className="lan-peer" key={p.id}>
+          <strong>{p.name}</strong><span>На связи · {p.address}</span>
+          <button disabled={busy} onClick={() => void run(async () => { await fetchPeer(p); await refresh(); })}>Открыть диагностику</button>
+        </article>)}
+      </div>
+      {!discovering && !discovered.length && <p>Компьютеры не найдены. На них должны быть включены обмен и приём в брандмауэре; функция поиска требует обновления Atlas на этих ПК.</p>}
+      <details><summary>Подключиться по IP вручную</summary>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -300,6 +331,7 @@ export function LanDiagnostics() {
         </label>
         <button disabled={busy}>Подключить</button>
       </form>
+      </details>
       <p role="alert">{error}</p>
       <div className="lan-peers">
         {state?.peers.map((p) => (
@@ -345,7 +377,7 @@ export function LanDiagnostics() {
       {!state?.peers.length && (
         <p>
           Компьютеры ещё не добавлены. Включите обмен в Atlas на другом ПК и
-          укажите его IP.
+          нажмите «Обновить список».
         </p>
       )}
       {report && (

@@ -49,7 +49,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { boundedLatency, boundedBatch, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
+import { boundedLatency, testPool, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel, connectionProtection, afterConnectionReady } from "./protection";
@@ -409,27 +409,16 @@ function App() {
     return () => { alive = false; clearInterval(timer); };
   }, [latencyContext, page]);
   async function testAll() {
-    const entries = servers.map(n => ({name:n.name, token:latencyEpoch.current.begin(latencyContext, n.name)}))
-      .filter(entry => entry.token !== undefined);
-    if (!entries.length) return;
+    if (testingAll) return;
     setTestingAll(true);
-    setLatencies(previous => ({...previous, ...Object.fromEntries(entries.map(({name}) =>
+    setSortLatency(true);
+    const names = [...new Set(servers.map(node => node.name))];
+    setLatencies(previous => ({...previous, ...Object.fromEntries(names.map(name =>
       [name, {status:"testing" as const, delay:null, attempts:0}]))}));
-    let results: Record<string, Latency> = {};
     try {
-      const response = await boundedBatch(request<{revision:number; results:Record<string, Latency>}>("latency_batch"), Math.ceil(servers.length / 10) * 16000 + 5000);
-      if (response.revision !== data?.revision) throw new Error("Конфигурация изменилась во время проверки");
-      results = Object.fromEntries(Object.entries(response.results).map(([name,result]) => [name,{...result,measuredAt:Date.now()}]));
-    } catch (error) {
-      results = Object.fromEntries(entries.map(({name}) => [name,
-        {status:"error",delay:null,attempts:0,error:String(error)}]));
-    } finally {
-      const current = entries.filter(({name,token}) => latencyEpoch.current.current(name, token!));
-      setLatencies(previous => ({...previous, ...Object.fromEntries(current.map(({name}) => [name,
-        results[name] ?? {status:"error",delay:null,attempts:0,error:"Нет результата ядра"}]))}));
-      for (const {name,token} of entries) latencyEpoch.current.finish(name,token!);
-      setTestingAll(false);
-    }
+      // Each invocation publishes its own result; slow peers never hold up fast ones.
+      await testPool(names, test, 10);
+    } finally { setTestingAll(false); }
   }
   async function test(name: string) {
     const token = latencyEpoch.current.begin(latencyContext, name);
@@ -899,7 +888,7 @@ function App() {
                             selected={s?.selected === n.name || (connected && activeServer === n.name)}
                             favorite={s?.favorites.includes(n.name) ?? false}
                             latency={latencies[n.name]} disabled={busy}
-                            testing={!connected || testingAll || latencies[n.name]?.status === "testing"}
+                            testing={!connected || latencies[n.name]?.status === "testing"}
                             onSelect={() => s && run(() => save({ ...s, selected: n.name }))}
                             onTest={() => run(() => test(n.name))}
                             onFavorite={() => s && run(() => save({ ...s, favorites: s.favorites.includes(n.name) ? s.favorites.filter(f => f !== n.name) : [...s.favorites, n.name] }))}

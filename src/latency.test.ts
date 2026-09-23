@@ -78,3 +78,20 @@ test("проверки ограничены и результаты поступ
   expect(done[0]).not.toBe(1);
   expect(done.sort()).toEqual([1, 2, 3, 4, 5, 6, 7]);
 });
+
+test("быстрый результат публикуется, пока медленный сервер ещё проверяется", async () => {
+  let release!: () => void;
+  const slow = new Promise<void>(resolve => { release = resolve; });
+  const shown: string[] = [];
+  let finished = false;
+  const batch = testPool(["slow", "fast"], async name => {
+    if (name === "slow") await slow;
+    shown.push(name);
+  }, 2).then(() => { finished = true; });
+  await Promise.resolve();
+  expect(shown).toEqual(["fast"]);
+  expect(finished).toBe(false);
+  release();
+  await batch;
+  expect(shown).toEqual(["fast", "slow"]);
+});

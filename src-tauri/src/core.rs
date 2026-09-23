@@ -725,13 +725,18 @@ impl ApiClient {
                 // Reads, including connections/status, must not hold the command
                 // loop while the core is stalled. Stop/select retain access to IPC.
                 let delay = path.contains("/delay?");
-                let job = broker.call(if delay { "delay" } else { "query" }, json!({"path":path}))?;
+                let _permit = crate::query_admission::acquire(delay)?;
+                let job = crate::query_admission::retry_busy(Instant::now()+Duration::from_secs(5), ||
+                    broker.call(if delay { "delay" } else { "query" }, json!({"path":path})))?;
                 let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
                     if Instant::now() >= deadline {
                         return Err("Проверка сервера превысила время ожидания".into());
                     }
-                    let result = broker.call("delay_result", json!({"id":job["id"]}))?;
+                    // A busy IPC lock must not abandon a running job and fill
+                    // the service queue with orphan results for 30 seconds.
+                    let result = crate::query_admission::retry_busy(deadline, ||
+                        broker.call("delay_result", json!({"id":job["id"]})))?;
                     if result["done"] == true {
                         return Ok(result["value"].clone());
                     }
