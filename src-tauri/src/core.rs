@@ -228,6 +228,10 @@ impl Core {
         // Mihomo exposes its controller before creating the TUN adapter.
         // A false enable flag during that interval is pending, not a failure.
         let deadline = Instant::now() + Duration::from_secs(if s.mode == "tun" { 60 } else { 5 });
+        // Cold Windows CI workers concurrently start several real-core fixtures.
+        // Give test processes scheduling headroom without changing app deadlines.
+        #[cfg(test)]
+        let deadline = deadline + Duration::from_secs(25);
         while Instant::now() < deadline {
             if self.cancelled() {
                 self.stop()?;
@@ -287,6 +291,10 @@ impl Core {
         } else {
             "Mihomo не прошёл проверку запуска".into()
         };
+        #[cfg(test)]
+        let error = format!("{error}; fixture core log: {}", self.logs.lock()
+            .map(|lines| lines.iter().rev().take(8).cloned().collect::<Vec<_>>().join(" | "))
+            .unwrap_or_else(|_| "log unavailable".into()));
         self.stop()?;
         Err(error)
     }
