@@ -1,5 +1,7 @@
 # Atlas Alpha 2.0.1
 
+Для каждого PR сборка **Build signed PR installer** создаёт скачиваемый артефакт `Atlas-Alpha-2.0.1-Windows-x64-PR-<номер>`. В ZIP находятся настоящий EXE, его подпись `.sig` и `SHA256SUMS.txt`. Это результат новой сборки коммита PR, а не Git LFS-указатель. Откройте проверку PR → Summary → Artifacts и скачайте этот архив.
+
 Скачайте готовые файлы напрямую:
 
 - [Установщик Windows x64 (.exe)](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas_2.0.1-alpha.1_x64-setup.exe)
