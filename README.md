@@ -3,24 +3,20 @@
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
 
-Windows-приложение Atlas Beta 18.1.2 на React, TypeScript, Tauri 2, Rust и Mihomo.
+Windows-приложение Atlas Alpha 2.0.1 на React, TypeScript, Tauri 3 + CEF, Rust и Mihomo.
 Подробный статус реализации и подтверждённых проверок: [STATUS.md](STATUS.md).
 
 ## Сборка
 
-Windows 10/11 x64, WebView2, Node.js, Rust MSVC, Microsoft C++ Build Tools и Windows SDK.
+Windows 10/11 x64, Node.js, Rust MSVC, Microsoft C++ Build Tools и Windows SDK.
 
 ```powershell
-npm ci
-./scripts/fetch-core.ps1
-npm test
-cargo test --manifest-path src-tauri/Cargo.toml --lib
-npm run tauri build
+./scripts/build-local.ps1
 ```
 
 Актуальный установщик и соответствующая подпись `.sig` публикуются в [GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest) после успешной сборки. Устаревшие бинарные файлы из корня удалены.
-Исходный bundle после сборки: `src-tauri/target/release/bundle/nsis/Atlas_1.0.0-beta.18.1.2_x64-setup.exe`.
-Ядро и локальная GeoIP-база включены в проект. Контрольные суммы находятся в `src-tauri/resources`.
+Локальная сборка без публикации: `scripts/build-local.ps1`. Без отчёта приёмки скрипт оставляет только непроверенный кандидат в каталоге сборки; в «Загрузки» его не копирует. Текущий статус и блокеры выпуска — в `STATUS.md`.
+Ядро и локальная GeoIP-база включены в проект. `fetch-core.ps1` воспроизводит ядро из локально установленного Clash Verge 2.5.2 с закреплённой контрольной суммой; сведения и хэши находятся в `src-tauri/resources`.
 Дистрибутив пока не подписан издательским сертификатом, поэтому Windows показывает
 «Неизвестный издатель» при установке. При обычном запуске Atlas этот запрос больше
 не появляется: привилегированные сетевые операции выполняет установленная служба.
@@ -75,4 +71,4 @@ SQLite и 20 резервных состояний защищены Windows DPAP
 - `rule_probe.rs`, `latency.rs`, `network_diagnostics.rs`: измерения и диагностика.
 - `storage.rs`, `subscriptions.rs`: настройки и подписки.
 
-Mihomo 1.19.31 и GeoIP распространяются с лицензиями в ресурсах. Исходники используемой версии Mihomo находятся в `third_party`.
+Mihomo 1.19.29 и GeoIP распространяются с лицензиями в ресурсах. Исходники используемой версии Mihomo находятся в `third_party`.

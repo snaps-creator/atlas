@@ -1,20 +1,25 @@
-//! Session-owned WFP policy. Only the owned core, loopback and the TUN interface
+//! Atlas-owned session WFP policy. Only the owned core, loopback and the TUN interface
 //! can originate internet traffic. DHCP and local IPv4/IPv6 destinations are
 //! permitted so that the host can keep its address and reach office resources.
-//! Windows releases dynamic filters if the helper dies, restoring prior policy.
-use std::{path::Path, ptr};
+//! The dynamic WFP session disappears when the service exits, including a hard
+//! crash. Legacy persistent filters are removed by their exact Atlas keys.
+use std::{path::Path, ptr, sync::Mutex};
 use windows_sys::{
     core::GUID,
     Win32::{
         Foundation::HANDLE,
         NetworkManagement::{
-            IpHelper::ConvertInterfaceAliasToLuid, Ndis::NET_LUID_LH, WindowsFilteringPlatform::*,
+            IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid},
+            Ndis::NET_LUID_LH, WindowsFilteringPlatform::*,
         },
     },
 };
-const SUBLAYER: GUID = GUID::from_u128(0xe12a8041_d824_4776_978b_31a129691c00);
+const LEGACY_SUBLAYER: GUID = GUID::from_u128(0xe12a8041_d824_4776_978b_31a129691c00);
+const SESSION_SUBLAYER: GUID = GUID::from_u128(0xe12a8041_d824_4776_978b_31a129691c01);
+const LEGACY_FILTER_BASE: u128 = 0xe12a8041_d824_4776_978b_31a129692000;
+const SESSION_FILTER_BASE: u128 = 0xe12a8041_d824_4776_978b_31a129693000;
 fn key(index: u128) -> GUID {
-    GUID::from_u128(0xe12a8041_d824_4776_978b_31a129692000 + index)
+    GUID::from_u128(SESSION_FILTER_BASE + index)
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -28,10 +33,7 @@ fn checked(code: u32, op: &str) -> Result<(), String> {
 }
 struct Engine(HANDLE);
 impl Engine {
-    fn open() -> Result<Self, String> {
-        Self::with_session(false)
-    }
-    fn with_session(dynamic: bool) -> Result<Self, String> {
+    fn open(dynamic: bool) -> Result<Self, String> {
         unsafe {
             let mut h = ptr::null_mut();
             let mut session: FWPM_SESSION0 = std::mem::zeroed();
@@ -55,37 +57,79 @@ impl Drop for Engine {
         }
     }
 }
-unsafe fn erase(engine: HANDLE) -> Result<(), String> {
+unsafe fn erase(engine: HANDLE, sublayer: &GUID, filter_base: u128) -> Result<(), String> {
     for i in 0..(10 + crate::lan_policy::PREFIXES.len() as u128) {
-        let r = FwpmFilterDeleteByKey0(engine, &key(i));
+        let r = FwpmFilterDeleteByKey0(engine, &GUID::from_u128(filter_base + i));
         if r != 0 && r != 0x80320003 {
             return Err(format!("Не удалось удалить фильтр Атласа: {r:#x}"));
         }
     }
-    let r = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER);
+    let r = FwpmSubLayerDeleteByKey0(engine, sublayer);
     if r != 0 && r != 0x80320007 {
         return Err(format!("Не удалось удалить слой Атласа: {r:#x}"));
     }
     Ok(())
 }
 pub fn clear() -> Result<(), String> {
-    let e = Engine::open()?;
+    // Migration and uninstall only: delete the exact old Atlas-owned keys.
+    // Current session filters are lifetime-bound to their service handle.
+    let e = Engine::open(false)?;
     unsafe {
         checked(FwpmTransactionBegin0(e.0, 0), "транзакция")?;
-        if let Err(err) = erase(e.0) {
+        if let Err(err) = erase(e.0, &LEGACY_SUBLAYER, LEGACY_FILTER_BASE) {
             FwpmTransactionAbort0(e.0);
             return Err(err);
         }
         checked(FwpmTransactionCommit0(e.0), "завершение транзакции")
     }
 }
-pub struct Guard(Engine);
+pub struct Guard {
+    engine: Engine,
+    owned_tun: Mutex<Option<(u64, u128)>>,
+}
+
+fn guid_value(guid: GUID) -> u128 {
+    ((guid.data1 as u128) << 96)
+        | ((guid.data2 as u128) << 80)
+        | ((guid.data3 as u128) << 64)
+        | u64::from_be_bytes(guid.data4) as u128
+}
 
 pub fn tun_identity() -> Option<u64> {
     unsafe {
         let mut tun: NET_LUID_LH = std::mem::zeroed();
         (ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut tun) == 0)
             .then_some(tun.Value)
+    }
+}
+
+/// Stable identity of physical default routes. Changing Wi-Fi, gateway or VPN
+/// uplink starts a new health epoch without treating the old network's failed
+/// probes as evidence against servers on the new one.
+pub fn default_route_signature() -> Option<String> {
+    use windows_sys::Win32::{
+        NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2},
+        Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC},
+    };
+    unsafe {
+        let mut table = ptr::null_mut();
+        if GetIpForwardTable2(AF_UNSPEC, &mut table) != 0 { return None; }
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let tun = tun_identity();
+        let mut routes: Vec<String> = rows.iter().filter(|r|
+            r.DestinationPrefix.PrefixLength == 0 && r.Loopback == 0 && Some(r.InterfaceLuid.Value) != tun
+        ).map(|r| {
+            let family = r.NextHop.si_family;
+            let gateway = if family == AF_INET {
+                format!("{:08x}", r.NextHop.Ipv4.sin_addr.S_un.S_addr)
+            } else if family == AF_INET6 {
+                format!("{:02x?}", r.NextHop.Ipv6.sin6_addr.u.Byte)
+            } else { String::new() };
+            format!("{}:{}:{}", r.InterfaceLuid.Value, r.Metric, gateway)
+        }).collect();
+        FreeMibTable(table.cast());
+        routes.sort();
+        Some(routes.join("|"))
     }
 }
 
@@ -96,6 +140,9 @@ pub fn check_competing_routes() -> Result<(), String> {
         NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2},
         Networking::WinSock::AF_UNSPEC,
     };
+    if tun_identity().is_some() {
+        return Err("Интерфейс Atlas-TUN уже существует до запуска ядра. Его происхождение не подтверждено; Atlas не будет его менять".into());
+    }
     unsafe {
         let mut table = ptr::null_mut();
         checked(
@@ -116,24 +163,45 @@ pub fn check_competing_routes() -> Result<(), String> {
 }
 
 impl Guard {
-    pub fn prepare(_core: &Path) -> Result<Self, String> {
-        clear()?; // Remove only Atlas-owned filters left by older releases.
-                  // Do not block the entire host while the adapter has not even been created.
-                  // The caller reports Connected only after install has committed the policy.
-        Ok(Self(Engine::with_session(true)?))
+    pub fn prepare(core: &Path) -> Result<Self, String> {
+        if tun_identity().is_some() {
+            return Err("Atlas-TUN появился до запуска ядра; его происхождение не подтверждено".into());
+        }
+        let guard = Self { engine: Engine::open(true)?, owned_tun: Mutex::new(None) };
+        // The protected pause exists only while this service session lives.
+        guard.policy(core, false)?;
+        Ok(guard)
     }
     pub fn install(&self, core: &Path) -> Result<(), String> {
         self.policy(core, true)
     }
+    pub fn pause(&self, core: &Path) -> Result<(), String> {
+        self.policy(core, false)
+    }
+    pub fn reset_for_recovery(&self) -> Result<(), String> {
+        if tun_identity().is_some() {
+            return Err("Старый Atlas-TUN ещё существует; восстановление остановлено".into());
+        }
+        *self.owned_tun.lock().map_err(|_| "Не удалось сбросить идентификатор TUN")? = None;
+        Ok(())
+    }
     fn policy(&self, core: &Path, tun_ready: bool) -> Result<(), String> {
-        let e = &self.0;
+        let e = &self.engine;
         unsafe {
             let mut luid: NET_LUID_LH = std::mem::zeroed();
+            let mut tun_instance = None;
             if tun_ready {
                 checked(
                     ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut luid),
                     "интерфейс Atlas-TUN не найден",
                 )?;
+                let mut guid: GUID = std::mem::zeroed();
+                checked(ConvertInterfaceLuidToGuid(&luid, &mut guid), "GUID Atlas-TUN не найден")?;
+                tun_instance = Some((luid.Value, guid_value(guid)));
+                if self.owned_tun.lock().map_err(|_| "Не удалось проверить идентификатор TUN")?
+                    .is_some_and(|owned| Some(owned) != tun_instance) {
+                    return Err("Идентификатор Atlas-TUN изменился: запрещено привязывать защиту к неподтверждённому интерфейсу".into());
+                }
             }
             let mut app_id = ptr::null_mut();
             checked(
@@ -142,11 +210,10 @@ impl Guard {
             )?;
             let outcome = (|| {
                 checked(FwpmTransactionBegin0(e.0, 0), "транзакция")?;
-                erase(e.0)?;
+                erase(e.0, &SESSION_SUBLAYER, SESSION_FILTER_BASE)?;
                 let mut name = wide("Атлас — защита VPN");
                 let mut sub: FWPM_SUBLAYER0 = std::mem::zeroed();
-                sub.subLayerKey = SUBLAYER;
-                sub.flags = 0;
+                sub.subLayerKey = SESSION_SUBLAYER;
                 sub.displayData.name = name.as_mut_ptr();
                 sub.weight = 0x100;
                 checked(FwpmSubLayerAdd0(e.0, &sub, ptr::null_mut()), "слой")?;
@@ -188,8 +255,7 @@ impl Guard {
                         filter.filterKey = key((family * 4 + kind) as u128);
                         filter.displayData.name = name.as_mut_ptr();
                         filter.layerKey = layer;
-                        filter.subLayerKey = SUBLAYER;
-                        filter.flags = 0;
+                        filter.subLayerKey = SESSION_SUBLAYER;
                         filter.weight.r#type = FWP_UINT8;
                         filter.weight.Anonymous.uint8 = if kind == 3 { 1 } else { 10 };
                         filter.action.r#type = if kind == 3 {
@@ -255,6 +321,9 @@ impl Guard {
                 FwpmTransactionAbort0(e.0);
             }
             FwpmFreeMemory0(&mut app_id as *mut _ as *mut _);
+            if outcome.is_ok() && tun_ready {
+                *self.owned_tun.lock().map_err(|_| "Не удалось записать идентификатор TUN")? = tun_instance;
+            }
             outcome
         }
     }
@@ -274,7 +343,7 @@ unsafe fn permit(
     filter.filterKey = key(id);
     filter.displayData.name = name;
     filter.layerKey = layer;
-    filter.subLayerKey = SUBLAYER;
+    filter.subLayerKey = SESSION_SUBLAYER;
     filter.weight.r#type = FWP_UINT8;
     filter.weight.Anonymous.uint8 = 10;
     filter.action.r#type = FWP_ACTION_PERMIT;

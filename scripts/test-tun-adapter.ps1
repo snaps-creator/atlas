@@ -1,12 +1,17 @@
-param([Parameter(Mandatory=$true)][string]$OutputDirectory, [switch]$AsSystem)
+param([Parameter(Mandatory=$true)][string]$OutputDirectory, [switch]$AsSystem, [switch]$ConfirmedIsolatedVm)
 $ErrorActionPreference = 'Stop'
+if (-not $ConfirmedIsolatedVm) { throw 'This TUN fault test is restricted to an isolated Windows VM.' }
+$computer = Get-CimInstance Win32_ComputerSystem
+if ("$($computer.Manufacturer) $($computer.Model)" -notmatch 'QEMU|Virtual Machine|VMware|VirtualBox|Standard PC \(Q35') {
+    throw 'Virtual-machine hardware identity was not detected; refusing the TUN fault test.'
+}
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'This isolated adapter test requires administrator rights.'
 }
 if ($AsSystem) {
     $taskName = 'Atlas-Adapter-Probe-' + [guid]::NewGuid().ToString('N')
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -OutputDirectory "' + $OutputDirectory + '"'
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -OutputDirectory "' + $OutputDirectory + '" -ConfirmedIsolatedVm'
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     try {
@@ -21,7 +26,7 @@ if ($AsSystem) {
     }
     return
 }
-$binary = Join-Path (Split-Path $PSScriptRoot -Parent) 'src-tauri\resources\mihomo.exe'
+$binary = Join-Path (Split-Path $PSScriptRoot -Parent) 'src-tauri\resources\Atlas.Core.exe'
 if (Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue) {
     throw 'Atlas-TUN already exists; refusing to touch an existing adapter.'
 }

@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 /// Compare only generated network settings, ignoring the selector's initial order.
 /// UI preferences must never cause TUN reconfiguration.
 pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
+    if previous.auto_test_interval_seconds != next.auto_test_interval_seconds { return false; }
     let mut comparison = next.clone();
     comparison.selected = previous.selected.clone();
     generate(&comparison, "comparison")
@@ -54,14 +55,8 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     selection.extend(names.clone());
     let mut seen = std::collections::HashSet::new();
     selection.retain(|n| seen.insert(n.clone()));
-    let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"url-test","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"tolerance":50,"lazy":false},{"name":"FAILOVER","type":"fallback","proxies":names,"url":"https://www.gstatic.com/generate_204","interval":s.auto_test_interval_seconds,"lazy":false}],"rules":rules::compile(s)?});
+    let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"select","proxies":names},{"name":"FAILOVER","type":"select","proxies":names}],"rules":rules::compile(s)?});
     doc["mode"] = json!(s.routing_mode);
-    for group in doc["proxy-groups"].as_array_mut().unwrap() {
-        if group["type"] == "url-test" || group["type"] == "fallback" {
-            group["expected-status"] = json!("204");
-            group["timeout"] = json!(5000);
-        }
-    }
     // Pin global traffic to Atlas instead of Mihomo's generated DIRECT default.
     doc["proxy-groups"]
         .as_array_mut()
@@ -112,7 +107,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         doc["dns"]["proxy-server-nameserver"] =
             json!(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]);
         doc["dns"]["default-nameserver"] =
-            json!(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]);
+            json!(["1.1.1.1", "8.8.8.8"]);
         // Capture all destinations; DIRECT/PROXY/REJECT are decided inside the core.
         // Preserve the user's default route rather than replacing MATCH unconditionally.
         doc["tun"]["disable-icmp-forwarding"] = json!(true);
@@ -160,6 +155,9 @@ mod tests {
         assert_eq!(y["rules"][0], "MATCH,DIRECT");
         assert_eq!(y["allow-lan"], false);
         assert_eq!(y["unified-delay"], true);
+        assert_eq!(y["proxy-groups"][1]["type"], "select");
+        assert_eq!(y["proxy-groups"][2]["type"], "select");
+        assert!(y["proxy-groups"][1]["url"].is_null());
         assert_eq!(y["dns"]["enhanced-mode"], "fake-ip");
         assert!(!y["proxy-groups"][1]["proxies"]
             .as_array()
@@ -195,6 +193,7 @@ mod tests {
                 .any(|n| n.contains(&ip.parse::<std::net::IpAddr>().unwrap())));
         }
         assert_eq!(tun["dns"]["fake-ip-range"], "198.19.0.1/16");
+        assert_eq!(tun["dns"]["default-nameserver"], json!(["1.1.1.1", "8.8.8.8"]));
         assert_eq!(tun["tun"]["inet6-address"][0], "fd72:6174:6c61::1/126");
         assert_eq!(tun["ipv6"], false);
         assert_eq!(tun["rules"][0], "IP-CIDR6,::/0,REJECT,no-resolve");
@@ -208,12 +207,11 @@ mod tests {
             .unwrap()
             .ends_with("#ATLAS"));
         assert_eq!(tun["proxies"][0]["udp"], true);
-        assert_eq!(tun["proxy-groups"][1]["interval"], 300);
-        assert_eq!(tun["proxy-groups"][2]["interval"], 300);
+        assert!(tun["proxy-groups"][1]["interval"].is_null());
+        assert!(tun["proxy-groups"][2]["interval"].is_null());
         s.auto_test_interval_seconds = 60;
         let faster: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
-        assert_eq!(faster["proxy-groups"][1]["interval"], 60);
-        assert_eq!(faster["proxy-groups"][2]["interval"], 60);
+        assert_eq!(faster["proxy-groups"], tun["proxy-groups"]);
         s.default_route = Route::Direct;
         let direct: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(

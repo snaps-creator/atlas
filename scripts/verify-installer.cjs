@@ -27,7 +27,9 @@ if (require.main === module) {
   try {
     const config = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
     const version = config.version.replace(/^1\.0\.0-beta\./,'');
-    const file = process.argv[2] || `Atlas Beta ${version} Setup.exe`;
+    const alpha = /^(\d+\.\d+\.\d+)-alpha(?:\..*)?$/.exec(config.version);
+    const label = alpha ? `Alpha ${alpha[1]}` : config.version.startsWith('1.0.0-beta.') ? `Beta ${version}` : config.version;
+    const file = process.argv[2] || `Atlas ${label} Setup.exe`;
     const result = verifySignature(fs.readFileSync(file),fs.readFileSync(file+'.sig','utf8'),config.plugins.updater.pubkey);
     console.log(JSON.stringify({verified:true,version:config.version,file,...result}));
   } catch (error) { console.error(error.message); process.exitCode=1; }

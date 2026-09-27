@@ -10,8 +10,6 @@ mod diagnostics;
 mod job;
 mod lan_policy;
 mod latency;
-#[cfg(test)]
-mod auto_recovery;
 mod resilient_selection;
 mod model;
 mod network_guard;
@@ -24,7 +22,6 @@ mod rule_probe;
 mod rules;
 mod service;
 mod session_cleanup;
-mod shutdown;
 mod storage;
 mod subscriptions;
 mod support_report;
@@ -77,7 +74,7 @@ impl App {
                 *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p)});
             }
         }
-        let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs});
+        let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs,"buildId":env!("ATLAS_BUILD_ID")});
         let mut value = value;
         value["revision"] = json!(self.revision);
         self.published.set(value.clone());
@@ -85,6 +82,9 @@ impl App {
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
         next.mode = "tun".into();
+        if next.rules_semantics_version < self.settings.rules_semantics_version {
+            return Err("Возврат к старой семантике правил требует отдельной миграции".into());
+        }
         if next.tun_stack != self.settings.tun_stack && self.core.running() {
             return Err("Перед изменением сетевого стека отключите VPN".into());
         }
@@ -102,6 +102,7 @@ impl App {
         }
         let same_config = config::same_network_config(&self.settings, &next);
         let selection_only = same_config && next.selected != self.settings.selected;
+        let mut changed_live = false;
         if !next.subscriptions.is_empty() {
             if selection_only {
                 if !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
@@ -111,19 +112,30 @@ impl App {
                 }
                 if self.core.running() {
                     self.core.select(&next.selected)?;
+                    changed_live = true;
                 }
             } else if !same_config {
+                changed_live = self.core.service_reachable();
                 self.core.apply(&next)?;
             }
         }
         let previous = self.settings.clone();
         if let Err(e) = self.store.save(&next) {
-            if self.core.running() {
+            let rollback = if changed_live {
                 if selection_only {
-                    let _ = self.core.select(&previous.selected);
+                    self.core.select(&previous.selected)
                 } else if !same_config {
-                    let _ = self.core.apply(&previous);
-                }
+                    self.core.apply(&previous)
+                } else { Ok(()) }
+            } else { Ok(()) };
+            if let Err(rollback_error) = rollback {
+                let directory = self.core.directory.clone();
+                let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
+                self.status = if cleanup.is_err() { "CleanupError" } else { "Error" }.into();
+                let error = format!("Не удалось сохранить настройки: {e}; откат не подтверждён: {rollback_error}{}",
+                    cleanup.err().map(|failure| format!("; {failure}")).unwrap_or_default());
+                self.error = Some(error.clone());
+                return Err(error);
             }
             return Err(e);
         }
@@ -132,6 +144,9 @@ impl App {
         Ok(())
     }
     fn connect(&mut self) -> Result<(), String> {
+        if self.status == "CleanupError" {
+            return Err("Сначала завершите безопасное восстановление сети Atlas".into());
+        }
         if self.status == "Connected" && self.core.running() {
             return Ok(());
         }
@@ -156,11 +171,18 @@ impl App {
                 }
                 self.settings.was_connected = true;
                 if let Err(e) = self.store.save(&self.settings) {
-                    let _ = windows::restore(&self.core.directory.join("proxy-restore.json"));
-                    self.status = "Error".into();
-                    self.error = Some(e.clone());
-                    let _ = self.core.stop();
-                    return Err(e);
+                    self.settings.was_connected = false;
+                    let directory = self.core.directory.clone();
+                    let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
+                    let cleanup_failed = cleanup.is_err();
+                    self.core.continue_running = None;
+                    let error = match cleanup {
+                        Ok(()) => e,
+                        Err(cleanup) => format!("{e}; {cleanup}"),
+                    };
+                    self.status = if cleanup_failed { "CleanupError" } else { "Error" }.into();
+                    self.error = Some(error.clone());
+                    return Err(error);
                 }
                 self.status = "Connected".into();
                 self.log(
@@ -174,41 +196,54 @@ impl App {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.core.stop();
+                let directory = self.core.directory.clone();
+                let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
+                let cleanup_failed = cleanup.is_err();
                 self.core.continue_running = None;
-                let _ = windows::restore(&self.core.directory.join("proxy-restore.json"));
-                self.status = if self.reconnect.load(std::sync::atomic::Ordering::SeqCst) { "Error" } else { "Disconnected" }.into();
-                self.error = Some(e.clone());
-                self.log("ERROR", &e);
-                Err(e)
+                let error = match cleanup {
+                    Ok(()) => e,
+                    Err(cleanup) => format!("{e}; {cleanup}"),
+                };
+                self.status = if cleanup_failed { "CleanupError" }
+                    else if self.reconnect.load(std::sync::atomic::Ordering::SeqCst) { "Error" }
+                    else { "Disconnected" }.into();
+                self.error = Some(error.clone());
+                self.log("ERROR", &error);
+                Err(error)
             }
         }
     }
     fn disconnect(&mut self) -> Result<(), String> {
         self.revision = self.revision.wrapping_add(1);
+        self.status = "Stopping".into();
         self.reconnect
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let stopped = self.core.stop();
+        self.cancellation.cancel();
+        let directory = self.core.directory.clone();
+        let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
         self.core.continue_running = None;
-        let restored = windows::restore(&self.core.directory.join("proxy-restore.json"));
-        self.status = "Disconnected".into();
+        if let Err(error) = cleanup {
+            self.status = "CleanupError".into();
+            self.error = Some(error.clone());
+            self.log("ERROR", &error);
+            return Err(error);
+        }
         self.settings.was_connected = false;
-        self.store.save(&self.settings)?;
+        if let Err(error) = self.store.save(&self.settings) {
+            self.status = "CleanupError".into();
+            self.error = Some(format!("Сеть восстановлена, но не удалось сохранить отключённое состояние: {error}"));
+            return Err(self.error.clone().unwrap());
+        }
+        self.status = "Disconnected".into();
+        self.error = None;
         self.log(
             "INFO",
             "Соединение отключено; сетевые настройки восстановлены",
         );
-        stopped?;
-        restored?;
         Ok(())
     }
     fn prepare_restart(&mut self) -> Result<(), String> {
-        let was_connected = self.status == "Connected" && self.core.running();
-        windows::restore(&self.core.directory.join("proxy-restore.json"))?;
-        self.core.stop()?;
-        self.status = "Disconnected".into();
-        self.settings.was_connected = was_connected;
-        self.store.save(&self.settings)?;
+        self.disconnect()?;
         self.log(
             "INFO",
             "Приложение перезапускается; сетевые настройки восстановлены",
@@ -289,6 +324,22 @@ impl App {
                 if let Some(route) = preview.default_route {
                     next.default_route = route;
                 }
+                self.save(next)?;
+            }
+            "rules_migration_preview" => {
+                let old = rules::compile(&self.settings)?;
+                let mut next = self.settings.clone();
+                next.rules_semantics_version = 2;
+                let proposed = rules::compile(&next)?;
+                return Ok(json!({"fromVersion":self.settings.rules_semantics_version,
+                    "toVersion":2,"changed":old != proposed,"before":old,"after":proposed}));
+            }
+            "rules_migration_apply" => {
+                if self.settings.rules_semantics_version != 1 {
+                    return Err("Миграция правил уже выполнена".into());
+                }
+                let mut next = self.settings.clone();
+                next.rules_semantics_version = 2;
                 self.save(next)?;
             }
             "connect" => self.connect()?,
@@ -460,10 +511,10 @@ pub fn cleanup() -> Result<(), String> {
         std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?,
     )
     .join("net.atlasvpn.desktop");
-    windows::restore(&dir.join("proxy-restore.json"))?;
-    // This command runs elevated from the uninstaller. Cleanup must never launch a VPN.
-    network_guard::clear()?;
-    let _ = std::fs::remove_file(dir.join("tun-guard.active"));
+    // Runs elevated from the uninstaller; uses the same session cleanup as
+    // Disconnect and Exit, plus exact-key removal of legacy WFP filters.
+    cleanup_network_session(None, &dir, true)?;
+    windows::restore_loaded_profiles()?;
     use winreg::{enums::*, RegKey};
     for path in [
         r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -476,6 +527,24 @@ pub fn cleanup() -> Result<(), String> {
         }
     }
     Ok(())
+}
+fn cleanup_network_session(
+    core: Option<&mut core::Core>,
+    directory: &std::path::Path,
+    clear_legacy_filters: bool,
+) -> Result<(), String> {
+    let owned_core = core.map(|core| core.stop()).unwrap_or(Ok(()));
+    let service = service::stop_and_wait();
+    let proxy = windows::restore(&directory.join("proxy-restore.json"));
+    let legacy = if clear_legacy_filters { network_guard::clear() } else { Ok(()) };
+    let errors: Vec<_> = [owned_core, service, proxy, legacy].into_iter()
+        .filter_map(Result::err).collect();
+    if errors.is_empty() {
+        let _ = std::fs::remove_file(directory.join("tun-guard.active"));
+        Ok(())
+    } else {
+        Err(format!("Очистка Atlas не завершена: {}", errors.join("; ")))
+    }
 }
 #[tauri::command]
 async fn request(
@@ -494,67 +563,31 @@ async fn request(
         return Ok(app.state::<published_state::PublishedState>().get());
     }
     if action == "pool_probe" {
-        let (client, revision) = {
+        let (client, revision, names) = {
             let a = shared.try_lock().map_err(|_| "Atlas занят; проверка отложена")?;
             if a.status != "Connected" { return Err("Atlas не подключён".into()); }
-            (a.core.client(), a.revision)
+            (a.core.client(), a.revision, a.settings.servers().iter()
+                .filter_map(|n|n["name"].as_str().map(str::to_owned)).collect::<Vec<_>>())
         };
         return tauri::async_runtime::spawn_blocking(move || {
             client.api("GET", "/version", None)?;
             let mut delays = serde_json::Map::new();
-            for endpoint in latency::ENDPOINTS {
-                let url: String = url::form_urlencoded::byte_serialize(endpoint.as_bytes()).collect();
-                match client.api("GET", &format!("/group/AUTO/delay?timeout=5000&expected=204&url={url}"), None) {
-                    Ok(value) => {
-                        let health = client.api("GET","/proxies",None)?;
-                        if let Some(values) = value.as_object() { delays.extend(values.iter()
-                            .filter(|(name,_)|health["proxies"][name.as_str()]["extra"][endpoint]["alive"] == true)
-                            .map(|(name,value)|(name.clone(),value.clone()))); }
-                        if !delays.is_empty() { break; }
-                    }
-                    Err(error) if error == "Mihomo API: HTTP 504" => {}
-                    Err(error) => return Err(error),
+            let primary = latency::verified_batch(client.clone(), &names, latency::DISPLAY_URL);
+            let mut unresolved = Vec::new();
+            for name in &names {
+                if let Some(delay)=primary[name]["delay"].as_u64() { delays.insert(name.clone(),json!(delay)); }
+                else { unresolved.push(name.clone()); }
+            }
+            let mut secondary_healthy = Vec::new();
+            if !unresolved.is_empty() {
+                let secondary = latency::verified_batch(client.clone(), &unresolved, latency::SECONDARY_URL);
+                for name in &unresolved {
+                    if secondary[name]["expectedStatusMatched"] == true { secondary_healthy.push(name.clone()); }
                 }
             }
             client.api("GET", "/version", None)?;
-            Ok(json!({"revision":revision,"delays":delays}))
-        }).await.map_err(|e| e.to_string())?;
-    }
-    if action == "pool_refresh" {
-        let expected = payload.as_ref().and_then(|v| v["revision"].as_u64()).ok_or("Нет ревизии")?;
-        let mut next = {
-            let a = shared.try_lock().map_err(|_| "Atlas занят; восстановление отложено")?;
-            if a.revision != expected || a.status != "Connected" { return Err("Состояние изменилось; восстановление отменено".into()); }
-            a.settings.clone()
-        };
-        return tauri::async_runtime::spawn_blocking(move || {
-            // Download outside the app mutex; status and Disconnect remain responsive.
-            let mut failures = Vec::new();
-            for sub in &mut next.subscriptions {
-                let result = keyring::Entry::new("AtlasVPN", &sub.id)
-                    .map_err(|_| "Хранилище подписки недоступно".to_string())
-                    .and_then(|entry| entry.get_password().map_err(|_| "Ссылка подписки недоступна".to_string()))
-                    .and_then(|url| subscriptions::download(&url, true));
-                match result {
-                    Ok(mut nodes) => {
-                        for (index, node) in nodes.iter_mut().enumerate() {
-                            node["name"] = json!(format!("{} · {}-{}", node["name"].as_str().unwrap_or("Сервер"), sub.id.chars().take(8).collect::<String>(), index + 1));
-                        }
-                        sub.servers = nodes; sub.updated_at = model::now(); sub.error = None;
-                    }
-                    Err(error) => { sub.error = Some(error); failures.push(sub.name.clone()); }
-                }
-            }
-            let mut a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
-            if a.revision != expected || a.status != "Connected" || !a.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err("Состояние изменилось; восстановление отменено".into());
-            }
-            if !["AUTO","FAILOVER"].contains(&next.selected.as_str()) && !next.servers().iter().any(|n|n["name"] == next.selected) {
-                return Err("Выбранный вручную сервер исчез из подписки. Автоматическая замена отменена; выберите сервер явно.".into());
-            }
-            a.save(next)?;
-            a.log("INFO", "Восстановление: обновление подписок завершено; режим выбора сохранён");
-            Ok(json!({"snapshot":a.snapshot(),"failedSubscriptions":failures}))
+            Ok(json!({"revision":revision,"delays":delays,"secondaryHealthy":secondary_healthy,
+                "checkedNodes":names.len()}))
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "connect" || action == "disconnect" {
@@ -752,14 +785,31 @@ async fn request(
         .map_err(|e| e.to_string())?;
     }
     if action == "latency_batch" {
-        let (client, names, revision) = {
-            let a = shared.try_lock().map_err(|_| "Atlas занят, повторите проверку")?;
-            if a.status != "Connected" { return Err("Atlas не подключён".into()); }
-            (a.core.client(), a.settings.servers().iter()
-                .filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(), a.revision)
-        };
+        let batch_id = payload.as_ref().and_then(|p| p["batchId"].as_str())
+            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .ok_or("Не указан идентификатор проверки")?.to_owned();
         return tauri::async_runtime::spawn_blocking(move || {
-            latency::batch(client, &names).map(|results| json!({"revision":revision,"results":results}))
+            let (settings, client, binary, directory, names, revision) = {
+                // A snapshot or save may briefly own the app mutex. Queue the
+                // read instead of falsely marking every node as a probe error.
+                let a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
+                let connected = a.status == "Connected";
+                if !connected && a.core.directory.join("tun-guard.active").exists() {
+                    return Err("Atlas в защищённой паузе; автономная проверка недоступна".into());
+                }
+                (a.settings.clone(), connected.then(|| a.core.client()),
+                    a.core.binary.clone(), a.core.directory.clone(),
+                    a.settings.servers().iter().filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(),
+                    a.revision)
+            };
+            let progress = |name: &str, result: &Value| {
+                let _ = app.emit("latency-result", json!({
+                    "batchId":batch_id,"revision":revision,"name":name,"result":result
+                }));
+            };
+            let results = if let Some(client) = client { latency::batch_stream(client, &names, &progress)? }
+                else { latency::offline_batch_stream(settings, binary, directory, &names, &progress)? };
+            Ok(json!({"revision":revision,"results":results}))
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "latency" {
@@ -768,17 +818,22 @@ async fn request(
             .and_then(|p| p["name"].as_str())
             .ok_or("Не выбран сервер")?
             .to_owned();
-        let client = {
-            let a = shared
-                .try_lock()
-                .map_err(|_| "Atlas занят, повторите операцию")?;
-            if !a.settings.servers().iter().any(|p| p["name"] == name) {
-                return Err("Сервер отсутствует в подписках".into());
-            }
-            a.core.client()
-        };
         return tauri::async_runtime::spawn_blocking(move || {
-            serde_json::to_value(latency::test(client, &name)).map_err(|e| e.to_string())
+            let (settings, client, binary, directory) = {
+                let a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
+                if !a.settings.servers().iter().any(|p| p["name"] == name) {
+                    return Err("Сервер отсутствует в подписках".into());
+                }
+                let connected = a.status == "Connected";
+                if !connected && a.core.directory.join("tun-guard.active").exists() {
+                    return Err("Atlas в защищённой паузе; автономная проверка недоступна".into());
+                }
+                (a.settings.clone(), connected.then(|| a.core.client()),
+                    a.core.binary.clone(), a.core.directory.clone())
+            };
+            let result = if let Some(client) = client { latency::test(client, &name) }
+                else { latency::offline_test(settings, binary, directory, &name) };
+            serde_json::to_value(result).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -803,6 +858,7 @@ async fn request(
 }
 pub fn run() {
     tauri::Builder::default()
+        .runtime(tauri_runtime_cef::Cef::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -819,7 +875,13 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            // A previous UI may have crashed while its on-demand service was
+            // still alive. Finish that Atlas-owned session before opening UI.
+            if service::is_running() {
+                service::stop_and_wait().map_err(std::io::Error::other)?;
+            }
             windows::restore(&dir.join("proxy-restore.json")).map_err(std::io::Error::other)?;
+            let _ = std::fs::remove_file(dir.join("tun-guard.active"));
             let store =
                 storage::Store::open(&dir.join("atlas.db")).map_err(std::io::Error::other)?;
             let mut settings = store.load().map_err(std::io::Error::other)?;
@@ -832,13 +894,14 @@ pub fn run() {
                     return Ok(());
                 }
             }
-            let binary = app.path().resource_dir()?.join("resources/mihomo.exe");
+            let binary = app.path().resource_dir()?.join("resources/Atlas.Core.exe");
             let history_path = dir.join("incident-history.ndjson");
             incident_history::load(&history_path);
-            incident_history::record("application_start", json!({"version":env!("CARGO_PKG_VERSION")}), &[]);
+            incident_history::record("application_start", json!({"version":env!("CARGO_PKG_VERSION"),"buildId":env!("ATLAS_BUILD_ID")}), &[]);
             let core = core::Core::new(binary, dir.clone());
-            let auto = settings.startup.auto_connect
-                || (settings.startup.restore_connection && settings.was_connected);
+            // A stale service or marker is crash residue, never permission to
+            // resume VPN traffic. Only the explicit user preference can start it.
+            let auto = settings.startup.auto_connect;
             let delay = settings.startup.delay_seconds.min(300);
             if settings.startup.start_in_tray {
                 if let Some(w) = app.get_webview_window("main") {
@@ -946,25 +1009,37 @@ pub fn run() {
                     } else {
                         let handle = app.clone();
                         let action = id.to_owned();
-                        if action == "connect" || action == "disconnect" || action == "quit" {
+                        if action == "connect" || action == "disconnect" {
                             app.state::<ConnectionIntent>().0.store(action == "connect", std::sync::atomic::Ordering::SeqCst);
                         }
-                        if action == "disconnect" || action == "quit" {
+                        if action == "disconnect" {
                             app.state::<cancellation::Cancellation>().cancel();
                         }
                         if action == "quit" {
-                            if app.state::<ShuttingDown>().swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
-                            // Never leave Exit queued behind a driver/configuration timeout.
-                            // The service watches the parent process and releases its dynamic
-                            // filters and owned core when the desktop process exits.
-                            shutdown::begin(std::time::Duration::from_secs(8), move || {
-                                let state = handle.state::<Shared>();
-                                // A poisoned mutex must not prevent resource cleanup.
-                                let mut a = state.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = a.disconnect();
-                                drop(a);
-                                handle.exit(0);
-                            }, || std::process::exit(0));
+                            let shutdown = app.state::<ShuttingDown>().inner().clone();
+                            if shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+                            app.state::<ConnectionIntent>().0.store(false, std::sync::atomic::Ordering::SeqCst);
+                            app.state::<cancellation::Cancellation>().cancel();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let result = handle.state::<Shared>().lock()
+                                    .map_err(|_| "Состояние Atlas недоступно".to_owned())
+                                    .and_then(|mut state| {
+                                        let outcome = state.disconnect();
+                                        state.snapshot();
+                                        outcome
+                                    });
+                                match result {
+                                    Ok(()) => handle.exit(0),
+                                    Err(error) => {
+                                        shutdown.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        if let Some(window) = handle.get_webview_window("main") {
+                                            let _ = window.show();
+                                            let _ = window.set_focus();
+                                        }
+                                        let _ = handle.emit("cleanup-failed", error);
+                                    }
+                                }
+                            });
                             return;
                         }
                         tauri::async_runtime::spawn_blocking(move || {
@@ -989,17 +1064,15 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));
-                let mut failures = 0u32;
-                let mut retry_at = std::time::Instant::now();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    if shutdown.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                    if shutdown.load(std::sync::atomic::Ordering::SeqCst)
+                        || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
                     let Ok(mut a) = shared.try_lock() else { continue; };
                     if startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
                         startup_at = None;
                         if intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Disconnected" {
                             let _ = a.connect();
-                            retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
                         }
                     }
                     if !intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Connected" {
@@ -1009,19 +1082,20 @@ pub fn run() {
                     }
                     if a.status == "Connected" && !a.core.running() {
                         let _ = windows::restore(&a.core.directory.join("proxy-restore.json"));
-                        a.status = "Error".into();
-                        let message = "Ядро завершилось. Сетевая служба освобождает TUN и временные защитные фильтры; соединение VPN потеряно.";
+                        a.status = if a.core.service_reachable() { "ProtectedPause" } else { "Error" }.into();
+                        let message = "Путь VPN не подтверждён. Служба выполняет ограниченное восстановление либо завершает сессию.";
                         a.error = Some(message.into());
                         a.log("ERROR",message);
                         let _ = handle.emit("core-crashed", ());
-                        retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
                     }
-                    if a.reconnect.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Error" && std::time::Instant::now() >= retry_at {
-                        a.log("INFO", "Попытка восстановления VPN после сбоя");
-                        let _ = a.core.stop();
-                        if a.connect().is_ok() { failures = 0; }
-                        else { failures = failures.saturating_add(1); }
-                        retry_at = std::time::Instant::now() + std::time::Duration::from_secs(retry_delay(failures));
+                    if a.status == "ProtectedPause" {
+                        if a.core.running() {
+                            a.status = "Connected".into();
+                            a.error = None;
+                            a.log("INFO", "Служба восстановила проверенное соединение");
+                        } else if !a.core.service_reachable() {
+                            a.status = "Error".into();
+                        }
                     }
                     a.snapshot();
                 }
@@ -1041,29 +1115,12 @@ pub fn run() {
         .expect("Atlas failed to initialize");
 }
 
-fn retry_delay(failures: u32) -> u64 {
-    (3u64.saturating_mul(1u64 << failures.min(5))).min(60)
-}
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    #[test]
-    fn repeated_outages_back_off_without_overflow_or_busy_loop() {
-        assert_eq!(
-            (0..7).map(retry_delay).collect::<Vec<_>>(),
-            vec![3, 6, 12, 24, 48, 60, 60]
-        );
-        assert_eq!(retry_delay(u32::MAX), 60);
-    }
-}
-
 pub fn network_service() -> Result<(), String> {
     service::run()
 }
 
-pub fn watch_network_session(pid: u32) -> Result<(), String> {
-    session_cleanup::run(pid)
+pub fn watch_network_session(pid: u32, directory: &std::path::Path) -> Result<(), String> {
+    session_cleanup::run(pid, directory)
 }
 
 /// Exercises the installed service handshake without starting a network core.

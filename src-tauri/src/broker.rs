@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 };
 const LIMIT: usize = 16 * 1024 * 1024;
 const SERVICE_PIPE: &str = r"\\.\pipe\Atlas-Network-Service";
-const EMBEDDED_CORE: &[u8] = include_bytes!("../resources/mihomo.exe");
+const EMBEDDED_CORE: &[u8] = include_bytes!("../resources/Atlas.Core.exe");
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -222,11 +222,9 @@ impl Broker {
             // Starting can include driver installation; its IPC deadline must outlive readiness.
             receive_cancellable(
                 file,
-                Duration::from_secs(if matches!(op, "start" | "apply") {
-                    120
-                } else {
-                    15
-                }),
+                Duration::from_secs(if matches!(op, "start" | "apply") { 240 }
+                    else if op == "select" { 180 }
+                    else if op == "status" { 2 } else { 15 }),
                 running,
             )
         })();
@@ -234,7 +232,7 @@ impl Broker {
             Ok(reply) => reply,
             Err(error) => {
                 // A late reply must never be mistaken for the next command's reply.
-                // Closing the session also lets the service clean up its TUN/WFP.
+                // Closing the pipe also ends the on-demand service session.
                 *slot = None;
                 return Err(error);
             }
@@ -291,7 +289,7 @@ fn secure_directory() -> Result<PathBuf, String> {
         if ok == 0 {
             return Err(error("Не удалось создать защищённый каталог"));
         }
-        std::fs::write(directory.join("mihomo.exe"), EMBEDDED_CORE).map_err(|e| e.to_string())?;
+        std::fs::write(directory.join("Atlas.Core.exe"), EMBEDDED_CORE).map_err(|e| e.to_string())?;
         Ok(directory)
     }
 }
@@ -381,14 +379,9 @@ fn allowed_api(method: &str, path: &str) -> bool {
     if method == "GET" && (path.starts_with("/proxies/") || path.starts_with("/group/AUTO/delay?")) && path.contains("/delay?") {
         if let Ok(url) = url::Url::parse(&format!("http://localhost{path}")) {
             return url.query_pairs().all(|(k, v)| match k.as_ref() {
-                "url" => [
-                    crate::latency::DISPLAY_URL,
-                    "https://www.gstatic.com/generate_204",
-                    "https://cp.cloudflare.com/generate_204",
-                ]
-                .contains(&v.as_ref()),
+                "url" => crate::latency::ENDPOINTS.contains(&v.as_ref()),
                 "timeout" => v.parse::<u64>().is_ok_and(|n| n <= 10000),
-                "expected" => v == "204",
+                "expected" => v == "204" || v == "200",
                 _ => false,
             });
         }
@@ -425,74 +418,244 @@ impl Drop for PipeWatch {
         if let Some(worker) = self.thread.take() { let _ = worker.join(); }
     }
 }
-fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), String> {
-    let directory = secure_directory()?;
-    let mut core = Core::privileged(directory.join("mihomo.exe"), directory.clone());
+struct Controller {
+    session: NetworkSession,
+    scheduler: Scheduler,
+    selection: crate::resilient_selection::Recovery,
+}
+struct NetworkSession {
+    core: Core,
+    session_id: Option<uuid::Uuid>,
+    network_epoch: u64,
+    configured: bool,
+    cleanup_observer: Option<std::process::Child>,
+    guard: Option<network_guard::Guard>,
+    active_settings: Option<Settings>,
+}
+struct Scheduler {
+    health: HealthState,
+    queries: crate::query_jobs::QueryJobs,
+}
+struct HealthState {
+    last_recovery_scan: Instant,
+    last_health: Instant,
+    failures: u32,
+    probe: crate::background_probe::Probe,
+    tun_identity: Option<u64>,
+    retry_at: Option<Instant>,
+    attempts: std::collections::VecDeque<Instant>,
+}
+impl Default for HealthState {
+    fn default() -> Self {
+        Self { last_recovery_scan: Instant::now(), last_health: Instant::now(), failures: 0,
+            probe: Default::default(), tun_identity: network_guard::tun_identity(),
+            retry_at: None, attempts: Default::default() }
+    }
+}
+impl HealthState {
+    fn reset(&mut self) {
+        self.failures = 0;
+        self.probe = Default::default();
+        self.tun_identity = network_guard::tun_identity();
+        self.last_health = Instant::now();
+        self.retry_at = None;
+    }
+    fn tick(&mut self, core: &mut Core, configured: &mut bool,
+        guard: &mut Option<network_guard::Guard>, settings: &mut Option<Settings>,
+        recovery: &mut crate::resilient_selection::Recovery,
+        observer: &mut Option<std::process::Child>,
+        queries: &mut crate::query_jobs::QueryJobs,
+        session_id: &mut Option<uuid::Uuid>, network_epoch: &mut u64) {
+        let now = Instant::now();
+        if *configured && self.last_recovery_scan.elapsed() >= Duration::from_millis(500) {
+            self.last_recovery_scan = now;
+            if let Some(s) = settings { recovery.tick(core.client(), s); }
+        }
+        if *configured {
+            if let Some(healthy) = self.probe.poll() {
+                self.failures = if healthy { 0 } else { self.failures + 1 };
+            }
+            if self.last_health.elapsed() >= Duration::from_secs(5) {
+                let observer_ok = observer.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+                let observed = network_guard::tun_identity();
+                let guard_ready = match tun_guard_action(self.tun_identity, observed) {
+                    TunGuardAction::Keep => true,
+                    TunGuardAction::Missing => false,
+                    TunGuardAction::Unowned => { self.failures = 3; false }
+                };
+                if !observer_ok || !core.running() { self.failures = 3; }
+                else {
+                    let client = core.client();
+                    self.probe.start(move || guard_ready && client.api("GET", "/version", None).is_ok());
+                }
+                self.last_health = now;
+            }
+            if self.failures >= 3 {
+                *network_epoch = network_epoch.wrapping_add(1);
+                queries.invalidate();
+                // Commit protected pause before tearing down the owned core.
+                let paused = guard.as_ref().map(|g| g.pause(&core.binary)).unwrap_or(Ok(()));
+                let stopped = core.stop();
+                *configured = false;
+                recovery.invalidate();
+                if paused.is_ok() && stopped.is_ok() && guard.as_ref().is_some_and(|g| g.reset_for_recovery().is_ok()) {
+                    self.retry_at = Some(now + Duration::from_secs(3));
+                } else {
+                    self.retry_at = None;
+                    *settings = None;
+                    // Keep the dynamic WFP session until the owned core has
+                    // been terminated by the service's final teardown.
+                    *session_id = None;
+                }
+                self.probe = Default::default();
+            }
+        }
+        if !*configured && settings.is_some() && self.retry_at.is_some_and(|t| now >= t) {
+            while self.attempts.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(600)) {
+                self.attempts.pop_front();
+            }
+            if self.attempts.len() >= 5 {
+                self.retry_at = None;
+                // Recovery is exhausted. The service loop exits and drops its
+                // dynamic WFP handle after stopping the owned core.
+                *settings = None;
+                *session_id = None;
+                return;
+            }
+            self.attempts.push_back(now);
+            if observer.as_mut().is_none_or(|child| !matches!(child.try_wait(), Ok(None))) {
+                match crate::session_cleanup::start_observer(&core.directory) {
+                    Ok(child) => *observer = Some(child),
+                    Err(_) => {
+                        self.retry_at = Some(now + Duration::from_secs(30));
+                        return;
+                    }
+                }
+            }
+            let s = settings.as_ref().unwrap();
+            let restarted = core.start(s)
+                .and_then(|_| guard.as_ref().ok_or_else(|| "Защита сети недоступна".to_owned())?.install(&core.binary))
+                .and_then(|_| confirm_route(&core.client(), s, &crate::latency::ENDPOINTS));
+            if restarted.is_ok() {
+                *configured = true;
+                *session_id = Some(uuid::Uuid::new_v4());
+                *network_epoch = network_epoch.wrapping_add(1);
+                queries.invalidate();
+                self.reset();
+                recovery.invalidate();
+            } else {
+                let paused = guard.as_ref().map(|g| g.pause(&core.binary)).unwrap_or(Ok(()));
+                let stopped = core.stop();
+                if paused.is_err() || stopped.is_err() {
+                    // A failed teardown must not feed the next retry back
+                    // into a possibly live TUN or an unconfirmed WFP policy.
+                    self.retry_at = None;
+                    *settings = None;
+                    *session_id = None;
+                    return;
+                }
+                let backoff = (3u64.saturating_mul(1u64 << self.attempts.len().min(5))).min(60);
+                self.retry_at = Some(Instant::now() + Duration::from_secs(backoff));
+            }
+        }
+    }
+}
+impl Controller {
+    fn new() -> Result<Self, String> {
+        // One-time migration of the previous build's exact persistent WFP
+        // keys. Current protection is dynamic and dies with this service.
+        network_guard::clear()?;
+        let directory = secure_directory()?;
+        Ok(Self {
+            session: NetworkSession {
+                core: Core::privileged(directory.join("Atlas.Core.exe"), directory),
+                session_id: None,
+                network_epoch: 0,
+                configured: false,
+                cleanup_observer: None,
+                guard: None,
+                active_settings: None,
+            },
+            scheduler: Scheduler { health: Default::default(), queries: Default::default() },
+            selection: Default::default(),
+        })
+    }
+    fn tick(&mut self) {
+        let session = &mut self.session;
+        self.scheduler.health.tick(&mut session.core, &mut session.configured, &mut session.guard,
+            &mut session.active_settings, &mut self.selection, &mut session.cleanup_observer,
+            &mut self.scheduler.queries, &mut session.session_id, &mut session.network_epoch);
+    }
+}
+fn confirm_route(client: &crate::core::ApiClient, settings: &Settings, controls: &[&str]) -> Result<Option<String>, String> {
+    let proxies = client.api("GET", "/proxies", None)?;
+    let name = if matches!(settings.selected.as_str(), "AUTO" | "FAILOVER") {
+        proxies["proxies"][settings.selected.as_str()]["now"].as_str()
+    } else { Some(settings.selected.as_str()) }
+        .filter(|name| settings.servers().iter().any(|n|n["name"] == *name))
+        .ok_or("Ядро не указало активный узел для проверки")?.to_owned();
+    let report = crate::resilient_selection::verify_names(client, std::slice::from_ref(&name), controls);
+    if report["candidate"] == name { return Ok(None); }
+    if !matches!(settings.selected.as_str(), "AUTO" | "FAILOVER") {
+        return Err("Закреплённый сервер не прошёл проверку двух контрольных целей".into());
+    }
+    let blocked = settings.servers().iter().filter(|n|n["name"] == name)
+        .map(crate::resilient_selection::node_key).collect();
+    let alternatives = crate::resilient_selection::verify(client, settings, &blocked, controls);
+    let candidate = alternatives["candidate"].as_str()
+        .ok_or("Ни один из первых резервных узлов не подтвердил доступность; подключение остаётся в защищённой паузе")?;
+    let group = settings.selected.as_str();
+    client.api("PUT", &format!("/proxies/{group}"), Some(json!({"name":candidate})))?;
+    if client.api("GET", &format!("/proxies/{group}"), None)?["now"] != candidate {
+        return Err("Ядро не подтвердило выбор проверенного узла".into());
+    }
+    Ok(Some(candidate.to_owned()))
+}
+fn confirm_session(core: &mut Core, guard: &network_guard::Guard, settings: &Settings) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if crate::service::is_stopping() || core.cancelled() {
+            return Err("Проверка подключения отменена".into());
+        }
+        match guard.install(&core.binary) {
+            Ok(()) => break,
+            Err(error) if !core.running() || Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ())
+}
+fn abandon_session(core: &mut Core, guard: &mut Option<network_guard::Guard>,
+    configured: &mut bool, active_settings: &mut Option<Settings>, reason: String) -> Result<Value, String> {
+    let paused = guard.as_ref().map(|policy| policy.pause(&core.binary)).unwrap_or(Ok(()));
+    let stopped = core.stop();
+    if stopped.is_ok() { *guard = None; }
+    *configured = false;
+    *active_settings = None;
+    let dns = crate::session_cleanup::flush_dns();
+    let mut errors = vec![reason];
+    errors.extend([paused, stopped, dns].into_iter().filter_map(Result::err));
+    Err(errors.join("; "))
+}
+fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
+    let Controller { session: NetworkSession { core, session_id, network_epoch, configured, cleanup_observer, guard, active_settings },
+        scheduler: Scheduler { health, queries }, selection: recovery } = state;
     let session_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let _watch = PipeWatch::start(&pipe, session_running.clone())?;
-    core.continue_running = Some(session_running);
+    core.continue_running = Some(session_running.clone());
     send(&mut pipe, &json!({"ready":true}))?;
-    let mut configured = false;
-    let mut cleanup_observer: Option<std::process::Child> = None;
-    let mut guard: Option<network_guard::Guard> = None;
     let mut explicit_stop = false;
-    let mut active_settings: Option<Settings> = None;
-    let mut recovery = crate::resilient_selection::Recovery::default();
-    let mut last_recovery_scan = Instant::now();
-    let mut last_health = Instant::now();
-    let mut health_failures = 0;
-    let mut health_probe = crate::background_probe::Probe::default();
-    let mut tun_identity = network_guard::tun_identity();
-    let mut queries = crate::query_jobs::QueryJobs::default();
     loop {
-        if configured && last_recovery_scan.elapsed() >= Duration::from_millis(500) {
-            last_recovery_scan = Instant::now();
-            if let Some(settings) = &active_settings { recovery.tick(core.client(), settings); }
-        }
-        if crate::service::is_stopping() || core.cancelled() {
+        if crate::service::is_stopping()
+            || !session_running.load(std::sync::atomic::Ordering::SeqCst)
+            || core.cancelled() {
             break;
         }
-        if let Some(parent) = parent_handle {
-            if unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0 {
-                break;
-            }
-        }
-        if configured {
-            if let Some(healthy) = health_probe.poll() {
-                health_failures = if healthy { 0 } else { health_failures + 1 };
-                if health_failures >= 3 { break; }
-            }
-        }
-        if configured && last_health.elapsed() >= Duration::from_secs(5) {
-            if cleanup_observer
-                .as_mut()
-                .is_none_or(|child| !matches!(child.try_wait(), Ok(None)))
-            {
-                break;
-            }
-            // Mihomo v1.19.31 already subscribes to Windows route/interface
-            // notifications and resets resolver connections. Do not reload TUN
-            // when DHCP, sleep or the physical egress changes.
-            let observed = network_guard::tun_identity();
-            let guard_ready = match tun_guard_action(tun_identity, observed) {
-                TunGuardAction::Keep => true,
-                TunGuardAction::Missing => false,
-                TunGuardAction::Rebind => {
-                    let ready = guard
-                        .as_ref()
-                        .is_some_and(|g| g.install(&core.binary).is_ok());
-                    if ready {
-                        tun_identity = observed;
-                    }
-                    ready
-                }
-            };
-            if !core.running() {
-                break;
-            }
-            let client = core.client();
-            health_probe.start(move || guard_ready && client.api("GET", "/version", None).is_ok());
-            last_health = Instant::now();
+        health.tick(core, configured, guard, active_settings, recovery, cleanup_observer,
+            queries, session_id, network_epoch);
+        if active_settings.is_none() && !*configured
+            && (guard.is_some() || health.attempts.len() >= 5) {
+            break;
         }
         let mut available = 0;
         if unsafe {
@@ -509,9 +672,6 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
             break;
         }
         if available == 0 {
-            if configured && !core.running() {
-                break;
-            }
             thread::sleep(Duration::from_millis(30));
             continue;
         }
@@ -523,7 +683,7 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
         let payload = &request["payload"];
         let result: Result<Value, String> = (|| match op {
             "support_snapshot" => {
-                let id = queries.start(false, || crate::support_report::privileged_snapshot().map(|text| json!({"text":text})))?;
+                let id = queries.start(false, |_| crate::support_report::privileged_snapshot().map(|text| json!({"text":text})))?;
                 Ok(json!({"id":id}))
             }
             "delay" | "query" => {
@@ -533,7 +693,9 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 }
                 let client = core.client();
                 let path = path.to_owned();
-                let id = queries.start(path.contains("/delay?"), move || client.api("GET", &path, None))?;
+                let key = path.clone();
+                let id = queries.start_keyed(path.contains("/delay?"), Some(key), move |cancelled|
+                    client.api_cancellable("GET", &path, None, Some(&cancelled)))?;
                 Ok(json!({"id":id}))
             }
             "delay_result" => {
@@ -547,101 +709,155 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;
+                if *configured && core.running() {
+                    let previous = active_settings.as_ref().ok_or("Нет активной конфигурации службы")?;
+                    if !crate::config::same_network_config(previous, &s) || previous.selected != s.selected {
+                        return Err("Служба уже подключена с другими настройками; сначала примените изменения или отключите VPN".into());
+                    }
+                    return Ok(json!({"running":true,"reattached":true}));
+                }
+                queries.invalidate();
                 network_guard::check_competing_routes()?;
                 core.validate(&s)?;
+                *network_epoch = network_epoch.wrapping_add(1);
+                *session_id = Some(uuid::Uuid::new_v4());
                 if cleanup_observer.is_none() {
-                    cleanup_observer = Some(crate::session_cleanup::start_observer()?);
+                    match crate::session_cleanup::start_observer(&core.directory) {
+                        Ok(observer) => *cleanup_observer = Some(observer),
+                        Err(error) => {
+                            *session_id = None;
+                            explicit_stop = true;
+                            return Err(error);
+                        }
+                    }
                 }
-                guard = Some(network_guard::Guard::prepare(&core.binary)?);
-                if let Err(e) = core.start(&s) {
-                    let _ = core.stop();
-                    guard = None;
-                    return Err(e);
+                match network_guard::Guard::prepare(&core.binary) {
+                    Ok(policy) => *guard = Some(policy),
+                    Err(error) => {
+                        *session_id = None;
+                        explicit_stop = true;
+                        return Err(error);
+                    }
+                }
+                let started = core.start(&s);
+                if let Err(e) = started {
+                    explicit_stop = true;
+                    return abandon_session(core, guard, configured, active_settings,
+                        format!("Запуск ядра не завершён: {e}"));
                 }
                 let deadline = Instant::now() + Duration::from_secs(60);
                 loop {
                     if crate::service::is_stopping() || core.cancelled()
-                        || parent_handle.is_some_and(
-                            |parent| unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0,
-                        )
                     {
-                        let _ = core.stop();
-                        guard = None;
-                        return Err("Подключение отменено: Atlas завершает работу".into());
+                        explicit_stop = true;
+                        return abandon_session(core, guard, configured, active_settings,
+                            "Подключение отменено: Atlas завершает работу".into());
                     }
                     match guard.as_ref().unwrap().install(&core.binary) {
                         Ok(()) => break,
                         Err(e) if !core.running() || Instant::now() >= deadline => {
-                            let logs = core.client().logs().unwrap_or_default();
-                            let _ = core.stop();
-                            guard = None;
-                            return Err(format!("{e}. Ядро: {logs:?}"));
+                            explicit_stop = true;
+                            return abandon_session(core, guard, configured, active_settings,
+                                format!("TUN не подтвердил готовность: {e}"));
                         }
                         Err(_) => thread::sleep(Duration::from_millis(100)),
                     }
                 }
-                configured = true;
-                health_probe = Default::default();
-                health_failures = 0;
+                if let Err(error) = confirm_route(&core.client(), &s, &crate::latency::ENDPOINTS) {
+                        explicit_stop = true;
+                        return abandon_session(core, guard, configured, active_settings,
+                            format!("Путь через сервер не подтверждён: {error}"));
+                }
+                if !session_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    explicit_stop = true;
+                    return abandon_session(core, guard, configured, active_settings,
+                        "Подключение отменено".into());
+                }
+                *configured = true;
+                health.reset();
+                health.attempts.clear();
                 recovery.invalidate();
-                active_settings = Some(s);
-                last_health = Instant::now();
-                tun_identity = network_guard::tun_identity();
+                *active_settings = Some(s);
                 Ok(json!({"running":true}))
             }
             "apply" => {
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;
-                core.apply(&s)?;
-                // API success alone is not proof of a working TUN adapter.
-                // Apply the same adapter-readiness check used for initial startup.
-                let deadline = Instant::now() + Duration::from_secs(60);
-                while let Some(policy) = &guard {
-                    match policy.install(&core.binary) {
-                        Ok(()) => break,
-                        Err(error) if !core.running() || Instant::now() >= deadline => {
-                            let logs = core.client().logs().unwrap_or_default();
-                            let _ = core.stop();
-                            guard = None;
-                            configured = false;
-                            return Err(format!("{error}. Ядро: {logs:?}"));
-                        }
-                        Err(_) => thread::sleep(Duration::from_millis(100)),
-                    }
-                    if crate::service::is_stopping() || core.cancelled()
-                        || parent_handle.is_some_and(
-                            |parent| unsafe { WaitForSingleObject(parent, 0) } == WAIT_OBJECT_0,
-                        )
-                    {
-                        let _ = core.stop();
-                        guard = None;
-                        configured = false;
-                        return Err("Обновление подключения отменено".into());
-                    }
-                }
+                if !*configured { return Err("Нет активной сетевой сессии для обновления".into()); }
+                let previous = active_settings.clone().ok_or("Нет предыдущей конфигурации для отката")?;
+                queries.invalidate();
+                *network_epoch = network_epoch.wrapping_add(1);
                 recovery.invalidate();
-                active_settings = Some(s);
-                tun_identity = network_guard::tun_identity();
-                health_probe = Default::default();
-                health_failures = 0;
-                last_health = Instant::now();
+                if let Err(error) = core.apply(&s) {
+                    if !core.running() {
+                        explicit_stop = true;
+                        return abandon_session(core, guard, configured, active_settings,
+                            format!("Обновление остановило ядро: {error}"));
+                    }
+                    return Err(format!("Обновление отклонено; прежняя конфигурация сохранена: {error}"));
+                }
+                let confirmed = guard.as_ref().ok_or_else(|| "Защита сети отсутствует после обновления".to_owned())
+                    .and_then(|policy| confirm_session(core, policy, &s));
+                if let Err(error) = confirmed {
+                    let rollback = core.apply(&previous).and_then(|_| {
+                        let policy = guard.as_ref().ok_or("Защита сети отсутствует при откате")?;
+                        confirm_session(core, policy, &previous)
+                    });
+                    if let Err(rollback_error) = rollback {
+                        explicit_stop = true;
+                        return abandon_session(core, guard, configured, active_settings,
+                            format!("Новый маршрут не подтверждён: {error}; откат не подтверждён: {rollback_error}"));
+                    }
+                    health.reset();
+                    return Err(format!("Новый маршрут не подтверждён: {error}; прежнее подключение восстановлено"));
+                }
+                *active_settings = Some(s);
+                health.reset();
                 Ok(json!({}))
             }
             "select" => {
                 let name = payload["name"].as_str().ok_or("Нет сервера")?;
+                if !*configured || !core.running() { return Err("Нет подтверждённой сетевой сессии".into()); }
                 let settings = active_settings.as_mut().ok_or("Ядро не подключено")?;
                 if !["AUTO", "FAILOVER"].contains(&name)
                     && !settings.servers().iter().any(|p| p["name"] == name)
                 {
                     return Err("Сервер отсутствует в подписках".into());
                 }
+                queries.invalidate();
+                *network_epoch = network_epoch.wrapping_add(1);
                 recovery.invalidate();
-                core.select(name)?;
+                let previous = settings.selected.clone();
+                if let Err(error) = core.select(name) {
+                    let rollback = core.select(&previous).and_then(|_| confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ()));
+                    if let Err(rollback_error) = rollback {
+                        explicit_stop = true;
+                        return abandon_session(core, guard, configured, active_settings,
+                            format!("Команда выбора не подтверждена: {error}; прежний маршрут не восстановлен: {rollback_error}"));
+                    }
+                    return Err(format!("Команда выбора не подтверждена: {error}; прежний маршрут восстановлен"));
+                }
                 settings.selected = name.to_owned();
+                if let Err(error) = confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS) {
+                    settings.selected = previous.clone();
+                    let rollback = core.select(&previous).and_then(|_| confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ()));
+                    if let Err(rollback_error) = rollback {
+                        explicit_stop = true;
+                        return abandon_session(core, guard, configured, active_settings,
+                            format!("Выбранный сервер не подтверждён: {error}; прежний маршрут не восстановлен: {rollback_error}"));
+                    }
+                    return Err(format!("Выбранный сервер не подтверждён: {error}; прежний маршрут восстановлен"));
+                }
                 Ok(json!({}))
             }
-            "status" => Ok(json!({"running":core.running(),"guard":configured})),
+            "status" => {
+                let running = core.running();
+                Ok(json!({"running":running,"guard":*configured && running,
+                    "sessionId":session_id.as_ref().map(ToString::to_string),"networkEpoch":*network_epoch,
+                    "state":if *configured && running { "Connected" }
+                        else if guard.is_some() { "ProtectedPause" } else { "Disconnected" }}))
+            },
             "logs" => Ok(json!(core.client().logs()?)),
             "api" => {
                 let method = payload["method"].as_str().ok_or("Нет метода")?;
@@ -652,14 +868,23 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
                 core.api(method, path, None)
             }
             "stop" => {
+                queries.invalidate();
+                *network_epoch = network_epoch.wrapping_add(1);
+                *session_id = None;
+                let paused = guard.as_ref().map(|policy| policy.pause(&core.binary)).unwrap_or(Ok(()));
                 let stopped = core.stop();
-                guard = None;
+                // Keep the dynamic protection until the service's final
+                // owned-process teardown if the core did not stop cleanly.
+                if stopped.is_ok() { *guard = None; }
+                *configured = false;
+                *active_settings = None;
+                recovery.invalidate();
                 explicit_stop = true;
                 // Attempt every cleanup even if core termination failed. Never
                 // acknowledge Stop before releasing filters and cached fake IPs.
                 let filters = network_guard::clear();
                 let dns = crate::session_cleanup::flush_dns();
-                let errors: Vec<_> = [stopped, filters, dns].into_iter()
+                let errors: Vec<_> = [paused, stopped, filters, dns].into_iter()
                     .filter_map(Result::err).collect();
                 if !errors.is_empty() { return Err(errors.join("; ")); }
                 Ok(json!({}))
@@ -673,36 +898,21 @@ fn run_channel(mut pipe: File, parent_handle: Option<HANDLE>) -> Result<(), Stri
         if send(&mut pipe, &reply).is_err() {
             break;
         }
-        if explicit_stop || (active_settings.is_some() && !configured) {
+        if explicit_stop || (active_settings.is_some() && !*configured) {
             break;
         }
     }
-    let stopped = core.stop();
-    drop(core);
-    drop(guard);
-    let dns_cleanup = if cleanup_observer.is_some() {
-        crate::session_cleanup::flush_dns()
-    } else {
-        Ok(())
-    };
-    if let Some(parent) = parent_handle {
-        unsafe {
-            CloseHandle(parent);
-        }
-    } // Dynamic WFP session is released after the core closes its adapter.
-      // Directory was generated here with an administrator-only DACL, never supplied by IPC.
-    if directory.parent()
-        == std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .as_deref()
-    {
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-    stopped.and(dns_cleanup)
+    // A lost desktop pipe ends this session. The service closes its dynamic
+    // WFP engine and owned core before reporting STOPPED to SCM.
+    queries.invalidate();
+    Ok(())
 }
 
 pub fn serve_service() -> Result<(), String> {
+    let mut state = Controller::new()?;
+    let mut channel_result = Ok(());
     while !crate::service::is_stopping() {
+        state.tick();
         let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)");
         let mut descriptor = std::ptr::null_mut();
         unsafe {
@@ -737,6 +947,7 @@ pub fn serve_service() -> Result<(), String> {
             let mut connected = false;
             let deadline = Instant::now() + Duration::from_secs(30);
             while !crate::service::is_stopping() {
+                state.tick();
                 if Instant::now() >= deadline {
                     break;
                 }
@@ -756,42 +967,41 @@ pub fn serve_service() -> Result<(), String> {
             if GetNamedPipeClientProcessId(handle, &mut client_pid) == 0
                 || verify_process_image(
                     client_pid,
-                    &std::env::current_exe().map_err(|e| e.to_string())?,
+                    &std::env::current_exe()
+                        .map_err(|e| e.to_string())?
+                        .with_file_name("Atlas.exe"),
                 )
                 .is_err()
             {
                 DisconnectNamedPipe(handle);
                 CloseHandle(handle);
-                continue;
+                channel_result = Err("Канал сетевой службы отклонён: клиент не подтверждён".into());
+                break;
             }
             let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
             if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
                 DisconnectNamedPipe(handle);
                 CloseHandle(handle);
-                continue;
-            }
-            let file = File::from_raw_handle(handle);
-            let parent = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-                0,
-                client_pid,
-            );
-            if parent.is_null() {
+                channel_result = Err("Не удалось настроить канал сетевой службы".into());
                 break;
             }
-            let _watch = match crate::service::watch_session(client_pid) {
-                Ok(watch) => watch,
-                Err(error) => {
-                    CloseHandle(parent);
-                    return Err(error);
-                }
-            };
-            let _ = run_channel(file, Some(parent));
-            // A service session belongs to a single Atlas connection, not the OS lifetime.
-            break;
+            let file = File::from_raw_handle(handle);
+            channel_result = run_channel(file, &mut state);
         }
+        break;
     }
-    Ok(())
+    let core_result = state.session.core.stop();
+    let dns_result = if state.session.cleanup_observer.is_some() {
+        crate::session_cleanup::flush_dns()
+    } else { Ok(()) };
+    let directory = state.session.core.directory.clone();
+    drop(state);
+    if directory.parent() == std::env::var_os("ProgramData").map(PathBuf::from).as_deref() {
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+    let errors: Vec<_> = [channel_result, core_result, dns_result].into_iter()
+        .filter_map(Result::err).collect();
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
 }
 #[cfg(test)]
 mod tests {
@@ -917,7 +1127,7 @@ mod tests {
         ));
         assert!(allowed_api(
             "GET",
-            "/proxies/x/delay?timeout=8000&url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
+            "/proxies/x/delay?timeout=8000&url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
         ));
     }
     #[test]
@@ -941,14 +1151,14 @@ fn busy_channel_is_not_reported_as_a_crashed_core() {
 #[derive(Debug, PartialEq)]
 enum TunGuardAction {
     Keep,
-    Rebind,
+    Unowned,
     Missing,
 }
 fn tun_guard_action(previous: Option<u64>, current: Option<u64>) -> TunGuardAction {
     match current {
         None => TunGuardAction::Missing,
         Some(_) if previous == current => TunGuardAction::Keep,
-        Some(_) => TunGuardAction::Rebind,
+        Some(_) => TunGuardAction::Unowned,
     }
 }
 #[cfg(test)]
@@ -959,8 +1169,8 @@ mod tun_guard_tests {
         assert_eq!(tun_guard_action(Some(7), Some(7)), TunGuardAction::Keep);
     }
     #[test]
-    fn replacement_adapter_requires_filter_rebinding_only() {
-        assert_eq!(tun_guard_action(Some(7), Some(8)), TunGuardAction::Rebind);
+    fn replacement_adapter_is_not_trusted_as_the_original_session() {
+        assert_eq!(tun_guard_action(Some(7), Some(8)), TunGuardAction::Unowned);
     }
     #[test]
     fn missing_adapter_is_not_treated_as_healthy() {

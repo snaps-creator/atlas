@@ -1,0 +1,8 @@
+{
+  "source": "Clash Verge 2.5.2 / verge-mihomo.exe",
+  "sourceSha256": "98986B574E41F92B22ED65AA42A61AD8CADF886CC7B3F76B722CD73A3A52D878",
+  "brandedSha256": "23285B575B41EA21085C71C3C722940AB6669C2340374C49EDDB05BB51D508C1",
+  "version": "v1.19.29",
+  "license": "LICENSE-mihomo",
+  "note": "Unsigned reference core used by installed Clash Verge 2.5.2; brand-core.ps1 adds Atlas FileDescription."
+}

@@ -37,14 +37,35 @@ impl Access {
 }
 
 pub(crate) fn privileged_snapshot() -> Result<String, String> {
-    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if BUSY.swap(true,std::sync::atomic::Ordering::SeqCst) { return Err("Privileged collector already running".into()); }
-    struct Release;
-    impl Drop for Release { fn drop(&mut self) { BUSY.store(false,std::sync::atomic::Ordering::SeqCst); } }
-    let _release = Release;
+    #[derive(Default)]
+    struct State { running: bool, generation: u64, results: std::collections::BTreeMap<u64, Result<String,String>> }
+    static SHARED: std::sync::OnceLock<(std::sync::Mutex<State>,std::sync::Condvar)> = std::sync::OnceLock::new();
+    let (lock,changed) = SHARED.get_or_init(||(std::sync::Mutex::new(State::default()),std::sync::Condvar::new()));
+    let mut state = lock.lock().map_err(|_| "Privileged collector state unavailable")?;
+    if state.running {
+        let generation = state.generation;
+        let deadline = Instant::now() + Duration::from_secs(28);
+        loop {
+            if let Some(result) = state.results.get(&generation) { return result.clone(); }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err("Privileged collector exceeded 28 seconds".into()); }
+            state = changed.wait_timeout(state,remaining).map_err(|_| "Privileged collector state unavailable")?.0;
+        }
+    }
+    state.running = true;
+    state.generation += 1;
+    let generation = state.generation;
+    drop(state);
     let mut command = Command::new("powershell.exe");
     command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_privileged.ps1")]);
-    run_bounded(command, Duration::from_secs(24))
+    let result = run_bounded(command, Duration::from_secs(24));
+    if let Ok(mut state) = lock.lock() {
+        state.results.insert(generation,result.clone());
+        while state.results.len() > 8 { state.results.pop_first(); }
+        state.running = false;
+        changed.notify_all();
+    }
+    result
 }
 #[derive(Default)]
 pub(crate) struct Recorder { last_log: Option<String>, counters: crate::interface_evidence::Counters,
@@ -74,7 +95,16 @@ impl Recorder {
             let position = self.last_log.as_ref().and_then(|last|lines.iter().rposition(|l|l == last));
             let gap = self.last_log.is_some() && position.is_none();
             let fresh = &lines[position.map_or(0, |i|i+1)..];
-            incident = fresh.iter().any(|l| !l.starts_with("ATLAS_EVENT") && (l.contains("connect error:") || l.contains("resolve failed") || l.contains("can't resolve ip")));
+            incident = fresh.iter().any(|l| {
+                if l.starts_with("ATLAS_EVENT") { return false; }
+                let dns_error = l.contains("resolve failed") || l.contains("can't resolve ip");
+                // Windows probes IPv6 connectivity even when Atlas rejects IPv6.
+                // Keep those lines in history, but do not launch a full incident
+                // capture every minute for this expected DIRECT-path failure.
+                let expected_ipv6_probe = l.contains("dial DIRECT") &&
+                    (l.contains("ipv6.msftconnecttest.com") || l.contains("ipv6.msftncsi.com"));
+                l.contains("connect error:") || (dns_error && !expected_ipv6_probe)
+            });
             self.last_log = lines.last().cloned();
             serde_json::json!({"newLines":fresh.iter().rev().take(512).collect::<Vec<_>>(),
                 "gap":gap,"omittedNewLines":fresh.len().saturating_sub(512),"evidence":failure_evidence(fresh)})

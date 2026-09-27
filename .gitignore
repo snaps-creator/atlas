@@ -4,6 +4,7 @@ node_modules/
 /build/
 /coverage/
 target/
+/t/
 /src-tauri/gen/
 *.tsbuildinfo
 .cache/
@@ -75,6 +76,7 @@ cache.db-*
 /Atlas*Setup.exe.sig
 /.impeccable/
 incident-history.ndjson
+/LOCAL-RUN-*.md
 
 # Keep package-lock.json, Cargo.lock, build configuration, icons,
 # src-tauri/resources and third_party: these are required build inputs.

@@ -97,6 +97,9 @@ fn specificity(r: &Rule) -> (u8, std::cmp::Reverse<usize>, &str) {
     };
     (rank, std::cmp::Reverse(detail), &r.value)
 }
+fn route_priority(route: &Route) -> u8 {
+    match route { Route::Block => 0, Route::Proxy => 1, Route::Direct => 2 }
+}
 
 pub fn validate(rule: &Rule) -> Result<(), String> {
     if rule.value.is_empty() || rule.value.contains([',', '\n', '\r']) {
@@ -144,6 +147,9 @@ pub fn validate(rule: &Rule) -> Result<(), String> {
     Ok(())
 }
 pub fn compile(settings: &Settings) -> Result<Vec<String>, String> {
+    if !(1..=2).contains(&settings.rules_semantics_version) {
+        return Err("Неподдерживаемая версия семантики правил".into());
+    }
     let mut result = vec![];
     let mut unique: BTreeMap<String, (Rule, Route)> = BTreeMap::new();
     for g in settings.groups.iter().filter(|g| g.enabled) {
@@ -163,7 +169,16 @@ pub fn compile(settings: &Settings) -> Result<Vec<String>, String> {
         }
     }
     let mut entries: Vec<_> = unique.into_values().collect();
-    entries.sort_by(|a, b| specificity(&a.0).cmp(&specificity(&b.0)));
+    if settings.rules_semantics_version == 1 {
+        // Preserve existing installations until the owner explicitly reviews
+        // the migration. Their previous compiler sorted by specificity.
+        entries.sort_by(|a, b| specificity(&a.0).cmp(&specificity(&b.0)));
+    } else {
+        entries.sort_by(|a, b| {
+            (route_priority(&a.1), specificity(&a.0))
+                .cmp(&(route_priority(&b.1), specificity(&b.0)))
+        });
+    }
     for (r, route) in entries {
         if r.kind == "PROCESS-DOMAIN" {
             let (process, domain) = r.value.split_once('|').unwrap();
@@ -317,7 +332,7 @@ mod tests {
         );
     }
     #[test]
-    fn order_is_preserved() {
+    fn route_priority_is_independent_of_source_order() {
         let a=import("rules:\n - DOMAIN,a.test,GLOBAL\n - DOMAIN,b.test,DIRECT\n - DOMAIN,c.test,GLOBAL\n - MATCH,REJECT").unwrap();
         assert_eq!(a.groups.len(), 3);
         let mut s = Settings::default();
@@ -327,8 +342,8 @@ mod tests {
             compile(&s).unwrap(),
             vec![
                 "DOMAIN,a.test,ATLAS",
-                "DOMAIN,b.test,DIRECT",
                 "DOMAIN,c.test,ATLAS",
+                "DOMAIN,b.test,DIRECT",
                 "MATCH,REJECT"
             ]
         );
@@ -360,5 +375,18 @@ mod tests {
         let mut sb = Settings::default();
         sb.groups = b.groups;
         assert_eq!(compile(&sa).unwrap(), compile(&sb).unwrap());
+    }
+    #[test]
+    fn legacy_policy_is_preserved_until_explicit_migration() {
+        let mut s = Settings::default();
+        s.groups = import("rules: ['DOMAIN-SUFFIX,example.com,REJECT','DOMAIN,chat.example.com,GLOBAL']").unwrap().groups;
+        s.rules_semantics_version = 1;
+        let old = compile(&s).unwrap();
+        assert_eq!(old[0], "DOMAIN,chat.example.com,ATLAS");
+        s.rules_semantics_version = 2;
+        let new = compile(&s).unwrap();
+        assert_eq!(new[0], "DOMAIN-SUFFIX,example.com,REJECT");
+        s.groups.reverse();
+        assert_eq!(new, compile(&s).unwrap());
     }
 }
