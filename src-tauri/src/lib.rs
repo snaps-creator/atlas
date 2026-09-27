@@ -24,6 +24,7 @@ mod service;
 mod session_cleanup;
 mod storage;
 mod subscriptions;
+mod site_checks;
 mod support_report;
 mod support_probes;
 mod incident_history;
@@ -699,15 +700,13 @@ async fn request(
             "telegram" => "https://web.telegram.org",
             _ => return Err("Неизвестный сервис".into()),
         };
-        {
-            let mut a = shared
-                .try_lock()
-                .map_err(|_| "Atlas занят, повторите операцию")?;
-            if !a.core.running() {
-                return Err("Сначала подключите Atlas".into());
-            }
-        }
         return tauri::async_runtime::spawn_blocking(move || {
+            {
+                let a = site_checks::wait_for_state(&shared, std::time::Duration::from_secs(2))?;
+                if a.status != "Connected" {
+                    return Err("Сначала подключите Atlas".into());
+                }
+            }
             let client = reqwest::blocking::Client::builder()
                 .proxy(reqwest::Proxy::all("http://127.0.0.1:17890").map_err(|e| e.to_string())?)
                 .timeout(std::time::Duration::from_secs(10))
@@ -716,7 +715,9 @@ async fn request(
             let start = std::time::Instant::now();
             match client.get(url).send() {
                 Ok(response) => Ok(json!({"ok":response.status().is_success(),"ms":start.elapsed().as_millis(),"status":response.status().as_u16()})),
-                Err(_) => Ok(json!({"ok":false,"ms":null,"status":null})),
+                Err(error) => Ok(json!({"ok":false,"ms":null,"status":null,
+                    "errorKind":if error.is_timeout() {"timeout"} else {"network"},
+                    "error":error.to_string()})),
             }
         }).await.map_err(|e| e.to_string())?;
     }
