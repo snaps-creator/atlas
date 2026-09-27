@@ -1,5 +1,9 @@
 # Atlas
 
+**[Скачать установщик Atlas Alpha 2.0.1 для Windows x64](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas_2.0.1-alpha.1_x64-setup.exe)** · [Подпись .sig](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas_2.0.1-alpha.1_x64-setup.exe.sig)
+
+Для установки скачайте EXE по ссылке выше. «Code → Download ZIP» — архив исходников, не установщик. Проверка размера, SHA-256 и подписи описана в [INSTALLER.md](INSTALLER.md).
+
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
 
@@ -14,7 +18,7 @@ Windows 10/11 x64, Node.js, Rust MSVC, Microsoft C++ Build Tools и Windows SDK.
 ./scripts/build-local.ps1
 ```
 
-Актуальный установщик и соответствующая подпись `.sig` публикуются в [GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest) после успешной сборки. Устаревшие бинарные файлы из корня удалены.
+Установщик и соответствующая подпись `.sig` этой версии опубликованы в [GitHub Releases](https://github.com/snaps-creator/atlas/releases/tag/v2.0.1-alpha.1). Копия EXE в Git хранится через LFS и исключена из архивов исходников, чтобы текстовый указатель не выдавался за приложение Windows.
 Локальная сборка без публикации: `scripts/build-local.ps1`. Без отчёта приёмки скрипт оставляет только непроверенный кандидат в каталоге сборки; в «Загрузки» его не копирует. Текущий статус и блокеры выпуска — в `STATUS.md`.
 Ядро и локальная GeoIP-база включены в проект. `fetch-core.ps1` воспроизводит ядро из локально установленного Clash Verge 2.5.2 с закреплённой контрольной суммой; сведения и хэши находятся в `src-tauri/resources`.
 Дистрибутив пока не подписан издательским сертификатом, поэтому Windows показывает
