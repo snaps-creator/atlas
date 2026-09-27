@@ -11,8 +11,13 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/t
+      # Integration tests spawn real cores. Bound contention on Windows runners
+      # so unrelated tests do not consume a probe core's startup deadline.
+      RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@v6
+        with:
+          lfs: true
 
       - name: Initialize MSVC and CMake
         shell: pwsh
@@ -44,8 +49,9 @@ jobs:
       - name: Verify checked-in installer when present
         shell: pwsh
         run: |
-          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version -replace '^1\.0\.0-beta\.', ''
-          $installer = "Atlas Beta $version Setup.exe"
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $label = if ($version -match '^(\d+\.\d+\.\d+)-alpha(?:\..*)?$') { "Alpha $($Matches[1])" } elseif ($version -match '^1\.0\.0-beta\.(\d+(?:\.\d+)*)$') { "Beta $($Matches[1])" } else { $version }
+          $installer = "Atlas $label Setup.exe"
           if (Test-Path -LiteralPath $installer) {
             node scripts/verify-installer.cjs $installer
             if ($LASTEXITCODE -ne 0) { throw 'Checked-in installer signature is invalid.' }
