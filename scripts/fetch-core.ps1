@@ -1,17 +1,21 @@
+param([string]$Source = 'C:\Program Files\Clash Verge\verge-mihomo.exe')
 $ErrorActionPreference = 'Stop'
-$atlasVersion = 'v1.19.31'
-$atlasExpectedHash = '93d14e9a13b49b2f2d256202d02cc8d14a7c4695edf084cae0f941986bc9c218'
-$atlasProject = Split-Path $PSScriptRoot -Parent
-$atlasTemp = Join-Path $env:TEMP ('atlas-core-' + [guid]::NewGuid())
-New-Item -ItemType Directory $atlasTemp | Out-Null
-$atlasArchive = Join-Path $atlasTemp 'mihomo.zip'
-Invoke-WebRequest "https://github.com/MetaCubeX/mihomo/releases/download/$atlasVersion/mihomo-windows-amd64-compatible-$atlasVersion.zip" -OutFile $atlasArchive
-if ((Get-FileHash $atlasArchive -Algorithm SHA256).Hash.ToLower() -ne $atlasExpectedHash) { throw 'Mihomo SHA-256 mismatch' }
-Expand-Archive $atlasArchive (Join-Path $atlasTemp 'expanded')
-$atlasResource = Join-Path $atlasProject 'src-tauri/resources'
-New-Item -ItemType Directory -Force $atlasResource | Out-Null
-$atlasExecutables = @(Get-ChildItem (Join-Path $atlasTemp 'expanded') -Filter '*.exe')
-if ($atlasExecutables.Count -ne 1) { throw 'Unexpected archive layout' }
-Copy-Item -LiteralPath $atlasExecutables[0].FullName -Destination (Join-Path $atlasResource 'mihomo.exe')
-Invoke-WebRequest "https://raw.githubusercontent.com/MetaCubeX/mihomo/$atlasVersion/LICENSE" -OutFile (Join-Path $atlasResource 'LICENSE-mihomo')
-Write-Output "Verified Mihomo $atlasVersion is ready."
+$expectedVersion = 'v1.19.29'
+$expectedHash = '98986B574E41F92B22ED65AA42A61AD8CADF886CC7B3F76B722CD73A3A52D878'
+$destination = Join-Path (Split-Path $PSScriptRoot -Parent) 'src-tauri\resources\Atlas.Core.exe'
+if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Reference Mihomo not found: $Source" }
+if ((Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash -ne $expectedHash) {
+    throw 'Reference Mihomo SHA-256 mismatch; inspect the new version before changing the pin'
+}
+$versionOutput = (& $Source -v | Out-String)
+if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch "Mihomo Meta $expectedVersion windows amd64") {
+    throw "Reference Mihomo version differs from $expectedVersion"
+}
+Copy-Item -LiteralPath $Source -Destination $destination -Force
+& (Join-Path $PSScriptRoot 'brand-core.ps1') -Executable $destination
+if ($LASTEXITCODE -ne 0) { throw 'Core version resource failed' }
+$brandedVersion = (& $destination -v | Out-String)
+if ($LASTEXITCODE -ne 0 -or $brandedVersion -notmatch "Mihomo Meta $expectedVersion windows amd64") {
+    throw 'Branding damaged the Mihomo executable'
+}
+Write-Output "Atlas.Core.exe contains verified Mihomo $expectedVersion."

@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { check } from "@tauri-apps/plugin-updater";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { startUpdatePolling } from "./updatePolling";
 import {
   Activity,
@@ -49,7 +50,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { boundedLatency, testPool, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
+import { applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel, connectionProtection, afterConnectionReady } from "./protection";
@@ -90,7 +91,8 @@ function App() {
       .then(async (version) => {
         setAppVersion(version);
         const beta = /^1\.0\.0-beta\.(\d+(?:\.\d+)*)$/.exec(version);
-        const label = version === "2.0.0-alpha.local" ? "Local Alpha 2.0" : beta ? `Beta ${beta[1]}` : version;
+        const alpha = /^(\d+\.\d+\.\d+)-alpha(?:\..*)?$/.exec(version);
+        const label = alpha ? `Alpha ${alpha[1]}` : beta ? `Beta ${beta[1]}` : version;
         setVersionLabel(label);
         await getCurrentWindow().setTitle("atlas");
       })
@@ -98,7 +100,7 @@ function App() {
   }, []);
   const [page, setPage] = useState("Dashboard");
   const [data, setData] = useState<Snapshot | null>(null);
-  const { health: poolHealth, checkPool } = usePoolRecovery(data, setData);
+  const { health: poolHealth, checkPool } = usePoolRecovery(data);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [reportBusy, setReportBusy] = useState(false);
@@ -338,6 +340,7 @@ function App() {
   const servers = s?.subscriptions.flatMap((v) => v.servers) ?? [];
   const connected = data?.running ?? false;
   const connecting = data?.status === "Connecting";
+  const protectedPause = data?.status === "ProtectedPause";
   const header = (
     eyebrow: string,
     title: string,
@@ -378,6 +381,8 @@ function App() {
   );
   const latencyContext = JSON.stringify([data?.revision, data?.running, data?.settings.selected,
     data?.settings.subscriptions.map(sub => [sub.id, sub.updatedAt, sub.servers])]);
+  const latencyContextRef = useRef(latencyContext);
+  latencyContextRef.current = latencyContext;
   useEffect(() => {
     if (latencyEpoch.current.update(latencyContext)) setLatencies({});
     return () => { latencyEpoch.current.update("unmounted"); };
@@ -413,14 +418,34 @@ function App() {
     setTestingAll(true);
     setSortLatency(true);
     const names = [...new Set(servers.map(node => node.name))];
+    const batchId = crypto.randomUUID();
+    const nameSet = new Set(names);
+    let active = true;
+    let unlisten: UnlistenFn | undefined;
     setLatencies(previous => ({...previous, ...Object.fromEntries(names.map(name =>
       [name, {status:"testing" as const, delay:null, attempts:0}]))}));
     try {
-      // Each invocation publishes its own result; slow peers never hold up fast ones.
-      await testPool(names, test, 10);
-    } finally { setTestingAll(false); }
+      // Subscribe before invoking so even the first fast result is delivered.
+      unlisten = await listen<LatencyProgress>("latency-result", ({payload}) => {
+        if (!active || latencyContextRef.current !== latencyContext) return;
+        setLatencies(previous => active && latencyContextRef.current === latencyContext
+          ? applyLatencyProgress(previous, payload, batchId, data?.revision, nameSet) : previous);
+      });
+      // One native batch reads app state once. Per-card invocations used to
+      // race the app mutex and falsely label the entire pool as failed.
+      const response = await boundedBatch(request<{revision:number;results:Record<string,Latency>}>("latency_batch", {batchId}),
+        15000 + Math.ceil(names.length / 6) * 12000);
+      if (latencyContextRef.current !== latencyContext || response.revision !== data?.revision) return;
+      setLatencies(previous => ({...previous, ...Object.fromEntries(names.map(name =>
+        [name, {...(response.results[name] ?? {status:"error",delay:null,attempts:0,
+          error:"Ядро не вернуло результат для этого узла"}), measuredAt:Date.now()}]))}));
+    } catch (error) {
+      if (latencyContextRef.current === latencyContext) setLatencies(previous =>
+        failPendingLatencies(previous, names, error));
+    } finally { active = false; unlisten?.(); setTestingAll(false); }
   }
   async function test(name: string) {
+    if (testingAll) return;
     const token = latencyEpoch.current.begin(latencyContext, name);
     if (!token) return;
     setLatencies((l) => ({
@@ -619,6 +644,14 @@ function App() {
               </button>
             </div>
           )}
+          {data?.status === "CleanupError" && (
+            <div className="alert" role="alert">
+              <span>{data.error ?? "Очистка сети Atlas не завершена."}</span>
+              <button disabled={busy} onClick={() => run(() => act("disconnect"))}>
+                Повторить безопасное восстановление
+              </button>
+            </div>
+          )}
           {error && (
             <div role="alert" className="alert">
               <span>{error}</span>
@@ -660,8 +693,10 @@ function App() {
                     <div className="hero-top">
                       <span className="badge">
                         <i className={connected ? "dot online" : "dot"} />
-                        {connecting ? "ПОДКЛЮЧЕНИЕ…" : data.status === "Disconnecting" ? "ОТКЛЮЧЕНИЕ…" : connected
+                        {connecting ? "ПОДКЛЮЧЕНИЕ…" : data.status === "Stopping" ? "ОТКЛЮЧЕНИЕ…" : connected
                           ? "ТУННЕЛЬ ЗАПУЩЕН"
+                          : protectedPause
+                            ? "ЗАЩИЩЁННАЯ ПАУЗА"
                           : data.status === "Error"
                             ? "ОШИБКА ПОДКЛЮЧЕНИЯ"
                             : "ГОТОВ К ПОДКЛЮЧЕНИЮ"}
@@ -676,10 +711,10 @@ function App() {
                     <div className="hero-main">
                       <button
                         aria-label={
-                          connecting ? "Отменить подключение" : connected ? "Отключить VPN" : "Подключить VPN"
+                          connecting ? "Отменить подключение" : connected || protectedPause ? "Отключить VPN" : "Подключить VPN"
                         }
                         className="power"
-                        disabled={(busy && !connecting) || !servers.length}
+                        disabled={(busy && !connecting) || !servers.length || data.status === "CleanupError"}
                         onClick={() =>
                           run(() =>
                             act(
@@ -697,16 +732,18 @@ function App() {
                         )}
                       </button>
                       <div>
-                        <h2>{connecting ? "Подключение…" : data.status === "Disconnecting" ? "Отключение…" : connected ? "Туннель запущен" : "Отключено"}</h2>
+                        <h2>{connecting ? "Подключение…" : data.status === "Stopping" ? "Отключение…" : connected ? "Туннель запущен" : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
                         <p>
                           {connected
                             ? protection.detail
+                            : protectedPause
+                              ? "VPN восстанавливается; прямой обход заблокирован. Нажмите «Отключить», чтобы вернуть обычную сеть."
                             : "Выберите сервер и подключитесь"}
                         </p>
                       </div>
                       <button
                         className="primary connect-btn"
-                        disabled={(busy && !connecting) || !servers.length}
+                        disabled={(busy && !connecting) || !servers.length || data.status === "CleanupError"}
                         onClick={() =>
                           run(() =>
                             act(
@@ -717,7 +754,7 @@ function App() {
                           )
                         }
                       >
-                        {connecting ? "Отменить" : connected ? "Отключить" : "Подключить"}
+                        {connecting ? "Отменить" : connected || protectedPause ? "Отключить" : "Подключить"}
                         <ArrowUpRight size={17} />
                       </button>
                     </div>
@@ -812,7 +849,7 @@ function App() {
                     "Найдите свой маршрут.",
                     "Серверы из ваших подписок. Доступность проверяется через Mihomo.",
                     <button
-                      disabled={!connected || testingAll}
+                      disabled={testingAll || busy || !servers.length}
                       onClick={() =>
                         run(async () => {
                           setTestingAll(true);
@@ -888,7 +925,7 @@ function App() {
                             selected={s?.selected === n.name || (connected && activeServer === n.name)}
                             favorite={s?.favorites.includes(n.name) ?? false}
                             latency={latencies[n.name]} disabled={busy}
-                            testing={!connected || latencies[n.name]?.status === "testing"}
+                            testing={latencies[n.name]?.status === "testing"}
                             onSelect={() => s && run(() => save({ ...s, selected: n.name }))}
                             onTest={() => run(() => test(n.name))}
                             onFavorite={() => s && run(() => save({ ...s, favorites: s.favorites.includes(n.name) ? s.favorites.filter(f => f !== n.name) : [...s.favorites, n.name] }))}
@@ -1478,7 +1515,7 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Об этой сборке</h2>
-                    <p>Atlas {versionLabel} · Mihomo 1.19.31 · React + Tauri + Rust</p>
+                    <p>Atlas {versionLabel} · Mihomo 1.19.29 · сборка {data?.buildId ?? "неизвестна"}</p>
                   </section>
                 </>
               )}

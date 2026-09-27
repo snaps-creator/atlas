@@ -14,8 +14,19 @@ Section 'Atlas service' {
         Select-Object Name, State, Status, ProcessId, ExitCode, StartMode
 }
 Section 'Atlas / Mihomo processes (no command lines)' {
-    Get-CimInstance Win32_Process -Filter "Name='atlas.exe' OR Name='atlas-vpn.exe' OR Name='mihomo.exe' OR Name='verge-mihomo.exe' OR Name='verge-mihomo-alpha.exe' OR Name='clash-verge-service.exe'" |
-        Select-Object Name, ProcessId, ParentProcessId, CreationDate
+    Get-CimInstance Win32_Process -Filter "Name='Atlas.exe' OR Name='Atlas.Service.exe' OR Name='Atlas.Core.exe' OR Name='atlas-vpn.exe' OR Name='mihomo.exe' OR Name='verge-mihomo.exe' OR Name='verge-mihomo-alpha.exe' OR Name='clash-verge-service.exe'" |
+        ForEach-Object {
+            $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+            [pscustomobject]@{
+                Name = $_.Name; ProcessId = $_.ProcessId; ParentProcessId = $_.ParentProcessId
+                CreationDate = $_.CreationDate; ExecutablePath = $_.ExecutablePath
+                Owner = if ($owner -and $owner.ReturnValue -eq 0) { "$($owner.Domain)\$($owner.User)" } else { 'Unavailable' }
+            }
+        }
+}
+Section 'WebView2 runtime process inventory (ownership not inferred)' {
+    Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" |
+        Select-Object Name, ProcessId, ParentProcessId, CreationDate, ExecutablePath
 }
 Section 'DNS listeners and owners (presence alone is not a conflict)' {
     $processNames = @{}
@@ -49,12 +60,12 @@ Section 'Neighbor cache and network profile' {
     Get-NetConnectionProfile | Select-Object InterfaceAlias,NetworkCategory,IPv4Connectivity,IPv6Connectivity
 }
 Section 'Core TCP egress (no browsing names)' {
-    $coreIds = @(Get-CimInstance Win32_Process -Filter "Name='mihomo.exe'" | Select-Object -ExpandProperty ProcessId)
+    $coreIds = @(Get-CimInstance Win32_Process -Filter "Name='Atlas.Core.exe' OR Name='mihomo.exe'" | Select-Object -ExpandProperty ProcessId)
     Get-NetTCPConnection | Where-Object { $_.OwningProcess -in $coreIds } |
         Select-Object OwningProcess,LocalAddress,LocalPort,RemoteAddress,RemotePort,State
 }
 Section 'Windows route lookup for core TCP peers (binding may override)' {
-    $coreIds = @(Get-CimInstance Win32_Process -Filter "Name='mihomo.exe'" | Select-Object -ExpandProperty ProcessId)
+    $coreIds = @(Get-CimInstance Win32_Process -Filter "Name='Atlas.Core.exe' OR Name='mihomo.exe'" | Select-Object -ExpandProperty ProcessId)
     $peers = @(Get-NetTCPConnection | Where-Object { $_.OwningProcess -in $coreIds -and $_.RemoteAddress -notin @('0.0.0.0','127.0.0.1','::','::1') } |
         Select-Object -ExpandProperty RemoteAddress -Unique | Select-Object -First 16)
     foreach ($peer in $peers) {

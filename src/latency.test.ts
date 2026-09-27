@@ -1,5 +1,21 @@
 import { expect, test, vi } from "vitest";
-import { boundedLatency, boundedBatch, historyLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+import { applyLatencyProgress, failPendingLatencies, boundedLatency, boundedBatch, historyLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+
+test("готовый сервер появляется до завершения остальных; поздние чужие результаты игнорируются", () => {
+  const pending: Latency = {status:"testing",delay:null,attempts:0};
+  const initial = {fast: pending, slow: pending};
+  const names = new Set(["fast", "slow"]);
+  const event = {batchId:"current",revision:7,name:"fast",result:{status:"ok" as const,delay:42,attempts:1}};
+  const next = applyLatencyProgress(initial,event,"current",7,names);
+  expect(next.fast.delay).toBe(42);
+  expect(next.slow.status).toBe("testing");
+  expect(applyLatencyProgress(next,{...event,batchId:"old"},"current",7,names)).toBe(next);
+  expect(applyLatencyProgress(next,{...event,revision:6},"current",7,names)).toBe(next);
+  expect(applyLatencyProgress(next,{...event,name:"foreign"},"current",7,names)).toBe(next);
+  const failed = failPendingLatencies(next,["fast","slow"],"deadline");
+  expect(failed.fast).toEqual(next.fast);
+  expect(failed.slow.status).toBe("error");
+});
 
 test("карточка использует историю ядра, отсутствие истории не становится таймаутом", () => {
   expect(historyLatency({alive:false,history:[]})).toBeUndefined();

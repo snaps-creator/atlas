@@ -1,7 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Atlas",
-  "version": "1.0.0-beta.18.1.2",
+  "mainBinaryName": "Atlas",
+  "version": "2.0.1-alpha.1",
   "identifier": "net.atlasvpn.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "atlas",
+        "title": "Atlas Alpha 2.0.1",
         "width": 1780,
         "height": 1050,
         "center": true,
@@ -35,7 +36,7 @@
       "icons/icon.ico"
     ],
     "targets": ["nsis"],
-    "resources": ["resources/mihomo.exe", "resources/LICENSE-mihomo", "resources/LICENSE-geoip", "resources/geoip-manifest.json"],
+    "resources": ["resources/Atlas.Core.exe", "resources/LICENSE-mihomo", "resources/LICENSE-geoip", "resources/geoip-manifest.json"],
     "windows": {
       "nsis": {
         "installMode": "perMachine",

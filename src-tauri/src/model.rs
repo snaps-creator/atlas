@@ -8,6 +8,7 @@ pub const MAX_AUTO_TEST_INTERVAL_SECONDS: u64 = 3600;
 fn default_auto_test_interval_seconds() -> u64 {
     DEFAULT_AUTO_TEST_INTERVAL_SECONDS
 }
+fn legacy_rules_semantics_version() -> u8 { 1 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
@@ -80,6 +81,8 @@ pub struct Settings {
     pub subscriptions: Vec<Subscription>,
     pub selected: String,
     pub default_route: Route,
+    #[serde(default = "legacy_rules_semantics_version")]
+    pub rules_semantics_version: u8,
     pub mode: String,
     pub dns: Dns,
     pub startup: Startup,
@@ -98,6 +101,7 @@ impl Default for Settings {
             subscriptions: vec![],
             selected: "AUTO".into(),
             default_route: Route::Direct,
+            rules_semantics_version: 2,
             mode: "tun".into(),
             dns: Dns {
                 servers: vec![

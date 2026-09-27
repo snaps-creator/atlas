@@ -1,5 +1,9 @@
-param([string]$Executable = 'C:\Program Files\Atlas\atlas-vpn.exe', [int]$Cycles = 5)
+param([string]$Executable = 'C:\Program Files\Atlas\Atlas.exe', [int]$Cycles = 5)
 $ErrorActionPreference = 'Stop'
+$computer = Get-CimInstance Win32_ComputerSystem
+if ("$($computer.Manufacturer) $($computer.Model)" -notmatch 'QEMU|Virtual Machine|VMware|VirtualBox|Standard PC \(Q35') {
+    throw 'Atlas service acceptance tests may only run in an isolated Windows VM.'
+}
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this test as a normal, non-elevated user: administrator permissions hide IPC permission bugs.'

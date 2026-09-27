@@ -15,7 +15,7 @@ fn isolated_core() -> Core {
     let dir = std::env::temp_dir().join(format!("atlas-multi-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut core = Core::new(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/mihomo.exe"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe"),
         dir,
     );
     let ports: Vec<_> = (0..3)
@@ -412,23 +412,25 @@ fn independent_clients_share_vless_server_and_recover_after_its_restart() {
 }
 
 #[test]
-fn recovery_requires_four_successes_and_encoded_names_work_on_real_vless() {
+fn recovery_accepts_one_working_control_and_encoded_names_on_real_vless() {
     let origin=TcpListener::bind("127.0.0.1:0").unwrap();
     let origin_port=origin.local_addr().unwrap().port();origin.set_nonblocking(true).unwrap();
     let done=Arc::new(AtomicBool::new(false));let done_worker=done.clone();
     let reject=Arc::new(AtomicBool::new(false));let reject_worker=reject.clone();
+    let fail_all=Arc::new(AtomicBool::new(false));let fail_all_worker=fail_all.clone();
     let worker=thread::spawn(move || {
         let mut jobs=Vec::new();
         while !done_worker.load(Ordering::SeqCst) {
             if let Ok((mut stream,_))=origin.accept() {
                 let reject=reject_worker.clone();
+                let fail_all=fail_all_worker.clone();
                 jobs.push(thread::spawn(move || {
                     stream.set_nonblocking(false).unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                     let mut request=Vec::new();let mut buffer=[0;1024];
                     while request.len()<8192 && !request.windows(4).any(|v|v==b"\r\n\r\n") {
                         match stream.read(&mut buffer) {Ok(0)|Err(_)=>return,Ok(n)=>request.extend_from_slice(&buffer[..n])}
                     }
-                    let refused=reject.load(Ordering::SeqCst) && String::from_utf8_lossy(&request).contains("/second");
+                    let refused=fail_all.load(Ordering::SeqCst) || (reject.load(Ordering::SeqCst) && String::from_utf8_lossy(&request).contains("/second"));
                     let response=if refused {b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()}
                         else {b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice()};
                     // Mihomo's delay API rejects a measured 0 ms with HTTP 503,
@@ -469,14 +471,29 @@ fn recovery_requires_four_successes_and_encoded_names_work_on_real_vless() {
     assert_eq!(batch[name]["status"],"ok","failed members must not hide a working node in a later batch slot");
     assert_eq!(batch["missing 0"]["status"],"error");
     let rejected=crate::resilient_selection::verify(&client.client(),&settings,&Default::default(),&[&first,&second]);
-    assert!(rejected["candidate"].is_null(),"one working control cannot hide another failed control: {rejected}");
+    assert_eq!(rejected["candidate"],name,"one failed control must not condemn a working VPN node: {rejected}");
+    assert!(rejected["results"][0]["checks"].as_array().unwrap().iter().any(|c|c["result"]["error"].is_string()));
+    fail_all.store(true,Ordering::SeqCst);
+    let failed=crate::resilient_selection::verify_names(&client.client(),&[name.into()],&[&first,&second]);
+    assert!(failed["candidate"].is_null(),"two failed controls cannot release quarantine: {failed}");
+    let mut quarantine=crate::resilient_selection::Recovery::default();
+    quarantine.propose_for_test(failed);
+    quarantine.tick(client.client(),&settings);
+    assert_eq!(quarantine.quarantined_count(),1);
+    fail_all.store(false,Ordering::SeqCst);
+    let repaired=crate::resilient_selection::verify_names(&client.client(),&[name.into()],&[&first,&second]);
+    assert_eq!(repaired["candidate"],name,"recovered node must pass both series: {repaired}");
+    quarantine.propose_for_test(repaired);
+    quarantine.tick(client.client(),&settings);
+    assert_eq!(quarantine.quarantined_count(),0,"only confirmed recheck releases quarantine");
     assert_eq!(client.api("GET","/proxies/ATLAS",None).unwrap()["now"],selected_before,"worker must not mutate selector");
     let mut recovery=crate::resilient_selection::Recovery::default();
     let mut automatic=settings.clone();automatic.selected="AUTO".into();
     client.select("AUTO").unwrap();
     recovery.propose_for_test(verified.clone());
     recovery.tick(client.client(),&automatic);
-    assert_eq!(client.api("GET","/proxies/ATLAS",None).unwrap()["now"],name,"service commits the verified candidate");
+    assert_eq!(client.api("GET","/proxies/ATLAS",None).unwrap()["now"],"AUTO","service keeps the selected group");
+    assert_eq!(client.api("GET","/proxies/AUTO",None).unwrap()["now"],name,"service commits the verified group member");
     recovery.propose_for_test(verified);
     recovery.invalidate();client.select("AUTO").unwrap();
     recovery.tick(client.client(),&automatic);

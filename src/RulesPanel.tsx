@@ -12,6 +12,7 @@ type Preview = {
   duplicates: number;
   conflicts: { key: string; value: string; routes: Route[] }[];
 };
+type Migration = { changed: boolean; before: string[]; after: string[] };
 export function RulesPanel({
   settings: s,
   save,
@@ -31,6 +32,7 @@ export function RulesPanel({
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [preview, setPreview] = useState<Preview | null>(null),
+    [migration, setMigration] = useState<Migration | null>(null),
     [choices, setChoices] = useState<Record<string, Route>>({});
   const rows = s.groups.flatMap((g) =>
     g.rules.map((r, i) => ({ g, r, key: `${g.id}/${i}` })),
@@ -161,6 +163,29 @@ export function RulesPanel({
           </button>
         ))}
       </div>
+      {s.rulesSemanticsVersion === 1 && (
+        <div className="default-route">
+          <div>
+            <strong>Старый порядок правил</strong>
+            <p>Новая семантика: BLOCK → PROXY → DIRECT → маршрут по умолчанию. Сначала просмотрите изменение, затем примените его.</p>
+            <button disabled={busy} onClick={() => void perform(async () =>
+              setMigration(await request<Migration>("rules_migration_preview"))
+            )}>Просмотреть миграцию</button>
+            {migration && (
+              <details open>
+                <summary>{migration.changed ? "Порядок обработки изменится" : "Порядок обработки не изменится"}</summary>
+                <p>Сейчас:</p><pre style={{ maxHeight: 180, overflow: "auto" }}>{migration.before.join("\n")}</pre>
+                <p>После:</p><pre style={{ maxHeight: 180, overflow: "auto" }}>{migration.after.join("\n")}</pre>
+                <button disabled={busy} onClick={() => void perform(async () => {
+                  await request("rules_migration_apply");
+                  await refresh();
+                  setMigration(null);
+                })}>Применить новую семантику</button>
+              </details>
+            )}
+          </div>
+        </div>
+      )}
       <input
         aria-label="Поиск правил"
         placeholder="Приложение, домен, IP или маршрут"
@@ -253,16 +278,12 @@ export function RulesPanel({
       {!rows.length && <p className="muted">Правил пока нет</p>}
       <div className="default-route">
         <span>По умолчанию</span>
-        {s.mode === "tun" ? (
-          <strong>VPN · Вся система</strong>
-        ) : (
-          <RouteSelect
-            value={s.defaultRoute}
-            onChange={(defaultRoute) =>
-              void perform(() => save({ ...s, defaultRoute }))
-            }
-          />
-        )}
+        <RouteSelect
+          value={s.defaultRoute}
+          onChange={(defaultRoute) =>
+            void perform(() => save({ ...s, defaultRoute }))
+          }
+        />
       </div>
       {!modal && error && (
         <div className="error" role="alert">

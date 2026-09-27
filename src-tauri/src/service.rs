@@ -1,4 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::io::Read;
+use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
     Foundation::{
         GetLastError, LocalFree, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
@@ -30,69 +32,6 @@ fn wide(value: &str) -> Vec<u16> {
 
 pub(crate) fn is_stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
-}
-
-/// Independent of the command loop: a stuck core start/apply must not leave
-/// a privileged session and its dynamic filters alive after the desktop exits.
-pub(crate) struct SessionWatch(std::sync::Arc<AtomicBool>);
-impl Drop for SessionWatch {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-fn shutdown_watch(
-    finished: std::sync::Arc<AtomicBool>,
-    mut cancelled: impl FnMut() -> bool,
-    grace: std::time::Duration,
-    terminate: impl FnOnce(),
-) {
-    let mut deadline = None;
-    while !finished.load(Ordering::SeqCst) {
-        if cancelled() && deadline.is_none() {
-            deadline = Some(std::time::Instant::now() + grace);
-        }
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            if !finished.load(Ordering::SeqCst) {
-                terminate();
-            }
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-pub(crate) fn watch_session(parent_pid: u32) -> Result<SessionWatch, String> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, parent_pid) };
-    if handle.is_null() {
-        return Err(windows_error("Наблюдение за клиентом Atlas"));
-    }
-    let parent = unsafe { OwnedHandle::from_raw_handle(handle) };
-    let finished = std::sync::Arc::new(AtomicBool::new(false));
-    let worker_done = finished.clone();
-    std::thread::Builder::new()
-        .name("atlas-session-watch".into())
-        .spawn(move || {
-            shutdown_watch(
-                worker_done,
-                || {
-                    is_stopping()
-                        || unsafe {
-                            WaitForSingleObject(parent.as_raw_handle(), 0) == WAIT_OBJECT_0
-                        }
-                },
-                std::time::Duration::from_secs(5),
-                || {
-                    // Windows closes the dynamic WFP session and the KILL_ON_JOB_CLOSE
-                    // handle, terminating only this service's owned core.
-                    std::process::exit(1);
-                },
-            );
-        })
-        .map_err(|e| format!("Наблюдение за сессией: {e}"))?;
-    Ok(SessionWatch(finished))
 }
 
 fn report(state: u32, accepted: u32, exit_code: u32, wait_hint: u32) {
@@ -172,9 +111,27 @@ pub fn run() -> Result<(), String> {
 fn windows_error(action: &str) -> String {
     format!("{action}: код Windows {}", unsafe { GetLastError() })
 }
+fn file_hash(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let size = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if size == 0 { break; }
+        hash.update(&buffer[..size]);
+    }
+    Ok(hash.finalize().into())
+}
 
 pub fn install() -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let ui_executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let executable = ui_executable.with_file_name("Atlas.Service.exe");
+    if !executable.is_file() {
+        return Err("Отсутствует Atlas.Service.exe".into());
+    }
+    if file_hash(&ui_executable)? != file_hash(&executable)? {
+        return Err("Atlas.Service.exe отличается от установленного Atlas.exe".into());
+    }
     let command = wide(&format!(
         "\"{}\" --network-service",
         executable.to_string_lossy()
@@ -239,7 +196,9 @@ pub fn install() -> Result<(), String> {
         }
         // Users may start/query this service, but cannot reconfigure its privileged binary.
         let mut descriptor = std::ptr::null_mut();
-        let security = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;LCRP;;;AU)");
+        // Authenticated desktop users may query, start and stop their own
+        // on-demand service; reconfiguration remains administrator-only.
+        let security = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;LCRPWP;;;AU)");
         let converted = ConvertStringSecurityDescriptorToSecurityDescriptorW(
             security.as_ptr(),
             1,
@@ -330,6 +289,62 @@ pub fn verify_server_pid(pid: u32) -> Result<(), String> {
     }
 }
 
+pub fn is_running() -> bool {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() { return false; }
+        let service = OpenServiceW(manager, wide(NAME).as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() { CloseServiceHandle(manager); return false; }
+        let mut status: SERVICE_STATUS_PROCESS = std::mem::zeroed();
+        let mut needed = 0;
+        let running = QueryServiceStatusEx(
+            service, SC_STATUS_PROCESS_INFO, &mut status as *mut _ as *mut u8,
+            std::mem::size_of_val(&status) as u32, &mut needed,
+        ) != 0 && status.dwCurrentState == SERVICE_RUNNING;
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        running
+    }
+}
+
+pub fn stop_and_wait() -> Result<(), String> {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() { return Err(windows_error("Диспетчер служб")); }
+        let service = OpenServiceW(manager, wide(NAME).as_ptr(), SERVICE_STOP | SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let missing = GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST;
+            CloseServiceHandle(manager);
+            return if missing { Ok(()) } else { Err(windows_error("Служба Atlas")) };
+        }
+        let mut status: SERVICE_STATUS = std::mem::zeroed();
+        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let outcome = loop {
+            let mut process: SERVICE_STATUS_PROCESS = std::mem::zeroed();
+            let mut needed = 0;
+            if QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                &mut process as *mut _ as *mut u8, std::mem::size_of_val(&process) as u32, &mut needed) == 0 {
+                break Err(windows_error("Ожидание остановки службы Atlas"));
+            }
+            if process.dwCurrentState == SERVICE_STOPPED { break Ok(()); }
+            if std::time::Instant::now() >= deadline {
+                break Err("Служба Atlas не остановилась за 20 секунд; защита сети сохранена".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        outcome
+    }
+}
+
 pub fn uninstall() -> Result<(), String> {
     let name = wide(NAME);
     unsafe {
@@ -363,43 +378,4 @@ pub fn uninstall() -> Result<(), String> {
         CloseServiceHandle(manager);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
-    };
-    #[test]
-    fn cancelled_session_has_a_deadline_even_when_command_loop_is_stuck() {
-        let done = Arc::new(AtomicBool::new(false));
-        let terminated = AtomicBool::new(false);
-        let start = Instant::now();
-        shutdown_watch(
-            done,
-            || true,
-            Duration::from_millis(100),
-            || {
-                terminated.store(true, Ordering::SeqCst);
-            },
-        );
-        assert!(terminated.load(Ordering::SeqCst));
-        assert!(start.elapsed() < Duration::from_secs(2));
-    }
-    #[test]
-    fn clean_shutdown_disarms_forced_exit() {
-        let done = Arc::new(AtomicBool::new(false));
-        let cancel_done = done.clone();
-        shutdown_watch(
-            done,
-            || {
-                cancel_done.store(true, Ordering::SeqCst);
-                true
-            },
-            Duration::from_millis(100),
-            || panic!("normal cleanup must not force exit"),
-        );
-    }
 }

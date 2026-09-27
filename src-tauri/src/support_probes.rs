@@ -62,7 +62,7 @@ fn dns() -> Value {
         socket.connect("127.0.0.1:11053").map_err(|e| e.to_string())?;
         let id = (crate::model::now() as u16).to_be_bytes();
         let mut query = vec![id[0],id[1],1,0,0,1,0,0,0,0,0,0];
-        for label in "www.gstatic.com".split('.') { query.push(label.len() as u8); query.extend(label.as_bytes()); }
+        for label in "cp.cloudflare.com".split('.') { query.push(label.len() as u8); query.extend(label.as_bytes()); }
         query.extend([0,0,1,0,1]);
         socket.send(&query).map_err(|e| format!("DNS send: {e}"))?;
         let mut data = [0;4096];
@@ -71,7 +71,7 @@ fn dns() -> Value {
         Ok(json!({"response":true,"rcode":data[3]&15,"answerCount":u16::from_be_bytes([data[6],data[7]]),
             "truncated":data[2]&2 != 0,"bytes":count}))
     })();
-    json!({"endpoint":"127.0.0.1:11053","question":"www.gstatic.com A",
+    json!({"endpoint":"127.0.0.1:11053","question":"cp.cloudflare.com A",
         "elapsedMs":start.elapsed().as_millis(),"result":result.unwrap_or_else(|e| json!({"response":false,"error":e})),
         "scope":"Local DNS reply; fake-IP response does not prove upstream DNS or VPN success"})
 }
@@ -80,7 +80,7 @@ pub(crate) fn valid_dns_name(name: &str) -> bool {
         !part.is_empty() && part.len() <= 63 && !part.starts_with('-') && !part.ends_with('-') && part.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'-'))
 }
 fn failed_domains(lines: &[String]) -> Vec<String> {
-    let mut domains = vec!["www.gstatic.com".to_owned(),"cp.cloudflare.com".to_owned()];
+    let mut domains = vec!["cp.cloudflare.com".to_owned()];
     for line in lines.iter().rev().filter(|l| !l.starts_with("ATLAS_EVENT") && (l.contains("resolve failed") || l.contains("can't resolve ip"))) {
         if let Some(name) = line.split("--> ").nth(1).and_then(|s|s.split(':').next()) {
             if valid_dns_name(name) && name.parse::<std::net::IpAddr>().is_err() && !domains.iter().any(|s|s == name) { domains.push(name.into()); }
@@ -134,27 +134,30 @@ pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
         match c.api("GET","/proxies",None) {
         Ok(proxies) => {
             let names = sample_nodes(&proxies);
-            let results: Vec<Value> = std::thread::scope(|scope| {
-                let jobs: Vec<_> = names.iter().map(|name| {
-                    let client = c.clone();
-                    scope.spawn(move || {
-                        let mut checks = Vec::new();
-                        for (index, endpoint) in crate::latency::ENDPOINTS.iter().enumerate() {
-                            if Instant::now() >= deadline {
-                                checks.push(json!({"control":index,"skipped":"Export deadline reached"}));
-                                break;
+            let mut results: Vec<Value> = Vec::new();
+            for pair in names.chunks(2) {
+                results.extend(std::thread::scope(|scope| {
+                    let jobs: Vec<_> = pair.iter().map(|name| {
+                        let client = c.clone();
+                        scope.spawn(move || {
+                            let mut checks = Vec::new();
+                            for (index, endpoint) in crate::latency::ENDPOINTS.iter().enumerate() {
+                                if Instant::now() >= deadline {
+                                    checks.push(json!({"control":index,"skipped":"Export deadline reached"}));
+                                    break;
+                                }
+                                let start = Instant::now();
+                                let at = crate::model::now();
+                                let result = crate::latency::verified_probe(&client,name,endpoint);
+                                checks.push(json!({"control":index,"startedAt":at,"elapsedMs":start.elapsed().as_millis(),
+                                    "result":result.unwrap_or_else(|e|json!({"error":e}))}));
                             }
-                            let start = Instant::now();
-                            let at = crate::model::now();
-                            let result = crate::latency::verified_probe(&client,name,endpoint);
-                            checks.push(json!({"control":index,"startedAt":at,"elapsedMs":start.elapsed().as_millis(),
-                                "result":result.unwrap_or_else(|e|json!({"error":e}))}));
-                        }
-                        json!({"name":name,"checks":checks})
-                    })
-                }).collect();
-                jobs.into_iter().map(|j|j.join().unwrap_or_else(|_|json!({"error":"Node probe worker panicked"}))).collect()
-            });
+                            json!({"name":name,"checks":checks})
+                        })
+                    }).collect();
+                    jobs.into_iter().map(|j|j.join().unwrap_or_else(|_|json!({"error":"Node probe worker panicked"}))).collect::<Vec<_>>()
+                }));
+            }
             json!({"tested":names.len(),"limit":6,"selection":"selected node, then failed and healthy samples; not the entire pool","results":results})
         }
         Err(e) => json!({"error":e,"tested":0}),

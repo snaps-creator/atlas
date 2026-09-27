@@ -9,6 +9,7 @@ import {
   Wifi,
 } from "lucide-react";
 import { request } from "./api";
+import { siteResultLabel, type SiteResult } from "./siteChecks";
 import type { Settings } from "./types";
 import "./dashboard.css";
 import type { TrafficSample } from "./traffic";
@@ -35,12 +36,6 @@ const modes = [
     "Весь трафик напрямую, без VPN. Правила не применяются.",
   ],
 ] as const;
-type SiteResult = {
-  ok: boolean;
-  ms: number | null;
-  status: number | null;
-  error?: string;
-};
 export function DashboardTools({
   connected,
   settings,
@@ -95,7 +90,7 @@ export function DashboardTools({
         try {
           result = await request<SiteResult>("site_check", { id });
         } catch (e) {
-          result = { ok: false, ms: null, status: null, error: String(e) };
+          result = { ok: false, ms: null, status: null, errorKind: "local", error: String(e) };
         }
         if (current === generation.current)
           setResults((old) => ({ ...old, [id]: result }));
@@ -278,11 +273,7 @@ export function DashboardTools({
                   title={result?.error}
                 >
                   {result
-                    ? result.ok
-                      ? `HTTP-ответ: ${result.ms} мс`
-                      : result.status
-                        ? `HTTP ${result.status}`
-                        : "Нет ответа"
+                    ? siteResultLabel(result)
                     : checking
                       ? "Проверяем…"
                       : "Не проверен"}

@@ -48,6 +48,17 @@ impl Core {
         c.elevated = true;
         c
     }
+    /// A probe-only core has private loopback listeners and never owns TUN,
+    /// system proxy settings, or the service's fixed controller ports.
+    pub(crate) fn use_ephemeral_ports(&mut self) -> Result<(), String> {
+        let listeners = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| format!("Не удалось выделить порт проверки: {e}")))
+            .collect::<Result<Vec<_>,_>>()?;
+        for (index, listener) in listeners.iter().enumerate() {
+            self.ports[index] = listener.local_addr().map_err(|e| e.to_string())?.port();
+        }
+        Ok(())
+    }
     fn command(&self) -> Command {
         let mut c = Command::new(&self.binary);
         c.creation_flags(0x08000000)
@@ -58,6 +69,13 @@ impl Core {
     }
     pub fn validate(&self, s: &Settings) -> Result<PathBuf, String> {
         let yaml = config::generate(s, &self.secret)?;
+        let yaml = if self.ports != [17890, 19090, 11053] {
+            let mut doc: Value = serde_yaml::from_str(&yaml).map_err(|e| e.to_string())?;
+            doc["mixed-port"] = json!(self.ports[0]);
+            doc["external-controller"] = json!(format!("127.0.0.1:{}", self.ports[1]));
+            doc["dns"]["listen"] = json!(format!("127.0.0.1:{}", self.ports[2]));
+            serde_yaml::to_string(&doc).map_err(|e| e.to_string())?
+        } else { yaml };
         #[cfg(test)]
         let yaml = {
             let mut doc: Value = serde_yaml::from_str(&yaml).map_err(|e| e.to_string())?;
@@ -114,15 +132,19 @@ impl Core {
     pub fn guard_active(&self) -> bool {
         self.started.is_some() && self.broker.as_ref().is_some_and(|broker| broker.alive())
     }
+    pub fn service_reachable(&self) -> bool {
+        self.broker.as_ref().is_some_and(|broker| broker.alive())
+    }
     pub fn running(&mut self) -> bool {
         if let Some(broker) = &self.broker {
             if !broker.alive() {
                 let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
                 return false;
             }
-            // The service closes this session when its core dies. Status polling
-            // must not queue behind URL latency tests on the command pipe.
-            return true;
+            // The service survives the UI and may hold WFP in protected pause.
+            // A live pipe alone is not evidence of a working VPN path.
+            return broker.call("status", Value::Null).is_ok_and(|state|
+                state["running"] == true && state["guard"] == true);
         }
         if let Some(child) = self.child.as_mut() {
             matches!(child.try_wait(), Ok(None))
@@ -141,7 +163,7 @@ impl Core {
             let broker = std::sync::Arc::new(crate::broker::Broker::launch_cancellable(self.continue_running.as_deref())?);
             std::fs::write(
                 self.directory.join("tun-guard.active"),
-                b"Atlas persistent network guard",
+                b"Atlas active network session",
             )
             .map_err(|e| e.to_string())?;
             self.broker = Some(broker.clone());
@@ -243,8 +265,18 @@ impl Core {
                         continue;
                     }
                 }
-                self.api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected})))?;
-                self.commit(&path)?;
+                // The listener can be ready while selecting or persisting the
+                // candidate still fails. Never leave that core (and its TUN)
+                // running after reporting a failed start.
+                if let Err(error) = self
+                    .api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected})))
+                    .and_then(|_| self.commit(&path))
+                {
+                    return match self.stop() {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(format!("{error}; очистка после ошибки запуска: {cleanup}")),
+                    };
+                }
                 self.started = Some(Instant::now());
                 return Ok(());
             }
@@ -334,8 +366,12 @@ impl Core {
                 Ok::<(), String>(())
             })();
             if let Err(rollback_error) = rollback {
-                let _ = self.stop();
-                return Err(format!("{e}. Откат не подтверждён: {rollback_error}. Сессия остановлена."));
+                let cleanup = self.stop();
+                return Err(format!("{e}. Откат не подтверждён: {rollback_error}. {}",
+                    match cleanup {
+                        Ok(()) => "Сессия остановлена.".to_owned(),
+                        Err(error) => format!("Остановка сессии не подтверждена: {error}"),
+                    }));
             }
             return Err(e);
         }
@@ -343,13 +379,19 @@ impl Core {
     }
     pub fn select(&self, name: &str) -> Result<(), String> {
         if let Some(broker) = &self.broker {
-            broker.call("select", json!({"name":name}))?;
+            broker.call_cancellable("select", json!({"name":name}), self.continue_running.as_deref())?;
         } else {
             self.api("PUT", "/proxies/ATLAS", Some(json!({"name":name})))?;
         }
         Ok(())
     }
     pub fn stop(&mut self) -> Result<(), String> {
+        self.stop_with_tun_observer(crate::network_guard::tun_identity)
+    }
+
+    fn stop_with_tun_observer(&mut self, tun_identity: impl Fn() -> Option<u64>) -> Result<(), String> {
+        let had_privileged_core = self.elevated && self.child.is_some();
+        let had_broker = self.broker.is_some();
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
             self.broker = None;
         }
@@ -357,6 +399,16 @@ impl Core {
         if let Some(broker) = self.broker.take() {
             result = broker.call("stop", Value::Null).map(|_| ());
             let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
+        }
+        if had_broker {
+            // Disconnect and Exit both require the on-demand service to be
+            // STOPPED. A live controller must not outlast the desktop.
+            let stopped = crate::service::stop_and_wait();
+            result = match (result, stopped) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(a), Ok(())) | (Ok(()), Err(a)) => Err(a),
+                (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+            };
         }
         if self.elevated && self.child.is_some() {
             // Run sing-tun's real Close path (adapter, routes, DNS cache) before
@@ -375,12 +427,21 @@ impl Core {
         self.started = None;
         self.job = None;
         let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
+        if had_privileged_core {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while tun_identity().is_some() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if tun_identity().is_some() {
+                return Err("Ядро остановлено, но Atlas-TUN ещё существует; восстановление сети не подтверждено".into());
+            }
+        }
         result
     }
 }
 impl Drop for Core {
     fn drop(&mut self) {
-        // Closing the IPC session releases the broker's dynamic WFP filters.
+        // The service observes IPC loss and releases its dynamic WFP session.
         if let Some(mut child) = self.child.take() {
             let job = self.job.take();
             if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(2)) {
@@ -447,7 +508,9 @@ mod integration_tests {
                 .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
                 .unwrap();
         });
-        core.stop().unwrap();
+        // This fixture has a mock API and no TUN. Do not observe the user's
+        // unrelated live Atlas adapter when testing owned-process stop order.
+        core.stop_with_tun_observer(|| None).unwrap();
         worker.join().unwrap();
         assert!(core.child.is_none());
         assert!(!core.running());
@@ -471,12 +534,36 @@ mod integration_tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
+    fn fifty_probe_only_core_cycles_leave_no_owned_process_or_network_listener() {
+        let directory = std::env::temp_dir().join(format!("atlas-fifty-cycles-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
+        let mut core = Core::new(binary, directory.clone());
+        core.use_ephemeral_ports().unwrap();
+        let mut settings = Settings::default();
+        settings.mode = "system".into();
+        settings.subscriptions.push(Subscription { id:"fixture".into(), name:"fixture".into(),
+            masked_url:String::new(), updated_at:0, error:None,
+            servers:vec![json!({"name":"fixture","type":"direct"})] });
+        for cycle in 0..50 {
+            core.start(&settings).unwrap_or_else(|e| panic!("cycle {cycle} start: {e}"));
+            assert!(core.running(), "cycle {cycle}: core stopped before disconnect");
+            assert_eq!(core.api("GET", "/configs", None).unwrap()["tun"]["enable"], false);
+            core.stop().unwrap_or_else(|e| panic!("cycle {cycle} stop: {e}"));
+            assert!(!core.running(), "cycle {cycle}: owned process survived disconnect");
+            assert!(std::net::TcpListener::bind(("127.0.0.1", core.ports[1])).is_ok(),
+                "cycle {cycle}: local controller listener survived exit");
+        }
+        drop(core);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
     fn real_core_accepts_empty_full_tunnel_and_route_exceptions() {
         let directory =
             std::env::temp_dir().join(format!("atlas-config-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let core = Core::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/mihomo.exe"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe"),
             directory.clone(),
         );
         let mut s = Settings::default();
@@ -497,7 +584,7 @@ mod integration_tests {
         let directory =
             std::env::temp_dir().join(format!("atlas-core-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/mihomo.exe");
+        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
         let mut core = Core::new(binary, directory.clone());
         let reservations: Vec<_> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -720,15 +807,25 @@ impl ApiClient {
             .collect())
     }
     pub fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        self.api_cancellable(method, path, body, None)
+    }
+    pub(crate) fn api_cancellable(&self, method: &str, path: &str, body: Option<Value>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Value, String> {
         if let Some(broker) = &self.broker {
             if method == "GET" {
                 // Reads, including connections/status, must not hold the command
                 // loop while the core is stalled. Stop/select retain access to IPC.
                 let delay = path.contains("/delay?");
-                let _permit = crate::query_admission::acquire(delay)?;
+                // The service worker reserves the shared network slot when it
+                // actually begins the Mihomo request. Reserving one here too
+                // would consume two slots per probe and can deadlock a full
+                // batch while every caller waits for its own worker.
+                let _read_permit = if delay { None } else {
+                    Some(crate::query_admission::acquire(false)?)
+                };
                 let job = crate::query_admission::retry_busy(Instant::now()+Duration::from_secs(5), ||
                     broker.call(if delay { "delay" } else { "query" }, json!({"path":path})))?;
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + Duration::from_secs(if delay { 40 } else { 15 });
                 loop {
                     if Instant::now() >= deadline {
                         return Err("Проверка сервера превысила время ожидания".into());
@@ -744,6 +841,14 @@ impl ApiClient {
                 }
             }
             return broker.call("api", json!({"method":method,"path":path}));
+        }
+        // Service-owned scheduled probes and desktop-submitted probes share
+        // one eight-slot admission gate before the network timeout starts.
+        let _permit = if path.contains("/delay?") {
+            Some(crate::query_admission::acquire_cancellable(true, cancelled)?)
+        } else { None };
+        if cancelled.is_some_and(|flag|flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err("CANCELLED: конфигурация сети изменилась".into());
         }
         // Reuse connections to the local controller across status/traffic polls.
         // Authentication remains per request, so sessions never share credentials.

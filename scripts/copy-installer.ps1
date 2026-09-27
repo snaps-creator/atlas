@@ -1,8 +1,9 @@
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $version = (Get-Content -LiteralPath (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version
-$label = if ($version -match '^1\.0\.0-beta\.(\d+(?:\.\d+)*)$') { "Beta $($Matches[1])" } else { $version }
-$source = Join-Path $repo "src-tauri/target/release/bundle/nsis/Atlas_${version}_x64-setup.exe"
+$label = if ($version -match '^(\d+\.\d+\.\d+)-alpha(?:\..*)?$') { "Alpha $($Matches[1])" } elseif ($version -match '^1\.0\.0-beta\.(\d+(?:\.\d+)*)$') { "Beta $($Matches[1])" } else { $version }
+$target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo 'src-tauri/target' }
+$source = Join-Path $target "release/bundle/nsis/Atlas_${version}_x64-setup.exe"
 $destination = Join-Path $repo "Atlas $label Setup.exe"
 if (-not (Test-Path -LiteralPath "$source.sig")) { throw 'Updater signature is missing; refusing to copy an unsigned installer.' }
 Push-Location $repo

@@ -22,6 +22,7 @@ export type Settings = {
   subscriptions: Subscription[];
   selected: string;
   defaultRoute: Route;
+  rulesSemanticsVersion: number;
   mode: string;
   routingMode: "rule" | "global" | "direct";
   tunStack: "gvisor" | "mixed";
@@ -40,6 +41,7 @@ export type Settings = {
 };
 export type Log = { time: number; level: string; message: string };
 export type Snapshot = {
+  buildId?: string;
   revision?: number;
   settings: Settings;
   status: string;
