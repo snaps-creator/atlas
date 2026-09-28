@@ -16,6 +16,7 @@ jobs:
   publish-windows:
     runs-on: windows-latest
     env:
+      ATLAS_BUILD_ID: ${{ github.sha }}
       CARGO_TARGET_DIR: ${{ github.workspace }}/t
       RUST_TEST_THREADS: 4
     steps:

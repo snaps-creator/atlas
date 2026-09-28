@@ -1,3 +1,4 @@
+import { diagnosticEvent } from "./diagnosticEvents";
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { check } from "@tauri-apps/plugin-updater";
@@ -168,7 +169,12 @@ function App() {
   useEffect(() => {
     if (!native) return;
     const polling = startUpdatePolling(
-      () => check({ timeout: 15000 }),
+      async () => {
+        void diagnosticEvent("updater", "check_started");
+        const update=await check({ timeout: 15000 });
+        void diagnosticEvent("updater", update ? "available" : "current", update?.version ?? "");
+        return update;
+      },
       (update) => {
         setAvailableUpdate(update);
         setUpdateCheckStatus("available");
@@ -177,6 +183,7 @@ function App() {
       (reason) => {
         setUpdateCheckStatus("error");
         setUpdateCheckError(String(reason));
+        void diagnosticEvent("updater", "check_failed", reason);
         setUpdateCheckedAt(Date.now());
       },
       {
@@ -314,6 +321,7 @@ function App() {
     let downloaded = 0;
     let total = 0;
     try {
+      await diagnosticEvent("updater", "download_started", availableUpdate.version);
       await availableUpdate.download((event) => {
         if (event.event === "Started") {
           total = event.data.contentLength ?? 0;
@@ -328,10 +336,12 @@ function App() {
       });
       setUpdateStatus("installing");
       if (data?.running || data?.guardActive) await request("disconnect");
+      await diagnosticEvent("updater", "install_started", availableUpdate.version);
       await availableUpdate.install({ restartAfterInstall: true });
     } catch (reason) {
       setUpdateStatus("error");
       setUpdateError(`Не удалось установить обновление: ${String(reason)}`);
+      void diagnosticEvent("updater", "update_failed", reason);
     }
   }
   const s = data?.settings;

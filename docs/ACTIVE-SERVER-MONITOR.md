@@ -1,5 +1,24 @@
 # Active server monitoring
 
+## Independent UI reads
+
+The desktop publishes an immutable internal read snapshot separately from its
+command mutex. Server lists, connection lists, latency checks, service checks,
+pool checks, rules diagnostics and protection checks clone this snapshot without
+waiting for connection or settings mutations. No network call holds the read
+snapshot lock. The service-status observer performs IPC outside the command
+mutex and discards observations from older configuration revisions. An IPC
+error is recorded separately and does not count as confirmed core death.
+
+Concurrent frontend proxy-list reads share a single in-flight request. Failed
+reads are not cached. Passive pool polling retries after five seconds instead
+of waiting five minutes after a local failure. UI errors retain their actual
+reason; stale latency is not displayed as a fresh success. Command start/end
+events record an operation ID, lock wait and execution time without payloads.
+
+Regression checks hold a command lock while 32 snapshot readers complete, and
+exercise 20 simultaneous frontend reads followed by failure and a fresh retry.
+
 AUTO and FAILOVER monitor the actual selected node. A single asynchronous probe
 starts every 10 seconds when the previous probe has completed. Probes never
 overlap with themselves; controller errors are recorded separately from remote

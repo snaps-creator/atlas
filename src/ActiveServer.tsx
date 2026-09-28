@@ -35,10 +35,10 @@ export function ActiveServer({
   poolHealth?: PoolHealth;
 }) {
   const [value, setValue] = useState<{ name: string; delay: number | null; status?:Latency["status"] } | null>(null);
-  const [controlError, setControlError] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
   useEffect(() => {
     setValue(null);
-    setControlError(false);
+    setControlError(null);
     onChange?.(null);
     if (!connected) return;
     let alive = true, pending = false;
@@ -48,13 +48,13 @@ export function ActiveServer({
       try {
         const response = await request<{ proxies: Proxies }>("proxies");
         if (!alive) return;
-        setControlError(false);
+        setControlError(null);
         const name = resolveServer(response.proxies);
         if (!name) { setValue(null); onChange?.(null); return; }
         onChange?.(name);
         const result = selectedLatency(response.proxies);
         setValue({name,delay:result?.delay ?? null,status:result?.status});
-      } catch { if (alive) { setControlError(true); setValue(null); onChange?.(null); } }
+      } catch (error) { if (alive) setControlError(String(error)); }
       finally { pending = false; }
     };
     void poll();
@@ -63,6 +63,6 @@ export function ActiveServer({
   }, [connected, onChange]);
   return <div className="active-server" title={value?.name}>
     <strong>{connected ? value?.name ?? "—" : "—"}</strong>
-    <small className={connected && (controlError || value?.status === "unreachable" || poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "pool-error" : ""} title={poolHealth?.text}>{connected && controlError ? "Нет связи с ядром Atlas" : connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "Все проверки — таймаут" : connected && value?.status === "unreachable" ? "Таймаут выбранного сервера" : connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
+    <small className={connected && (controlError || value?.status === "unreachable" || poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "pool-error" : ""} title={controlError ?? poolHealth?.text}>{connected && controlError ? "Не удалось обновить статус" : connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "Все проверки — таймаут" : connected && value?.status === "unreachable" ? "Таймаут выбранного сервера" : connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
   </div>;
 }

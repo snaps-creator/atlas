@@ -9,7 +9,7 @@
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
 
-Windows-приложение Atlas Alpha 2.0.2 на React, TypeScript, Tauri 3 + CEF, Rust и Mihomo.
+Windows-приложение Atlas Alpha 2.1.1 на React, TypeScript, Tauri 3 + CEF, Rust и Mihomo.
 Подробный статус реализации и подтверждённых проверок: [STATUS.md](docs/STATUS.md).
 
 ## Сборка

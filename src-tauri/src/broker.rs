@@ -233,11 +233,13 @@ impl Broker {
             Err(error) => {
                 // A late reply must never be mistaken for the next command's reply.
                 // Closing the pipe also ends the on-demand service session.
+                crate::incident_history::record("service_transport_failed",json!({"operation":op,"error":error}),&[]);
                 *slot = None;
                 return Err(error);
             }
         };
         if let Some(e) = reply["error"].as_str() {
+            crate::incident_history::record("service_operation_failed",json!({"operation":op,"error":e,"evidence":reply["evidence"]}),&[]);
             Err(e.into())
         } else {
             Ok(reply["result"].clone())
@@ -596,8 +598,9 @@ fn confirm_route(client: &crate::core::ApiClient, settings: &Settings, controls:
         .ok_or("Ядро не указало активный узел для проверки")?.to_owned();
     let report = crate::resilient_selection::verify_names(client, std::slice::from_ref(&name), controls);
     if report["candidate"] == name { return Ok(None); }
+    client.event(json!({"kind":"route_confirmation_failed","at":crate::model::now(),"selected":name,"checks":report}));
     if !matches!(settings.selected.as_str(), "AUTO" | "FAILOVER") {
-        return Err("Закреплённый сервер не прошёл проверку двух контрольных целей".into());
+        return Err("Закреплённый сервер не подтвердил путь; подробные результаты сохранены в диагностике".into());
     }
     let blocked = settings.servers().iter().filter(|n|n["name"] == name)
         .map(crate::resilient_selection::node_key).collect();
@@ -627,6 +630,20 @@ fn confirm_session(core: &mut Core, guard: &network_guard::Guard, settings: &Set
 }
 fn abandon_session(core: &mut Core, guard: &mut Option<network_guard::Guard>,
     configured: &mut bool, active_settings: &mut Option<Settings>, reason: String) -> Result<Value, String> {
+    // Capture BEFORE stop/cleanup invalidates the only source of the primary failure.
+    let logs = core.client().logs().unwrap_or_default();
+    let mut secrets = Vec::new();
+    if let Some(settings) = active_settings.as_ref() {
+        crate::support_report::collect_secrets(&serde_json::to_value(settings).unwrap_or(Value::Null), &mut secrets);
+    }
+    let evidence = json!({"at":crate::model::now(),"stage":"session_abandon_before_cleanup",
+        "reason":reason,"logs":logs.iter().rev().take(256).collect::<Vec<_>>(),
+        "failures":crate::support_report::failure_evidence(&logs)});
+    let path = core.directory.join("last-session-failure.json");
+    let safe = crate::support_report::redact_value(&evidence,&secrets);
+    if let Err(error) = std::fs::write(&path,safe.to_string()) {
+        core.client().event(json!({"kind":"failure_evidence_write_failed","error":error.to_string()}));
+    }
     let paused = guard.as_ref().map(|policy| policy.pause(&core.binary)).unwrap_or(Ok(()));
     let stopped = core.stop();
     if stopped.is_ok() { *guard = None; }
@@ -900,7 +917,15 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
         })();
         let reply = match result {
             Ok(v) => json!({"result":v}),
-            Err(e) => json!({"error":e}),
+            Err(e) => {
+                let persisted=std::fs::read_to_string(core.directory.join("last-session-failure.json")).ok()
+                    .and_then(|v|serde_json::from_str::<Value>(&v).ok());
+                let logs=core.client().logs().unwrap_or_default();
+                let evidence=json!({"at":crate::model::now(),"sessionId":session_id,"networkEpoch":network_epoch,
+                    "configured":configured,"beforeCleanup":persisted,
+                    "logs":logs.iter().rev().take(128).collect::<Vec<_>>()});
+                json!({"error":e,"evidence":crate::support_report::redact_value(&evidence,&[])})
+            },
         };
         if send(&mut pipe, &reply).is_err() {
             break;

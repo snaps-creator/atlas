@@ -27,7 +27,7 @@ impl History {
 static HISTORY: OnceLock<Mutex<History>> = OnceLock::new();
 fn history() -> &'static Mutex<History> { HISTORY.get_or_init(Default::default) }
 pub fn record(kind: &str, value: Value, secrets: &[String]) {
-    let safe = crate::support_report::redact(&value.to_string(), secrets);
+    let safe = crate::support_report::redact_value(&value, secrets).to_string();
     // Text intentionally remains text: redaction is allowed to change JSON syntax.
     let item = json!({"at":crate::model::now(),"kind":kind,"evidence":safe});
     if let Ok(mut h) = history().lock() { h.push(item); }
@@ -49,6 +49,8 @@ pub fn load(path: &Path) {
     }
 }
 pub fn flush(path: &Path) -> Result<(), String> {
+    static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
+    let _writer = WRITER.get_or_init(Default::default).lock().map_err(|_| "History writer unavailable")?;
     use std::io::Write;
     let (all, new, sequence, first) = {
         let h = history().lock().map_err(|_| "History unavailable")?;

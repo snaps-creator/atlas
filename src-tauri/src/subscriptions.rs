@@ -192,10 +192,14 @@ pub fn download(raw: &str, connected: bool) -> Result<Vec<Value>, String> {
         .map_err(|_| "Ошибка HTTPS клиента")?;
     let mut response = client
         .get(u)
-        .header("User-Agent", "Atlas/1.0-beta.1 mihomo")
+        .header("User-Agent", concat!("Atlas/",env!("CARGO_PKG_VERSION")," mihomo"))
         .send()
-        .map_err(|_| {
-            "Не удалось загрузить подписку: проверьте сеть и TLS. Предыдущая версия сохранена."
+        .map_err(|e| {
+            let mut chain=e.to_string();
+            let mut source=std::error::Error::source(&e);
+            while let Some(error)=source {chain.push_str(&format!(" -> {error}"));source=error.source();}
+            format!("Загрузка подписки: timeout={}, connect={}, {}; предыдущая версия сохранена",
+                e.is_timeout(),e.is_connect(),crate::support_report::redact(&chain,&[raw.to_owned()]))
         })?;
     if !response.status().is_success() {
         return Err(format!(
@@ -247,5 +251,24 @@ mod tests {
         let plain = parse("vless://id@example.com:443?security=none&fp=firefox&alpn=h2#plain").unwrap();
         assert!(plain[0].get("client-fingerprint").is_none());
         assert!(plain[0].get("alpn").is_none());
+    }
+}
+
+/// A delayed refresh must not overwrite a newer manual refresh or restore a deleted subscription.
+pub(crate) fn refresh_is_current(before: Option<&crate::model::Subscription>, current: Option<&crate::model::Subscription>) -> bool {
+    matches!((before,current),(Some(a),Some(b)) if a.id==b.id && a.updated_at==b.updated_at && a.servers==b.servers)
+}
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    #[test]
+    fn stale_or_deleted_subscription_is_never_overwritten() {
+        let a=crate::model::Subscription{id:"a".into(),name:"A".into(),masked_url:String::new(),updated_at:10,error:None,servers:vec![json!({"server":"old"})]};
+        assert!(refresh_is_current(Some(&a),Some(&a)));
+        assert!(!refresh_is_current(Some(&a),None));
+        let mut b=a.clone(); b.updated_at=11;
+        assert!(!refresh_is_current(Some(&a),Some(&b)));
+        b.updated_at=10; b.servers=vec![json!({"server":"new"})];
+        assert!(!refresh_is_current(Some(&a),Some(&b)));
     }
 }

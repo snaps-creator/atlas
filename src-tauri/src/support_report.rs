@@ -252,6 +252,16 @@ pub(crate) fn collect_secrets(value: &Value, result: &mut Vec<String>) {
     }
 }
 
+/// Redact leaf strings before serializing so embedded evidence stays valid JSON.
+pub(crate) fn redact_value(value: &Value, secrets: &[String]) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact(text,secrets)),
+        Value::Array(items) => Value::Array(items.iter().map(|v|redact_value(v,secrets)).collect()),
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k,v)|(k.clone(),redact_value(v,secrets))).collect()),
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn redact(text: &str, secrets: &[String]) -> String {
     let mut output = text.to_owned();
     let mut secrets = secrets.to_vec();
@@ -396,18 +406,24 @@ pub(crate) fn save(
         secrets.extend(cached.secrets);
         serde_json::json!({"capturedAt":cached.captured_at,"revision":cached.revision,"configuration":cached.configuration})
     }).unwrap_or_else(||serde_json::json!({"error":"No final cached context"}));
+    let coverage = diagnostic_coverage(&parts);
     let analysis = conclusions(&parts);
-    let evidence = serde_json::to_string_pretty(&parts).map_err(|e|e.to_string())?;
+    let evidence = serde_json::to_string_pretty(&redact_value(&Value::Object(parts.clone()),&secrets)).map_err(|e|e.to_string())?;
+    let context = match serde_json::from_str::<Value>(&context) {
+        Ok(value)=>redact_value(&value,&secrets).to_string(),Err(_)=>redact(&context,&secrets)
+    };
+    let final_context=redact_value(&final_context,&secrets);
+    let history=redact_value(&history,&secrets);
     let text = format!(
-        "Atlas incident report / schema 3\nVersion: {}\nStarted (Unix UTC): {started}\nCompleted: {}\n\
+        "Atlas incident report / schema 4\nVersion: {}\nStarted (Unix UTC): {started}\nCompleted: {}\n\
         Limited active probes requested by export. Selectors, routes, DNS settings and WFP policy were not changed.\n\
         Probe histories can change during URL tests and automatic recovery can still run. Samples are timestamped, not atomic.\n\
         Missing sections: {missing:?}\n\n=== Confirmed observations and interpretation ===\n{}\n\n\
-        === Atlas state at request ===\n{context}\n\n=== Last cached configuration at completion (compare revisions) ===\n{final_context}\n\n=== History before export ===\n{history}\n\n=== Incident evidence ===\n{evidence}\n",
+        === Atlas state at request ===\n{context}\n\n=== Last cached configuration at completion (compare revisions) ===\n{final_context}\n\n=== History before export ===\n{history}\n\n=== Diagnostic coverage ===\n{coverage}\n\n=== Incident evidence ===\n{evidence}\n",
         env!("CARGO_PKG_VERSION"),
         crate::model::now(),serde_json::to_string_pretty(&analysis).map_err(|e|e.to_string())?
     );
-    std::fs::write(path, format!("\u{feff}{}", redact(&text, &secrets)))
+    std::fs::write(path, format!("\u{feff}{text}"))
         .map_err(|e| format!("Не удалось сохранить отчёт: {e}"))?;
     Ok(true)
 }
@@ -616,5 +632,49 @@ function Get-WinEvent { param($FilterHashtable,$MaxEvents) [pscustomobject]@{Id=
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
+    }
+}
+
+// Every domain declares its source and missing evidence; absence is never success.
+fn diagnostic_coverage(parts: &serde_json::Map<String,Value>) -> Value {
+    let rows = [
+        ("Windows adapters / DNS / routes / proxy / services", "windows"),
+        ("WFP policy and privileged service", "privileged"),
+        ("Core logs / actual selector / traffic", "before"),
+        ("DNS resolution / HTTP control / sampled VPN nodes", "active"),
+        ("State after probes", "after"),
+    ].into_iter().map(|(domain,source)| {
+        let data=parts.get(source);
+        json_coverage(domain,source,data)
+    }).collect::<Vec<_>>();
+    serde_json::json!({"sections":rows,
+        "operationEvidence":"History includes command start/completion/error, queue time, revision, and subscription refresh outcome. Last failure before cleanup preserves primary checks and core logs.",
+        "limits":["Installation failures before the app starts require installer logs; this report cannot infer them from an installed app.",
+            "A timeout alone cannot distinguish network filtering from an unresponsive remote peer.",
+            "Historical Windows state is unavailable if it was not captured at the incident."]})
+}
+fn json_coverage(domain: &str, source: &str, data: Option<&Value>) -> Value {
+    serde_json::json!({"domain":domain,"source":source,"state":match data {
+        None=>"missing",Some(v) if v.get("error").is_some()=>"collection_failed",Some(_)=>"captured_not_a_health_verdict"
+    },"collectionError":data.and_then(|v|v.get("error"))})
+}
+
+#[cfg(test)]
+mod diagnostic_integrity_tests {
+    use super::*;
+    #[test]
+    fn redacted_nested_evidence_remains_machine_readable() {
+        let input=serde_json::json!({"error":"Get \"https://example.test/private\": TLS handshake failed", "checks":[{"error":"token=hidden timeout"}]});
+        let safe=redact_value(&input,&["hidden".into()]);
+        let encoded=safe.to_string();
+        assert!(serde_json::from_str::<Value>(&encoded).is_ok());
+        assert!(!encoded.contains("https://example.test"));
+        assert!(!encoded.contains("hidden"));
+        assert!(safe["error"].as_str().unwrap().contains("TLS handshake failed"));
+    }
+    #[test]
+    fn missing_collectors_cannot_be_reported_as_success() {
+        assert_eq!(json_coverage("DNS","active",None)["state"],"missing");
+        assert_eq!(json_coverage("service","privileged",Some(&serde_json::json!({"error":"access denied"})))["state"],"collection_failed");
     }
 }
