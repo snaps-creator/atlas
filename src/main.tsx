@@ -39,7 +39,7 @@ import { request, download, bytes, native } from "./api";
 import { RouteSelect, routeName } from "./RuleEditor";
 import type { Snapshot, Settings, Group, Connection } from "./types";
 import "./style.css";
-import "./arcade.css";
+
 import { RulesPanel } from "./RulesPanel";
 import { RuleChecks } from "./RuleChecks";
 import { DashboardTools } from "./DashboardTools";
@@ -51,6 +51,7 @@ import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
 import { applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
+import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel, connectionProtection, afterConnectionReady } from "./protection";

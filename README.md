@@ -1,14 +1,14 @@
 # Atlas
 
-**[Скачать установщик Atlas Alpha 2.0.1 для Windows x64](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas_2.0.1-alpha.1_x64-setup.exe)** · [Подпись .sig](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas_2.0.1-alpha.1_x64-setup.exe.sig)
+**[Скачать Atlas Alpha 2.0.1 — ZIP с EXE и подписью](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas-2.0.1-alpha.1-Windows-x64.zip)**
 
-Для установки скачайте EXE по ссылке выше. «Code → Download ZIP» — архив исходников, не установщик. Проверка размера, SHA-256 и подписи описана в [INSTALLER.md](INSTALLER.md).
+Распакуйте ZIP и запустите `Atlas Alpha 2.0.1 Setup.exe`. Внутри настоящий установщик, подпись `.sig` и контрольная сумма. Размер EXE — 162 232 261 байт. [Сведения об установщике](INSTALLER.md).
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
 
 Windows-приложение Atlas Alpha 2.0.1 на React, TypeScript, Tauri 3 + CEF, Rust и Mihomo.
-Подробный статус реализации и подтверждённых проверок: [STATUS.md](STATUS.md).
+Подробный статус реализации и подтверждённых проверок: [STATUS.md](docs/STATUS.md).
 
 ## Сборка
 
@@ -18,17 +18,17 @@ Windows 10/11 x64, Node.js, Rust MSVC, Microsoft C++ Build Tools и Windows SDK.
 ./scripts/build-local.ps1
 ```
 
-Установщик и соответствующая подпись `.sig` этой версии опубликованы в [GitHub Releases](https://github.com/snaps-creator/atlas/releases/tag/v2.0.1-alpha.1). Копия EXE в Git хранится через LFS и исключена из архивов исходников, чтобы текстовый указатель не выдавался за приложение Windows.
-Локальная сборка без публикации: `scripts/build-local.ps1`. Без отчёта приёмки скрипт оставляет только непроверенный кандидат в каталоге сборки; в «Загрузки» его не копирует. Текущий статус и блокеры выпуска — в `STATUS.md`.
+Установщик и соответствующая подпись `.sig` этой версии опубликованы в [GitHub Releases](https://github.com/snaps-creator/atlas/releases/tag/v2.0.1-alpha.1). Копия EXE в Git хранится через LFS. Для «Code → Download ZIP» требуется настройка GitHub «Include Git LFS objects in archives»; готовый ZIP по ссылке выше от неё не зависит.
+Локальная сборка без публикации: `scripts/build-local.ps1`. Без отчёта приёмки скрипт оставляет только непроверенный кандидат в каталоге сборки; в «Загрузки» его не копирует. Текущий статус и блокеры выпуска — в `docs/STATUS.md`.
 Ядро и локальная GeoIP-база включены в проект. `fetch-core.ps1` воспроизводит ядро из локально установленного Clash Verge 2.5.2 с закреплённой контрольной суммой; сведения и хэши находятся в `src-tauri/resources`.
 Дистрибутив пока не подписан издательским сертификатом, поэтому Windows показывает
 «Неизвестный издатель» при установке. При обычном запуске Atlas этот запрос больше
 не появляется: привилегированные сетевые операции выполняет установленная служба.
 
-Автоматические обновления поставляются через подписанные GitHub Releases. Инструкция для выпуска новой версии: [UPDATES.md](UPDATES.md).
+Автоматические обновления поставляются через подписанные GitHub Releases. Инструкция для выпуска новой версии: [UPDATES.md](docs/UPDATES.md).
 
 При обрыве сохраните TXT в разделе «Диагностика» до перезагрузки. Состав данных,
-ограничения и правила интерпретации: [INCIDENT-DIAGNOSTICS.md](INCIDENT-DIAGNOSTICS.md).
+ограничения и правила интерпретации: [INCIDENT-DIAGNOSTICS.md](docs/INCIDENT-DIAGNOSTICS.md).
 
 ## Подключение
 
@@ -37,7 +37,7 @@ Windows 10/11 x64, Node.js, Rust MSVC, Microsoft C++ Build Tools и Windows SDK.
 3. Используйте переключатель подключения. UAC требуется один раз при установке или
    обновлении системной сетевой службы, а не при каждом запуске и подключении.
 
-Перед проверкой TUN отключите другой активный VPN. Сетевая приёмка восстановления после аварии ещё не завершена — см. STATUS.md и TUN-VALIDATION.md.
+Перед проверкой TUN отключите другой активный VPN. Сетевая приёмка восстановления после аварии ещё не завершена — см. docs/STATUS.md и docs/TUN-VALIDATION.md.
 
 ## Правила
 
