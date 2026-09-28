@@ -796,6 +796,13 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    pub(crate) fn session_running(&self) -> Result<bool,String> {
+        if let Some(broker)=&self.broker {
+            if !broker.alive() { return Ok(false); }
+            return broker.call("status",Value::Null).map(|s|s["running"]==true && s["guard"]==true);
+        }
+        self.api("GET","/version",None).map(|_|true)
+    }
     #[cfg(test)]
     pub(crate) fn loopback_fixture(port: u16) -> Self {
         Self { controller_port:port, secret:String::new(), broker:None, logs:Default::default() }
@@ -899,7 +906,15 @@ impl ApiClient {
         if let Some(b) = body {
             req = req.json(&b)
         }
-        let response = req.send().map_err(|e| format!("Mihomo API недоступен: {}",crate::support_report::redact(&e.to_string(), &[self.secret.clone()])))?;
+        let response = req.send().map_err(|e| {
+            let mut chain=e.to_string();
+            let mut source=std::error::Error::source(&e);
+            while let Some(error)=source {chain.push_str(&format!(" -> {error}"));source=error.source();}
+            let detail=crate::support_report::redact(&chain,&[self.secret.clone()]);
+            self.event(json!({"at":crate::model::now(),"kind":"controller_transport_failure","path":path,
+                "timeout":e.is_timeout(),"connectError":e.is_connect(),"error":detail}));
+            format!("Mihomo API недоступен: {detail}")
+        })?;
         let status = response.status();
         if !status.is_success() {
             let detail = response.text().unwrap_or_default().chars().take(1024).collect::<String>();

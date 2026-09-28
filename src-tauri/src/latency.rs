@@ -133,7 +133,11 @@ pub(crate) fn verified_probe(client: &ApiClient, name: &str, endpoint: &str) -> 
     // Its per-URL alive flag includes that status check; the delay alone does not.
     let health = &proxies["proxies"][name]["extra"][endpoint];
     if health["alive"] != true {
-        return Err(CONTROL_STATUS_ERROR.into());
+        client.event(json!({"kind":"control_status_rejected","at":crate::model::now(),"name":name,
+            "controlHost":url::Url::parse(endpoint).ok().and_then(|u|u.host_str().map(str::to_owned)),
+            "expectedStatus":expected_status(endpoint),"returnedDelay":result["delay"],"health":health}));
+        return Err(format!("{CONTROL_STATUS_ERROR}; expected={}, returnedDelay={}, perUrlAlive={}",
+            expected_status(endpoint),result["delay"],health["alive"]));
     }
     if result["delay"].as_u64().is_none() { return Err("Ядро не вернуло задержку".into()); }
     Ok(json!({"delay":result["delay"],"expectedStatusMatched":true,"health":health}))

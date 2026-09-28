@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 export const native = isTauri();
+const reads = new Map<string, Promise<unknown>>();
 export async function request<T>(
   action: string,
   payload?: unknown,
@@ -8,6 +9,14 @@ export async function request<T>(
     throw new Error(
       "Откройте Atlas как Windows-приложение. В браузере нет доступа к Mihomo и настройкам Windows.",
     );
+  if (action === "proxies" && payload === undefined) {
+    const existing = reads.get(action);
+    if (existing) return existing as Promise<T>;
+    const pending = invoke<T>("request", { action, payload });
+    reads.set(action, pending);
+    try { return await pending; }
+    finally { if (reads.get(action) === pending) reads.delete(action); }
+  }
   return invoke<T>("request", { action, payload });
 }
 export function download(name: string, value: unknown) {

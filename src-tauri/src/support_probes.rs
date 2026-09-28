@@ -19,7 +19,7 @@ fn http_with(endpoint: &str, proxy: Option<&str>, timeout: Duration) -> Value {
     let mut builder = reqwest::blocking::Client::builder().no_proxy()
         .connect_timeout(timeout.min(Duration::from_secs(3))).timeout(timeout)
         .redirect(reqwest::redirect::Policy::none());
-    if let Some(proxy) = proxy { builder = builder.proxy(reqwest::Proxy::http(proxy).unwrap()); }
+    if let Some(proxy) = proxy { builder = builder.proxy(reqwest::Proxy::all(proxy).unwrap()); }
     let response = builder.build().and_then(|client| client.head(endpoint).send());
     let path = if proxy.is_some() { "local_mixed_proxy" } else { "windows_default_path" };
     match response {
@@ -191,6 +191,23 @@ mod tests {
         assert_eq!(sample_nodes(&p),vec!["healthy","failed"]);
         p["proxies"]["ATLAS"]["now"] = json!("ATLAS");
         assert_eq!(sample_nodes(&p),vec!["failed","healthy"]);
+    }
+    #[test]
+    fn https_probe_must_use_the_requested_proxy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream,_) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = [0;2048];
+            let count = stream.read(&mut bytes).unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..count]).starts_with("CONNECT reserved.invalid:443"));
+            stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").unwrap();
+        });
+        let result = http_with("https://reserved.invalid/",Some(&format!("http://{address}")),Duration::from_secs(2));
+        worker.join().unwrap();
+        assert_eq!(result["path"],"local_mixed_proxy");
+        assert_eq!(result["httpResponded"],false);
     }
     #[test]
     fn http_probe_records_status_and_bounds_a_stalled_peer() {

@@ -24,6 +24,7 @@ mod service;
 mod session_cleanup;
 mod storage;
 mod subscriptions;
+#[cfg(test)]
 mod site_checks;
 mod support_report;
 mod support_probes;
@@ -40,6 +41,7 @@ use tauri_plugin_autostart::ManagerExt;
 struct App {
     revision: u64,
     published: published_state::PublishedState,
+    reads: published_state::ReadState,
     diagnostic_access: support_report::Access,
     cancellation: cancellation::Cancellation,
     settings: Settings,
@@ -47,6 +49,7 @@ struct App {
     core: core::Core,
     status: String,
     error: Option<String>,
+    control_error: Option<String>,
     logs: Vec<Value>,
     reconnect: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -60,7 +63,13 @@ impl App {
         }
     }
     fn snapshot(&mut self) -> Value {
-        let running = self.core.running();
+        self.reads.set(published_state::ReadSnapshot {
+            revision:self.revision, settings:self.settings.clone(), status:self.status.clone(),
+            client:self.core.client(), binary:self.core.binary.clone(), directory:self.core.directory.clone(),
+        });
+        // Only the independent service observer changes connection state.
+        // Publishing UI data must never perform network I/O under App's mutex.
+        let running = self.status == "Connected";
         self.diagnostic_access.update(self.revision,&self.settings,self.core.client());
         let mut s = self.settings.clone();
         for group in &mut s.groups {
@@ -77,9 +86,44 @@ impl App {
         }
         let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs,"buildId":env!("ATLAS_BUILD_ID")});
         let mut value = value;
+        value["controlError"] = json!(self.control_error);
         value["revision"] = json!(self.revision);
         self.published.set(value.clone());
         value
+    }
+    fn install_subscription(&mut self, id: String, url: String, mut nodes: Vec<Value>, label: Option<String>, entry: Option<keyring::Entry>) -> Result<(),String> {
+                for (i, node) in nodes.iter_mut().enumerate() {
+                    let name = node["name"].as_str().unwrap_or("Сервер");
+                    node["name"] = json!(format!("{} · {}-{}", name, &id[..8], i + 1));
+                }
+                let mut next = self.settings.clone();
+                let old = next.subscriptions.iter().position(|s| s.id == id);
+                let name = label
+                    .or_else(|| old.map(|i| next.subscriptions[i].name.clone()))
+                    .unwrap_or("Подписка".into());
+                let sub = Subscription {
+                    id: id.clone(),
+                    name,
+                    masked_url: subscriptions::mask(&url),
+                    updated_at: now(),
+                    error: None,
+                    servers: nodes,
+                };
+                if let Some(i) = old {
+                    next.subscriptions[i] = sub
+                } else {
+                    next.subscriptions.push(sub)
+                }
+                if !next.servers().iter().any(|s| s["name"] == next.selected)
+                    && !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
+                {
+                    next.selected = "AUTO".into()
+                };
+                self.core.validate(&next)?;
+                if let Some(entry) = entry { entry.set_password(&url).map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?; }
+                self.save(next)?;
+                self.log("INFO", "Подписка обновлена и проверена Mihomo");
+        Ok(())
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
         next.mode = "tun".into();
@@ -382,7 +426,7 @@ impl App {
                         .get_password()
                         .map_err(|_| "Ссылка подписки отсутствует в хранилище Windows")?
                 };
-                let mut nodes = match subscriptions::download(&url, self.core.running()) {
+                let nodes = match subscriptions::download(&url, self.core.running()) {
                     Ok(n) => n,
                     Err(e) => {
                         if let Some(s) = self.settings.subscriptions.iter_mut().find(|s| s.id == id)
@@ -393,43 +437,8 @@ impl App {
                         return Err(e);
                     }
                 };
-                for (i, node) in nodes.iter_mut().enumerate() {
-                    let name = node["name"].as_str().unwrap_or("Сервер");
-                    node["name"] = json!(format!("{} · {}-{}", name, &id[..8], i + 1));
-                }
-                let mut next = self.settings.clone();
-                let old = next.subscriptions.iter().position(|s| s.id == id);
-                let name = p["name"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| old.map(|i| next.subscriptions[i].name.clone()))
-                    .unwrap_or("Подписка".into());
-                let sub = Subscription {
-                    id: id.clone(),
-                    name,
-                    masked_url: subscriptions::mask(&url),
-                    updated_at: now(),
-                    error: None,
-                    servers: nodes,
-                };
-                if let Some(i) = old {
-                    next.subscriptions[i] = sub
-                } else {
-                    next.subscriptions.push(sub)
-                }
-                if !next.servers().iter().any(|s| s["name"] == next.selected)
-                    && !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
-                {
-                    next.selected = "AUTO".into()
-                };
-                self.core.validate(&next)?;
-                if action == "subscription_add" {
-                    entry
-                        .set_password(&url)
-                        .map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?
-                }
-                self.save(next)?;
-                self.log("INFO", "Подписка обновлена и проверена Mihomo");
+                self.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned),
+                    (action == "subscription_add").then_some(entry))?;
             }
             "subscription_delete" => {
                 let id = p["id"].as_str().ok_or("Нет ID")?;
@@ -555,6 +564,19 @@ async fn request(
     state: tauri::State<'_, Shared>,
     action: String,
     payload: Option<Value>,
+) -> Result<Value,String> {
+    let started=std::time::Instant::now();
+    let result=request_inner(app,state,action.clone(),payload).await;
+    if let Err(error)=&result {
+        incident_history::record("request_failed",json!({"action":action,"elapsedMs":started.elapsed().as_millis(),"error":error}),&[]);
+    }
+    result
+}
+async fn request_inner(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+    action: String,
+    payload: Option<Value>,
 ) -> Result<Value, String> {
     let shared = state.inner().clone();
     if action.starts_with("lan_") {
@@ -567,9 +589,9 @@ async fn request(
     }
     if action == "pool_probe" {
         let (client, revision, names) = {
-            let a = shared.try_lock().map_err(|_| "Atlas занят; проверка отложена")?;
+            let a = app.state::<published_state::ReadState>().get()?;
             if a.status != "Connected" { return Err("Atlas не подключён".into()); }
-            (a.core.client(), a.revision, a.settings.servers().iter()
+            (a.client.clone(), a.revision, a.settings.servers().iter()
                 .filter_map(|n|n["name"].as_str().map(str::to_owned)).collect::<Vec<_>>())
         };
         return tauri::async_runtime::spawn_blocking(move || {
@@ -642,11 +664,7 @@ async fn request(
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "connections" || action == "proxies" {
-        let client = shared
-            .try_lock()
-            .map_err(|_| "Atlas занят, повторите операцию")?
-            .core
-            .client();
+        let client = app.state::<published_state::ReadState>().get()?.client.clone();
         return tauri::async_runtime::spawn_blocking(move || {
             client.api(
                 "GET",
@@ -662,11 +680,7 @@ async fn request(
         .map_err(|e| e.to_string())?;
     }
     if action == "public_ip" {
-        if !shared
-            .try_lock()
-            .map_err(|_| "Atlas занят, повторите операцию")?
-            .core
-            .running()
+        if app.state::<published_state::ReadState>().get()?.status != "Connected"
         {
             return Err("Сначала подключитесь".into());
         }
@@ -703,9 +717,10 @@ async fn request(
             "telegram" => "https://web.telegram.org",
             _ => return Err("Неизвестный сервис".into()),
         };
+        let reads = app.state::<published_state::ReadState>().inner().clone();
         return tauri::async_runtime::spawn_blocking(move || {
             {
-                let a = site_checks::wait_for_state(&shared, std::time::Duration::from_secs(2))?;
+                let a = reads.get()?;
                 if a.status != "Connected" {
                     return Err("Сначала подключите Atlas".into());
                 }
@@ -728,9 +743,7 @@ async fn request(
         let payload = payload.ok_or("Нет правила")?;
         let key = payload["key"].as_str().ok_or("Нет ключа правила")?;
         let (settings, client, rule, route) = {
-            let a = shared
-                .try_lock()
-                .map_err(|_| "Atlas занят, повторите операцию")?;
+            let a = app.state::<published_state::ReadState>().get()?;
             if a.settings.routing_mode != RoutingMode::Rule {
                 return Err("Для проверки правил включите режим «Правила» на Главной".into());
             }
@@ -744,7 +757,7 @@ async fn request(
                 .ok_or("Правило отсутствует или отключено")?;
             (
                 a.settings.clone(),
-                a.core.client(),
+                a.client.clone(),
                 rule.clone(),
                 route.clone(),
             )
@@ -757,10 +770,8 @@ async fn request(
     }
     if action == "diagnostics" {
         let (settings, client) = {
-            let a = shared
-                .try_lock()
-                .map_err(|_| "Atlas занят, повторите операцию")?;
-            (a.settings.clone(), a.core.client())
+            let a = app.state::<published_state::ReadState>().get()?;
+            (a.settings.clone(), a.client.clone())
         };
         return tauri::async_runtime::spawn_blocking(move || {
             Ok(json!(diagnostics::run(&settings, client)))
@@ -770,17 +781,15 @@ async fn request(
     }
     if action == "protection_status" {
         let (settings, client) = {
-            let mut a = shared
-                .try_lock()
-                .map_err(|_| "Atlas занят, повторите операцию")?;
-            if !a.core.running() || a.status != "Connected" {
+            let a = app.state::<published_state::ReadState>().get()?;
+            if a.status != "Connected" {
                 return Ok(json!({
                     "secure": false,
                     "detail": "Atlas не подключён.",
                     "checkedAt": model::now()
                 }));
             }
-            (a.settings.clone(), a.core.client())
+            (a.settings.clone(), a.client.clone())
         };
         return tauri::async_runtime::spawn_blocking(move || {
             Ok(diagnostics::protection_status(&settings, client))
@@ -792,17 +801,18 @@ async fn request(
         let batch_id = payload.as_ref().and_then(|p| p["batchId"].as_str())
             .filter(|id| !id.is_empty() && id.len() <= 128)
             .ok_or("Не указан идентификатор проверки")?.to_owned();
+        let reads = app.state::<published_state::ReadState>().inner().clone();
         return tauri::async_runtime::spawn_blocking(move || {
             let (settings, client, binary, directory, names, revision) = {
                 // A snapshot or save may briefly own the app mutex. Queue the
                 // read instead of falsely marking every node as a probe error.
-                let a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
+                let a = reads.get()?;
                 let connected = a.status == "Connected";
-                if !connected && a.core.directory.join("tun-guard.active").exists() {
+                if !connected && a.directory.join("tun-guard.active").exists() {
                     return Err("Atlas в защищённой паузе; автономная проверка недоступна".into());
                 }
-                (a.settings.clone(), connected.then(|| a.core.client()),
-                    a.core.binary.clone(), a.core.directory.clone(),
+                (a.settings.clone(), connected.then(|| a.client.clone()),
+                    a.binary.clone(), a.directory.clone(),
                     a.settings.servers().iter().filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(),
                     a.revision)
             };
@@ -822,18 +832,19 @@ async fn request(
             .and_then(|p| p["name"].as_str())
             .ok_or("Не выбран сервер")?
             .to_owned();
+        let reads = app.state::<published_state::ReadState>().inner().clone();
         return tauri::async_runtime::spawn_blocking(move || {
             let (settings, client, binary, directory) = {
-                let a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
+                let a = reads.get()?;
                 if !a.settings.servers().iter().any(|p| p["name"] == name) {
                     return Err("Сервер отсутствует в подписках".into());
                 }
                 let connected = a.status == "Connected";
-                if !connected && a.core.directory.join("tun-guard.active").exists() {
+                if !connected && a.directory.join("tun-guard.active").exists() {
                     return Err("Atlas в защищённой паузе; автономная проверка недоступна".into());
                 }
-                (a.settings.clone(), connected.then(|| a.core.client()),
-                    a.core.binary.clone(), a.core.directory.clone())
+                (a.settings.clone(), connected.then(|| a.client.clone()),
+                    a.binary.clone(), a.directory.clone())
             };
             let result = if let Some(client) = client { latency::test(client, &name) }
                 else { latency::offline_test(settings, binary, directory, &name) };
@@ -843,17 +854,23 @@ async fn request(
         .map_err(|e| e.to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut a = if action == "disconnect" {
-            // The caller awaits actual cleanup (the updater relies on this).
-            // Cancellation above already interrupted the pending network operation.
-            shared.lock().map_err(|_| "Состояние Atlas недоступно")?
-        } else {
-            shared.try_lock().map_err(|_| "Atlas занят, повторите операцию")?
-        };
+        let queued=std::time::Instant::now();
+        // Only mutations are serialized. Readers use ReadState and never wait
+        // for this lock; queued mutations do not fail just because another runs.
+        let mut a = shared.lock().map_err(|_| "Состояние Atlas недоступно")?;
+        let waited_ms=queued.elapsed().as_millis();
         if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
             return Err("Atlas завершает работу".into());
         }
+        let started=std::time::Instant::now();
+        let command_id=format!("{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        incident_history::record("command_started",json!({"id":command_id,"action":action,
+            "waitedMs":waited_ms,"revision":a.revision}),&[]);
         let result = a.dispatch(&app, &action, payload.unwrap_or(Value::Null));
+        incident_history::record("command_completed",json!({"id":command_id,"action":action,
+            "waitedMs":waited_ms,"executionMs":started.elapsed().as_millis(),
+            "success":result.is_ok(),"error":result.as_ref().err(),"revision":a.revision}),&[]);
+        if result.is_err() { let _ = incident_history::flush(&a.core.directory.join("incident-history.ndjson")); }
         a.snapshot();
         result
     })
@@ -916,6 +933,8 @@ pub fn run() {
             app.manage(ConnectionIntent(intent.clone()));
             let published = published_state::PublishedState::default();
             app.manage(published.clone());
+            let reads = published_state::ReadState::default();
+            app.manage(reads.clone());
             let diagnostic_access = support_report::Access::default();
             app.manage(diagnostic_access.clone());
             let cancellation = cancellation::Cancellation::default();
@@ -923,6 +942,7 @@ pub fn run() {
             let shared = Arc::new(Mutex::new(App {
                 revision: 0,
                 published,
+                reads,
                 diagnostic_access,
                 cancellation,
                 settings,
@@ -930,6 +950,7 @@ pub fn run() {
                 core,
                 status: "Disconnected".into(),
                 error: None,
+                control_error: None,
                 logs: vec![],
                 reconnect: intent.clone(),
             }));
@@ -1065,6 +1086,49 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            let refresh_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let shared = shared.clone();
+                let done = refresh_done.clone();
+                let stop = shutdown.clone();
+                std::thread::spawn(move || {
+                    struct Finish(Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for Finish { fn drop(&mut self) { self.0.store(true,std::sync::atomic::Ordering::SeqCst); } }
+                    let _finish = Finish(done);
+                    let ids = shared.lock().map(|a|a.settings.subscriptions.iter().map(|s|s.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                    for id in ids {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                        let started = std::time::Instant::now();
+                        incident_history::record("subscription_refresh_started",json!({"subscription":id,"trigger":"startup"}),&[]);
+                        let result = (|| -> Result<(),String> {
+                            let url = keyring::Entry::new("AtlasVPN",&id).map_err(|_|"Хранилище Windows недоступно")?
+                                .get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")?;
+                            let captured = shared.lock().map_err(|_|"Состояние Atlas недоступно")?.reads.get()?;
+                            let nodes = subscriptions::download(&url,captured.status == "Connected")?;
+                            let mut a = shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) { return Err("Atlas завершает работу".into()); }
+                            // Never recreate a subscription deleted while the download was running.
+                            let Some(current) = a.settings.subscriptions.iter().find(|s|s.id==id) else { return Ok(()); };
+                            let before = captured.settings.subscriptions.iter().find(|s|s.id==id);
+                            if !subscriptions::refresh_is_current(before,Some(current)) {
+                                return Err("Подписка уже изменена; фоновый результат не применён".into());
+                            }
+                            a.install_subscription(id.clone(),url,nodes,None,None)?;
+                            a.snapshot();
+                            Ok(())
+                        })();
+                        incident_history::record("subscription_refresh_completed",json!({"subscription":id,"trigger":"startup",
+                            "elapsedMs":started.elapsed().as_millis(),"success":result.is_ok(),"error":result.as_ref().err()}),&[]);
+                        if let Err(error) = result {
+                            if let Ok(mut a) = shared.lock() {
+                                if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id) {sub.error=Some(error.clone());}
+                                a.log("WARN",&format!("Автообновление подписки: {error}"));
+                                a.snapshot();
+                            }
+                        }
+                    }
+                });
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));
@@ -1072,8 +1136,25 @@ pub fn run() {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if shutdown.load(std::sync::atomic::Ordering::SeqCst)
                         || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
+                    // Query the service without holding the mutation lock. A
+                    // result from an earlier revision cannot affect a new session.
+                    let observed=handle.state::<published_state::ReadState>().get().ok()
+                        .filter(|v|matches!(v.status.as_str(),"Connected"|"ProtectedPause"))
+                        .map(|v|(v.revision,v.client.session_running()));
                     let Ok(mut a) = shared.try_lock() else { continue; };
-                    if startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                    let service_running=observed.and_then(|(revision,result)| {
+                        if revision != a.revision { return None; }
+                        match result {
+                            Ok(running)=>{a.control_error=None;Some(running)},
+                            Err(error)=>{
+                                if a.control_error.as_ref()!=Some(&error) {
+                                    a.log("WARN",&format!("Проверка состояния службы: {error}"));
+                                }
+                                a.control_error=Some(error);None
+                            }
+                        }
+                    });
+                    if refresh_done.load(std::sync::atomic::Ordering::SeqCst) && startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
                         startup_at = None;
                         if intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Disconnected" {
                             let _ = a.connect();
@@ -1084,7 +1165,7 @@ pub fn run() {
                         a.snapshot();
                         continue;
                     }
-                    if a.status == "Connected" && !a.core.running() {
+                    if a.status == "Connected" && service_running == Some(false) {
                         let _ = windows::restore(&a.core.directory.join("proxy-restore.json"));
                         a.status = if a.core.service_reachable() { "ProtectedPause" } else { "Error" }.into();
                         let message = "Путь VPN не подтверждён. Служба выполняет ограниченное восстановление либо завершает сессию.";
@@ -1093,7 +1174,7 @@ pub fn run() {
                         let _ = handle.emit("core-crashed", ());
                     }
                     if a.status == "ProtectedPause" {
-                        if a.core.running() {
+                        if service_running == Some(true) {
                             a.status = "Connected".into();
                             a.error = None;
                             a.log("INFO", "Служба восстановила проверенное соединение");

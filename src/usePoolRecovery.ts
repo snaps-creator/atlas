@@ -78,10 +78,10 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
         else publish(verdict);
         // Only an explicit diagnostic request scans the full pool. The service
         // owns periodic checks and selection while the UI remains passive.
-        nextCheck = Date.now() + 300000;
+        nextCheck = Date.now() + 30000;
       } catch (error) {
         if (valid(revision)) publish({ phase: "local_error", text: `Проверка или восстановление Atlas не завершены: ${String(error)}. Недоступность всех VPN-серверов не подтверждена.`, checkedAt: Date.now() });
-        nextCheck = Date.now() + 300000;
+        nextCheck = Date.now() + 5000;
       } finally { pending = false; }
     };
     manual.current = () => { void check(true); };
