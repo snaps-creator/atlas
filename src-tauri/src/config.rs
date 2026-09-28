@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 /// UI preferences must never cause TUN reconfiguration.
 pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
     if previous.auto_test_interval_seconds != next.auto_test_interval_seconds { return false; }
+    if previous.auto_search_ping_ms != next.auto_search_ping_ms { return false; }
     let mut comparison = next.clone();
     comparison.selected = previous.selected.clone();
     generate(&comparison, "comparison")
@@ -12,6 +13,9 @@ pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
         .is_some_and(|(a, b)| a == b)
 }
 pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
+    if !(1..=5000).contains(&s.auto_search_ping_ms) {
+        return Err("Порог поиска сервера должен быть от 1 до 5000 мс".into());
+    }
     if !(MIN_AUTO_TEST_INTERVAL_SECONDS..=MAX_AUTO_TEST_INTERVAL_SECONDS)
         .contains(&s.auto_test_interval_seconds)
     {
@@ -212,6 +216,13 @@ mod tests {
         s.auto_test_interval_seconds = 60;
         let faster: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(faster["proxy-groups"], tun["proxy-groups"]);
+        let previous=s.clone();
+        s.auto_search_ping_ms=220;
+        assert!(!same_network_config(&previous,&s));
+        assert_eq!(generate(&previous,"secret").unwrap(),generate(&s,"secret").unwrap());
+        s.auto_search_ping_ms=0;
+        assert!(generate(&s,"secret").is_err());
+        s.auto_search_ping_ms=150;
         s.default_route = Route::Direct;
         let direct: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(

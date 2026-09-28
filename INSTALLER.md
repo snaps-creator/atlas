@@ -1,4 +1,4 @@
-# Установка Atlas Alpha 2.0.1
+# Установка Atlas Alpha 2.0.2
 
 1. Скачайте Code → Download ZIP с GitHub.
 2. Распакуйте архив полностью.

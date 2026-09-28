@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, HashSet}, sync::mpsc, time::{Duration, Instant}};
 
 const QUARANTINE: u64 = 300;
+fn remote_probe_failure(error: &str) -> bool {
+    matches!(error,"Mihomo API: HTTP 503"|"Mihomo API: HTTP 504")
+        || error.contains("Контрольный URL не подтвердил")
+}
 pub(crate) fn node_key(node: &Value) -> String {
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
@@ -27,7 +31,7 @@ pub(crate) fn candidates(settings: &Settings, proxies: &Value, blocked: &HashSet
     nodes.into_iter().filter(|n| {
         // The histories are only a ranking hint. Four new checks below are required.
         endpoints.insert(endpoint(n))
-    }).take(4).filter_map(|n|n["name"].as_str().map(str::to_owned)).collect()
+    }).filter_map(|n|n["name"].as_str().map(str::to_owned)).collect()
 }
 
 struct Pending { rx: mpsc::Receiver<Value>, generation: u64, repair_only: bool }
@@ -51,12 +55,15 @@ pub(crate) struct Recovery {
     scheduled: Option<Scheduled>,
     samples: HashMap<String,NodeSample>,
     last_active: Option<Instant>,
+    active: Option<Scheduled>,
+    slow_samples: u8,
     last_reserves: Option<Instant>,
     last_pool: Option<Instant>,
     pool_cursor: usize,
     observed_current: Option<String>,
     current_since: Option<Instant>,
     improvement: Option<(String,u8)>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Recovery {
     #[cfg(test)]
@@ -67,10 +74,70 @@ impl Recovery {
     #[cfg(test)]
     pub(crate) fn quarantined_count(&self) -> usize { self.blocked.len() }
     pub fn invalidate(&mut self) {
+        self.cancelled.store(true,std::sync::atomic::Ordering::SeqCst);
+        self.cancelled=Default::default();
         self.generation += 1; self.pending = None; self.needed = false;
         self.scheduled = None; self.samples.clear(); self.last_active = None;
         self.last_reserves = None; self.last_pool = None; self.observed_current = None;
-        self.current_since = None; self.improvement = None;
+        self.current_since = None; self.improvement = None; self.active = None; self.slow_samples = 0;
+    }
+    fn poll_active(&mut self, client: &ApiClient, settings: &Settings, now: Instant) {
+        let Some(job) = &self.active else { return; };
+        let result = job.rx.try_recv();
+        if matches!(result, Err(mpsc::TryRecvError::Empty)) { return; }
+        let job = self.active.take().unwrap();
+        if job.generation != self.generation { return; }
+        let Ok(results) = result else { return; };
+        for (name, delay, alive) in results {
+            if self.observed_current.as_ref() != Some(&name) {
+                self.observed_current = Some(name.clone()); self.current_since = Some(now);
+                self.slow_samples = 0; self.improvement = None;
+            }
+            self.slow_samples = if delay.is_some_and(|d| d > settings.auto_search_ping_ms) {
+                self.slow_samples.saturating_add(1)
+            } else { 0 };
+            if self.slow_samples == 0 {
+                self.improvement = None; self.pool_cursor=0; self.last_pool=None;
+            }
+            if !alive {
+                self.needed = true; self.retry_at = None;
+                // Do not wait for a second diagnosis of the failed node.
+                if let Some(node) = settings.servers().iter().find(|n|n["name"] == name) {
+                    self.blocked.entry(node_key(node)).or_insert(Quarantine {
+                        probe_after: now + Duration::from_secs(60), failures: 0 });
+                }
+            }
+            client.event(json!({"at":crate::model::now(),"kind":"active_node_sample",
+                "name":name,"delay":delay,"responded":alive,"slowSamples":self.slow_samples}));
+            self.samples.insert(name, NodeSample {checked_at:now,primary_delay:delay,alive});
+        }
+    }
+    fn monitor(&mut self, client: ApiClient, settings: &Settings, now: Instant) {
+        if self.active.is_some() || self.last_active.is_some_and(|at|now.duration_since(at)<Duration::from_secs(10)) { return; }
+        self.last_active = Some(now);
+        let (tx,rx)=mpsc::channel();
+        self.active=Some(Scheduled{rx,generation:self.generation,current:String::new(),purpose:"active"});
+        let settings=settings.clone();
+        std::thread::spawn(move || {
+            let name = if matches!(settings.selected.as_str(),"AUTO"|"FAILOVER") {
+                match client.api("GET",&format!("/proxies/{}",settings.selected),None) {
+                    Ok(v) => v["now"].as_str().map(str::to_owned),
+                    Err(e) => { client.event(json!({"at":crate::model::now(),"kind":"active_monitor_error","error":e})); None }
+                }
+            } else { Some(settings.selected) };
+            let results = name.into_iter().filter_map(|name| {
+                let probe=crate::latency::verified_probe(&client,&name,crate::latency::DISPLAY_URL);
+                if let Err(error)=&probe {
+                    if !remote_probe_failure(error) {
+                        client.event(json!({"at":crate::model::now(),"kind":"active_monitor_error","error":error}));
+                        return None;
+                    }
+                }
+                let delay=probe.as_ref().ok().and_then(|v|v["delay"].as_u64());
+                Some((name,delay,probe.is_ok()))
+            }).collect();
+            let _=tx.send(results);
+        });
     }
     fn poll_scheduled(&mut self, client: &ApiClient, settings: &Settings, now: Instant) {
         let Some(pending) = &self.scheduled else { return; };
@@ -84,9 +151,13 @@ impl Recovery {
                 checked_at: now, primary_delay: *delay, alive: *alive });
             if name == &pending.current && !alive { self.needed = true; }
         }
-        if pending.purpose != "reserves" || !matches!(settings.selected.as_str(),"AUTO"|"FAILOVER") { return; }
+        if self.needed || self.pending.is_some() || self.observed_current.as_deref() != Some(&pending.current) || pending.purpose != "reserves" || !matches!(settings.selected.as_str(),"AUTO"|"FAILOVER") { return; }
         let Some(current) = self.samples.get(&pending.current).filter(|s|s.alive && s.checked_at.elapsed() < Duration::from_secs(90)) else { return; };
         let Some(current_delay) = current.primary_delay else { return; };
+        if self.slow_samples < 3 || current_delay <= settings.auto_search_ping_ms {
+            self.improvement = None;
+            return;
+        }
         let best = results.iter().filter_map(|(name,delay,alive)| {
             if name == &pending.current || !alive || self.blocked.contains_key(&settings.servers().iter()
                 .find(|n|n["name"] == *name).map(node_key).unwrap_or_default()) { return None; }
@@ -101,56 +172,41 @@ impl Recovery {
             self.improvement.as_ref().unwrap().1.saturating_add(1)
         } else { 1 };
         self.improvement = Some((name.to_owned(),count));
-        if count < 3 || self.current_since.is_none_or(|since|since.elapsed() < Duration::from_secs(120)) { return; }
+        if count < 2 || self.current_since.is_none_or(|since|since.elapsed() < Duration::from_secs(60)) { return; }
         let group = settings.selected.as_str();
         if client.api("PUT",&format!("/proxies/{group}"),Some(json!({"name":name}))).is_ok()
             && client.api("GET",&format!("/proxies/{group}"),None).is_ok_and(|v|v["now"] == name) {
             self.observed_current = Some(name.to_owned());
             self.current_since = Some(now);
             self.improvement = None;
+            self.active=None; self.last_active=None; self.slow_samples=0;
+            self.pool_cursor=0; self.last_pool=None;
             client.event(json!({"at":crate::model::now(),"kind":"automatic_optimization",
                 "from":pending.current,"to":name,"improvementMs":current_delay-delay,
-                "series":3,"heldSeconds":120}));
+                "series":2,"heldSeconds":60}));
         }
     }
     fn schedule(&mut self, client: ApiClient, settings: &Settings, now: Instant) {
         if self.scheduled.is_some() || self.pending.is_some() || self.needed { return; }
         let automatic = matches!(settings.selected.as_str(),"AUTO"|"FAILOVER");
-        let current = if automatic {
-            client.api("GET",&format!("/proxies/{}",settings.selected),None).ok()
-                .and_then(|v|v["now"].as_str().map(str::to_owned))
-        } else { Some(settings.selected.clone()) };
-        let Some(current) = current.filter(|name|settings.servers().iter().any(|n|n["name"] == *name)) else { return; };
-        if self.observed_current.as_deref() != Some(&current) {
-            self.observed_current = Some(current.clone());
-            self.current_since = Some(now);
-            self.improvement = None;
+        let Some(current) = self.observed_current.clone() else { return; };
+        if !automatic || self.slow_samples < 3 { return; }
+        if self.last_reserves.is_some_and(|at|now.duration_since(at)<Duration::from_secs(2)) { return; }
+        if self.last_pool.is_some_and(|at|now.duration_since(at)<Duration::from_secs(60)) { return; }
+        let nodes=settings.servers();
+        let mut backups:Vec<_>=nodes.iter().filter(|n|n["name"] != current && !self.blocked.contains_key(&node_key(n)))
+            .filter_map(|n|n["name"].as_str().map(str::to_owned)).collect();
+        backups.sort_by_key(|name|self.samples.get(name).filter(|s|s.alive).and_then(|s|s.primary_delay).unwrap_or(u64::MAX));
+        let mut names=Vec::new();
+        if let Some((name,_))=&self.improvement { names.push(name.clone()); }
+        for _ in 0..backups.len().min(2) {
+            if self.pool_cursor >= backups.len() { self.pool_cursor=0; self.last_pool=Some(now); break; }
+            let name=backups[self.pool_cursor].clone(); self.pool_cursor+=1;
+            if !names.contains(&name) { names.push(name); }
+            if names.len()==2 { break; }
         }
-        let nodes = settings.servers();
-        let mut names = Vec::new();
-        let purpose = if self.last_active.is_none_or(|at|at.elapsed() >= Duration::from_secs(30)) {
-            self.last_active=Some(now); names.push(current.clone()); "active"
-        } else if automatic && self.last_reserves.is_none_or(|at|at.elapsed() >= Duration::from_secs(60)) {
-            self.last_reserves=Some(now);
-            names.push(current.clone());
-            let mut backups: Vec<_> = nodes.iter().filter_map(|n|n["name"].as_str())
-                .filter(|name|*name != current && !self.blocked.contains_key(&nodes.iter()
-                    .find(|n|n["name"] == *name).map(node_key).unwrap_or_default()))
-                .map(str::to_owned).collect();
-            backups.sort_by_key(|name|self.samples.get(name).and_then(|s|s.primary_delay).unwrap_or(u64::MAX));
-            names.extend(backups.into_iter().take(2)); "reserves"
-        } else if self.last_pool.is_none_or(|at|at.elapsed() >= Duration::from_secs(settings.auto_test_interval_seconds)) {
-            self.last_pool=Some(now);
-            let count=nodes.len();
-            for offset in 0..count.min(6) {
-                let node=&nodes[(self.pool_cursor+offset)%count];
-                if let Some(name)=node["name"].as_str() {
-                    if !self.blocked.contains_key(&node_key(node)) { names.push(name.to_owned()); }
-                }
-            }
-            if count > 0 { self.pool_cursor=(self.pool_cursor+6)%count; }
-            "pool"
-        } else { return; };
+        self.last_reserves=Some(now);
+        let purpose="reserves";
         if names.is_empty() { return; }
         let (tx,rx)=mpsc::channel();
         self.scheduled=Some(Scheduled{rx,generation:self.generation,current,purpose});
@@ -203,10 +259,16 @@ impl Recovery {
             }
         }
         self.last_line = lines.last().cloned();
+        self.poll_active(&client,settings,now);
         self.poll_scheduled(&client,settings,now);
+        if !self.needed && self.pending.as_ref().is_none_or(|p|p.repair_only) { self.monitor(client.clone(),settings,now); }
         let automatic = matches!(settings.selected.as_str(),"AUTO"|"FAILOVER")
             && settings.routing_mode != crate::model::RoutingMode::Direct;
         if !automatic { self.needed = false; }
+        if self.needed && self.pending.as_ref().is_some_and(|p|p.repair_only) {
+            // A quarantine diagnosis must never delay restoring the active path.
+            self.pending = None;
+        }
         if let Some(p) = &self.pending {
             match p.rx.try_recv() {
                 Ok(report) => {
@@ -243,11 +305,15 @@ impl Recovery {
                     }));
                     if result.as_ref().is_some_and(|r|r.is_ok()) {
                         self.needed = false;
+                        self.observed_current = selected.map(str::to_owned);
+                        self.current_since = Some(now); self.slow_samples=0;
+                        self.last_active=None; self.improvement=None;
+                        self.active=None; self.scheduled=None; self.pool_cursor=0; self.last_pool=None;
                     } else { self.needed = true; }
                     self.retry_at = Some(now + Duration::from_secs(30));
                     client.event(json!({"at":crate::model::now(),"kind":"recovery_result","evidence":report,
                         "selectorResult":result.map(|r|r.unwrap_or_else(|e|json!({"error":e}))),
-                        "scope":"Four control responses prove tested paths; subsequent real traffic is monitored separately"}));
+                        "scope":"Replacement answered the control URL; old-node diagnosis is deferred"}));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => { self.pending = None; self.needed = true; self.retry_at = Some(now + Duration::from_secs(30)); }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -269,21 +335,74 @@ impl Recovery {
             }
             return;
         }
-        if self.scheduled.is_some() || self.retry_at.is_some_and(|t|t>now) { return; }
+        if self.retry_at.is_some_and(|t|t>now) { return; }
         self.needed = false;
         self.retry_at = Some(now + Duration::from_secs(30));
         let (tx,rx) = mpsc::channel();
-        let blocked = self.blocked.iter().filter(|(_,b)|b.probe_after > now).map(|(key,_)|key.clone()).collect();
+        let mut blocked: HashSet<_> = self.blocked.iter().filter(|(_,b)|b.probe_after > now).map(|(key,_)|key.clone()).collect();
+        if let Some(node)=servers.iter().find(|n|n["name"].as_str()==self.observed_current.as_deref()) {
+            blocked.insert(node_key(node));
+        }
         let settings = settings.clone();
         client.event(json!({"at":crate::model::now(),"kind":"recovery_started","quarantinedNodes":self.blocked.len()}));
         self.pending = Some(Pending{rx,generation:self.generation,repair_only:false});
-        std::thread::spawn(move || { let _ = tx.send(verify(&client,&settings,&blocked,&crate::latency::ENDPOINTS)); });
+        let cancelled=self.cancelled.clone();
+        let previous=self.observed_current.clone();
+        std::thread::spawn(move || { let _ = tx.send(verify_replacement(&client,&settings,&blocked,previous.as_deref(),cancelled)); });
     }
+}
+
+// Return the first freshly verified replacement, without waiting for a slow
+// peer or diagnosing the old node. At most two probes remain in flight.
+fn verify_replacement(client: &ApiClient, settings: &Settings, blocked: &HashSet<String>, previous: Option<&str>, cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Value {
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    let proxies = match client.api("GET","/proxies",None) { Ok(v)=>v,Err(e)=>return json!({"error":e}) };
+    let names=Arc::new(candidates(settings,&proxies,blocked,crate::model::now()));
+    let next=Arc::new(AtomicUsize::new(0));
+    let stop=Arc::new(AtomicBool::new(false));
+    let (tx,rx)=mpsc::channel();
+    for _ in 0..names.len().min(2) {
+        let (names,next,stop,tx,client,cancelled)=(names.clone(),next.clone(),stop.clone(),tx.clone(),client.clone(),cancelled.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) && !cancelled.load(Ordering::SeqCst) {
+                let Some(name)=names.get(next.fetch_add(1,Ordering::SeqCst)) else { break; };
+                let result=crate::latency::verified_probe(&client,name,crate::latency::DISPLAY_URL);
+                let passed=result.is_ok();
+                let remote_failure=result.as_ref().err().is_some_and(|e|remote_probe_failure(e));
+                if passed { stop.store(true,Ordering::SeqCst); }
+                if tx.send(json!({"name":name,"passed":if passed {Some(true)} else if remote_failure {Some(false)} else {None},"result":result.unwrap_or_else(|e|json!({"error":e}))})).is_err() { break; }
+                if !passed && !remote_failure { break; }
+            }
+        });
+    }
+    drop(tx);
+    let mut results=Vec::new();
+    for result in rx {
+        let candidate=result["name"].clone();
+        let passed=result["passed"]==true;
+        results.push(result);
+        if passed { return json!({"candidate":candidate,"results":results}); }
+    }
+    // Only after exhausting replacements, recheck the old path. A recovered
+    // original node must not leave the client searching forever.
+    if !cancelled.load(Ordering::SeqCst) {
+        if let Some(name)=previous {
+            if let Ok(result)=crate::latency::verified_probe(client,name,crate::latency::DISPLAY_URL) {
+                results.push(json!({"name":name,"passed":true,"result":result}));
+                return json!({"candidate":name,"results":results});
+            }
+        }
+    }
+    json!({"candidate":null,"results":results})
+}
+
+impl Drop for Recovery {
+    fn drop(&mut self) { self.cancelled.store(true,std::sync::atomic::Ordering::SeqCst); }
 }
 
 pub(crate) fn verify(client: &ApiClient, settings: &Settings, blocked: &HashSet<String>, controls: &[&str]) -> Value {
     let proxies = match client.api("GET","/proxies",None) { Ok(p)=>p,Err(e)=>return json!({"error":e}) };
-    let names = candidates(settings,&proxies,blocked,crate::model::now());
+    let names: Vec<_> = candidates(settings,&proxies,blocked,crate::model::now()).into_iter().take(4).collect();
     verify_names(client, &names, controls)
 }
 
@@ -322,6 +441,81 @@ pub(crate) fn verify_names(client: &ApiClient, names: &[String], controls: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replacement_is_returned_before_the_slow_candidate_finishes() {
+        use std::{io::{Read,Write}, net::TcpListener, sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+        let port=listener.local_addr().unwrap().port(); listener.set_nonblocking(true).unwrap();
+        let stop=Arc::new(AtomicBool::new(false)); let stopped=stop.clone();
+        let (release,wait)=mpsc::channel(); let wait=Arc::new(Mutex::new(wait));
+        let server=std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                if let Ok((mut socket,_))=listener.accept() {
+                    let wait=wait.clone();
+                    std::thread::spawn(move || {
+                        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        let mut request=[0;4096]; let n=socket.read(&mut request).unwrap_or(0);
+                        let request=String::from_utf8_lossy(&request[..n]);
+                        if request.contains("/slow/delay?") { let _=wait.lock().unwrap().recv_timeout(Duration::from_secs(5)); }
+                        let body=if request.contains("/delay?") { json!({"delay":40}) } else {
+                            let health=json!({"alive":true,"extra":{crate::latency::DISPLAY_URL:{"alive":true}}});
+                            json!({"proxies":{"slow":health.clone(),"fast":health}})
+                        }.to_string();
+                        let _=write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                    });
+                } else { std::thread::sleep(Duration::from_millis(5)); }
+            }
+        });
+        let mut settings=Settings::default();
+        settings.subscriptions.push(crate::model::Subscription{id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:vec![json!({"name":"slow","server":"127.0.0.1","port":1}),json!({"name":"fast","server":"127.0.0.1","port":2})]});
+        let (tx,rx)=mpsc::channel();
+        std::thread::spawn(move || { let _=tx.send(verify_replacement(&ApiClient::loopback_fixture(port),&settings,&HashSet::new(),None,Default::default())); });
+        let result=rx.recv_timeout(Duration::from_secs(3));
+        let _=release.send(()); stop.store(true,Ordering::SeqCst); server.join().unwrap();
+        assert_eq!(result.unwrap()["candidate"],"fast");
+    }
+    #[test]
+    fn controller_errors_do_not_quarantine_remote_nodes() {
+        assert!(!remote_probe_failure("Mihomo API недоступен: timeout"));
+        assert!(!remote_probe_failure("Сетевая служба занята. Повторите операцию."));
+        assert!(remote_probe_failure("Mihomo API: HTTP 504"));
+    }
+    fn sample(recovery: &mut Recovery, settings: &Settings, delay: Option<u64>) {
+        let (tx,rx)=mpsc::channel();
+        tx.send(vec![("fixture".into(),delay,delay.is_some())]).unwrap();
+        recovery.active=Some(Scheduled{rx,generation:recovery.generation,current:String::new(),purpose:"active"});
+        let core=crate::core::Core::new(std::path::PathBuf::new(),std::path::PathBuf::new());
+        recovery.poll_active(&core.client(),settings,Instant::now());
+    }
+    #[test]
+    fn active_monitor_requires_three_slow_samples_and_resets_after_recovery() {
+        let settings=Settings::default(); let mut recovery=Recovery::default();
+        sample(&mut recovery,&settings,Some(151)); assert_eq!(recovery.slow_samples,1);
+        sample(&mut recovery,&settings,Some(180)); assert_eq!(recovery.slow_samples,2);
+        sample(&mut recovery,&settings,Some(160)); assert_eq!(recovery.slow_samples,3);
+        sample(&mut recovery,&settings,Some(150)); assert_eq!(recovery.slow_samples,0);
+        assert!(!recovery.needed);
+    }
+    #[test]
+    fn custom_threshold_and_failure_are_independent() {
+        let mut settings=Settings::default(); settings.auto_search_ping_ms=500;
+        let mut recovery=Recovery::default();
+        sample(&mut recovery,&settings,Some(450)); assert_eq!(recovery.slow_samples,0);
+        recovery.retry_at=Some(Instant::now()+Duration::from_secs(60));
+        sample(&mut recovery,&settings,None);
+        assert!(recovery.needed); assert!(recovery.retry_at.is_none());
+    }
+    #[test]
+    fn stale_monitor_result_cannot_override_new_session() {
+        let mut recovery=Recovery::default(); let settings=Settings::default();
+        let (tx,rx)=mpsc::channel(); tx.send(vec![("old".into(),None,false)]).unwrap();
+        recovery.active=Some(Scheduled{rx,generation:1,current:String::new(),purpose:"active"});
+        recovery.generation=2;
+        let core=crate::core::Core::new(std::path::PathBuf::new(),std::path::PathBuf::new());
+        recovery.poll_active(&core.client(),&settings,Instant::now());
+        assert!(!recovery.needed); assert!(recovery.samples.is_empty());
+    }
     #[test]
     fn quarantine_is_bound_to_node_configuration() {
         let mut s=Settings::default();

@@ -55,10 +55,7 @@ import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
 import { type ProtectionStatus, unavailableProtection, protectionLabel, connectionProtection, afterConnectionReady } from "./protection";
-const autoTestIntervals = [30, 60, 120, 300, 600, 900, 1800, 3600];
-function intervalLabel(seconds: number) {
-  return seconds < 60 ? `${seconds} сек.` : `${seconds / 60} мин.`;
-}
+
 const nav = [
   ["Dashboard", LayoutDashboard],
   ["Servers", Server],
@@ -897,8 +894,8 @@ function App() {
                           </strong>
                           <small>
                             {n === "AUTO"
-                              ? `Тест каждые ${intervalLabel(s?.autoTestIntervalSeconds ?? 300)} · порог 50 мс`
-                              : `Первый доступный сервер · проверка каждые ${intervalLabel(s?.autoTestIntervalSeconds ?? 300)}`}
+                              ? `Контроль каждые 10 с · поиск выше ${s?.autoSearchPingMs ?? 150} мс`
+                              : `Рабочий резерв при потере ответа · контроль каждые 10 с`}
                           </small>
                         </span>
                         {s?.selected === n && <Check size={17} />}
@@ -1381,28 +1378,26 @@ function App() {
                     <h2>Автопереключение</h2>
                     <div className="setting-row">
                       <div>
-                        <strong>Интервал проверки серверов</strong>
-                        <p>Как часто AUTO и FAILOVER измеряют доступность и задержку</p>
+                        <strong>Искать быстрее при пинге выше</strong>
+                        <p>Порог в мс для AUTO и FAILOVER. При отказе сервера замена ищется независимо от порога.</p>
                       </div>
-                      <select
-                        aria-label="Интервал проверки серверов"
-                        value={s.autoTestIntervalSeconds}
-                        onChange={(e) =>
-                          run(() =>
-                            save({
-                              ...s,
-                              autoTestIntervalSeconds: Number(e.target.value),
-                            }),
-                          )
-                        }
-                      >
-                        {autoTestIntervals.map((seconds) => (
-                          <option key={seconds} value={seconds}>
-                            {intervalLabel(seconds)}
-                          </option>
-                        ))}
-                      </select>
+                      <input
+                        aria-label="Порог поиска более быстрого сервера, мс"
+                        type="number" min={1} max={5000} step={1}
+                        key={s.autoSearchPingMs ?? 150}
+                        defaultValue={s.autoSearchPingMs ?? 150}
+                        onBlur={(e) => {
+                          const value = e.currentTarget.valueAsNumber;
+                          if (!Number.isInteger(value) || value < 1 || value > 5000) {
+                            e.currentTarget.value = String(s.autoSearchPingMs ?? 150);
+                            return;
+                          }
+                          if (value !== s.autoSearchPingMs)
+                            run(() => save({ ...s, autoSearchPingMs: value }));
+                        }}
+                      />
                     </div>
+                    <p>Текущий сервер проверяется каждые 10 секунд. Поиск начинается после трёх превышений подряд. Переключение — после подтверждения улучшения минимум на 30 мс и 20%, с паузой 60 секунд. При потере ответа пауза не применяется.</p>
                   </section>
                   <section className="settings-section">
                     <h2>Запуск</h2>

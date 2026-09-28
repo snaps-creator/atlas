@@ -346,6 +346,7 @@ pub fn stop_and_wait() -> Result<(), String> {
 }
 
 pub fn uninstall() -> Result<(), String> {
+    stop_and_wait()?;
     let name = wide(NAME);
     unsafe {
         let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);

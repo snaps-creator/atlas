@@ -35,6 +35,7 @@ export type Settings = {
     restoreConnection: boolean;
   };
   autoTestIntervalSeconds: number;
+  autoSearchPingMs: number;
   theme: string;
   wasConnected: boolean;
   favorites: string[];

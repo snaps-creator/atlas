@@ -92,6 +92,7 @@ impl App {
         rules::compile(&next)?;
         if !["light", "dark", "system"].contains(&next.theme.as_str())
             || next.startup.delay_seconds > 300
+            || !(1..=5000).contains(&next.auto_search_ping_ms)
             || !(model::MIN_AUTO_TEST_INTERVAL_SECONDS..=model::MAX_AUTO_TEST_INTERVAL_SECONDS)
                 .contains(&next.auto_test_interval_seconds)
             || !["system", "tun"].contains(&next.mode.as_str())
@@ -538,7 +539,8 @@ fn cleanup_network_session(
     let service = service::stop_and_wait();
     let proxy = windows::restore(&directory.join("proxy-restore.json"));
     let legacy = if clear_legacy_filters { network_guard::clear() } else { Ok(()) };
-    let errors: Vec<_> = [owned_core, service, proxy, legacy].into_iter()
+    let tun = network_guard::wait_for_tun_release(std::time::Duration::from_secs(10));
+    let errors: Vec<_> = [owned_core, service, proxy, legacy, tun].into_iter()
         .filter_map(Result::err).collect();
     if errors.is_empty() {
         let _ = std::fs::remove_file(directory.join("tun-guard.active"));
@@ -621,6 +623,7 @@ async fn request(
                 let context = json!({"capturedAt":model::now(),"revision":a.revision,"status":a.status,"mode":a.settings.mode,
                     "routingMode":a.settings.routing_mode,"tunStack":a.settings.tun_stack,
                     "selected":a.settings.selected,"autoTestIntervalSeconds":a.settings.auto_test_interval_seconds,
+                    "activeCheckIntervalSeconds":10,"autoSearchPingMs":a.settings.auto_search_ping_ms,
                     "error":a.error,"logs":a.logs,
                     "connectionConfiguration":support_report::configuration_evidence(&a.settings),
                     "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});

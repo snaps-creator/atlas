@@ -796,6 +796,10 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    #[cfg(test)]
+    pub(crate) fn loopback_fixture(port: u16) -> Self {
+        Self { controller_port:port, secret:String::new(), broker:None, logs:Default::default() }
+    }
     pub(crate) fn event(&self, value: Value) {
         // Service-side events travel through the existing authenticated logs pipe.
         if let Ok(mut logs) = self.logs.lock() {

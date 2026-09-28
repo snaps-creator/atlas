@@ -9,6 +9,7 @@ fn default_auto_test_interval_seconds() -> u64 {
     DEFAULT_AUTO_TEST_INTERVAL_SECONDS
 }
 fn legacy_rules_semantics_version() -> u8 { 1 }
+fn default_auto_search_ping_ms() -> u64 { 150 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
@@ -88,6 +89,8 @@ pub struct Settings {
     pub startup: Startup,
     #[serde(default = "default_auto_test_interval_seconds")]
     pub auto_test_interval_seconds: u64,
+    #[serde(default = "default_auto_search_ping_ms")]
+    pub auto_search_ping_ms: u64,
     pub theme: String,
     pub was_connected: bool,
     pub favorites: Vec<String>,
@@ -119,6 +122,7 @@ impl Default for Settings {
                 restore_connection: false,
             },
             auto_test_interval_seconds: DEFAULT_AUTO_TEST_INTERVAL_SECONDS,
+            auto_search_ping_ms: default_auto_search_ping_ms(),
             theme: "system".into(),
             was_connected: false,
             favorites: vec![],
@@ -179,7 +183,12 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("autoTestIntervalSeconds");
+        value.as_object_mut().unwrap().remove("autoSearchPingMs");
         let restored: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.auto_search_ping_ms,150);
+        let mut changed=restored.clone(); changed.auto_search_ping_ms=220;
+        let saved=serde_json::to_value(changed).unwrap();
+        assert_eq!(serde_json::from_value::<Settings>(saved).unwrap().auto_search_ping_ms,220);
         assert_eq!(
             restored.auto_test_interval_seconds,
             DEFAULT_AUTO_TEST_INTERVAL_SECONDS
