@@ -1,8 +1,8 @@
 # Atlas
 
-**[Скачать Atlas Alpha 2.0.1 — ZIP с EXE и подписью](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas-2.0.1-alpha.1-Windows-x64.zip)**
+**[Скачать Atlas Alpha 2.0.1 — ZIP с EXE и подписью](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas-2.0.1-New-Design-Windows-x64.zip)**
 
-Распакуйте ZIP и запустите `Atlas Alpha 2.0.1 Setup.exe`. Внутри настоящий установщик, подпись `.sig` и контрольная сумма. Размер EXE — 162 232 261 байт. [Сведения об установщике](INSTALLER.md).
+Распакуйте ZIP и запустите `Atlas Alpha 2.0.1 Setup.exe`. Внутри настоящий установщик, подпись `.sig` и контрольная сумма. Размер EXE — 161 972 950 байт. [Сведения об установщике](INSTALLER.md).
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
