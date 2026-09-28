@@ -1,3 +1,4 @@
+import { SubscriptionCard } from "./SubscriptionCard";
 import { diagnosticEvent } from "./diagnosticEvents";
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
@@ -51,7 +52,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
+import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
@@ -387,13 +388,20 @@ function App() {
       Добавить подписку
     </button>
   );
-  const latencyContext = JSON.stringify([data?.revision, data?.running, data?.settings.selected,
-    data?.settings.subscriptions.map(sub => [sub.id, sub.updatedAt, sub.servers])]);
-  const latencyContextRef = useRef(latencyContext);
-  latencyContextRef.current = latencyContext;
+  const identities = Object.fromEntries(servers.map(node => [node.name, node.probeId]));
+  const identitiesRef = useRef(identities);
+  identitiesRef.current = identities;
+  const previousIdentities = useRef(identities);
+  const latencyContext = JSON.stringify(identities);
   useEffect(() => {
-    if (latencyEpoch.current.update(latencyContext)) setLatencies({});
+    latencyEpoch.current.update("nodes");
     return () => { latencyEpoch.current.update("unmounted"); };
+  }, []);
+  useEffect(() => {
+    const before = previousIdentities.current;
+    const after = identitiesRef.current;
+    setLatencies(values => retainNodeLatencies(values, before, after));
+    previousIdentities.current = after;
   }, [latencyContext]);
   useEffect(() => {
     if (!data?.running || page !== "Servers") return;
@@ -420,7 +428,7 @@ function App() {
     void read();
     const timer = setInterval(() => { void read(); }, 5000);
     return () => { alive = false; clearInterval(timer); };
-  }, [latencyContext, page]);
+  }, [latencyContext, page, data?.running]);
   async function testAll() {
     if (testingAll) return;
     setTestingAll(true);
@@ -435,26 +443,26 @@ function App() {
     try {
       // Subscribe before invoking so even the first fast result is delivered.
       unlisten = await listen<LatencyProgress>("latency-result", ({payload}) => {
-        if (!active || latencyContextRef.current !== latencyContext) return;
-        setLatencies(previous => active && latencyContextRef.current === latencyContext
-          ? applyLatencyProgress(previous, payload, batchId, data?.revision, nameSet) : previous);
+        if (!active) return;
+        setLatencies(previous => active
+          ? applyLatencyProgress(previous, payload, batchId, identitiesRef.current, nameSet) : previous);
       });
       // One native batch reads app state once. Per-card invocations used to
       // race the app mutex and falsely label the entire pool as failed.
-      const response = await boundedBatch(request<{revision:number;results:Record<string,Latency>}>("latency_batch", {batchId}),
+      const response = await boundedBatch(request<{identities:Record<string,string>;results:Record<string,Latency>}>("latency_batch", {batchId}),
         15000 + Math.ceil(names.length / 6) * 12000);
-      if (latencyContextRef.current !== latencyContext || response.revision !== data?.revision) return;
-      setLatencies(previous => ({...previous, ...Object.fromEntries(names.map(name =>
+      setLatencies(previous => ({...previous, ...Object.fromEntries(names.filter(name =>
+        response.identities[name] !== undefined && response.identities[name] === identitiesRef.current[name]).map(name =>
         [name, {...(response.results[name] ?? {status:"error",delay:null,attempts:0,
           error:"Ядро не вернуло результат для этого узла"}), measuredAt:Date.now()}]))}));
     } catch (error) {
-      if (latencyContextRef.current === latencyContext) setLatencies(previous =>
-        failPendingLatencies(previous, names, error));
+      setLatencies(previous => failPendingLatencies(previous,
+        names.filter(name => identities[name] === identitiesRef.current[name]), error));
     } finally { active = false; unlisten?.(); setTestingAll(false); }
   }
   async function test(name: string) {
     if (testingAll) return;
-    const token = latencyEpoch.current.begin(latencyContext, name);
+    const token = latencyEpoch.current.begin("nodes", name);
     if (!token) return;
     setLatencies((l) => ({
       ...l,
@@ -462,9 +470,9 @@ function App() {
     }));
     try {
       const r = await boundedLatency(request<Latency>("latency", { name }));
-      if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({ ...l, [name]: {...r,measuredAt:Date.now()} }));
+      if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({ ...l, [name]: {...r,measuredAt:Date.now()} }));
     } catch (e) {
-      if (latencyEpoch.current.current(name, token)) setLatencies((l) => ({
+      if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({
         ...l,
         [name]: { status: "error", delay: null, attempts: 0, error: String(e) },
       }));
@@ -967,48 +975,15 @@ function App() {
                   {s?.subscriptions.length ? (
                     <div className="list">
                       {s.subscriptions.map((sub) => (
-                        <div className="subscription" key={sub.id}>
-                          <div className="section-head">
-                            <div>
-                              <h2>{sub.name}</h2>
-                              <p>{sub.maskedUrl}</p>
-                            </div>
-                            <div className="actions">
-                              <button
-                                disabled={busy}
-                                onClick={() =>
-                                  run(() =>
-                                    act("subscription_refresh", { id: sub.id }),
-                                  )
-                                }
-                              >
-                                <RefreshCw size={15} />
-                                Обновить
-                              </button>
-                              <button
-                                aria-label="Удалить подписку"
-                                disabled={busy || connected}
-                                onClick={() =>
-                                  run(() =>
-                                    act("subscription_delete", { id: sub.id }),
-                                  )
-                                }
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </div>
-                          </div>
-                          <div className="subscription-meta">
-                            <span>{sub.servers.length} серверов</span>
-                            <span>
-                              Обновлена{" "}
-                              {new Date(sub.updatedAt * 1000).toLocaleString(
-                                "ru",
-                              )}
-                            </span>
-                          </div>
-                          {sub.error && <p className="error">{sub.error}</p>}
-                        </div>
+                        <SubscriptionCard key={sub.id} sub={sub}
+                          refreshing={data?.refreshingSubscriptions?.includes(sub.id) ?? false}
+                          canDelete={!busy && !connected}
+                          refresh={async () => {
+                            await request<Snapshot>("subscription_refresh", { id: sub.id });
+                            await refresh();
+                          }}
+                          remove={() => run(() => act("subscription_delete", { id: sub.id }))}
+                        />
                       ))}
                     </div>
                   ) : (

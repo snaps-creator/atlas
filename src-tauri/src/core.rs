@@ -409,6 +409,9 @@ impl Core {
             broker.call_cancellable("select", json!({"name":name}), self.continue_running.as_deref())?;
         } else {
             self.api("PUT", "/proxies/ATLAS", Some(json!({"name":name})))?;
+            if self.api("GET", "/proxies/ATLAS", None)?["now"] != name {
+                return Err("Ядро не подтвердило выбранный сервер".into());
+            }
         }
         Ok(())
     }
@@ -449,6 +452,11 @@ impl Core {
             let pid = self.child.as_ref().map(|c|c.id());
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_started",
                 "pid":pid,"tunLuid":initial_tun}));
+            // Explicit exit ends tracked streams before closing the network
+            // stack. Do not wait for their remote peers' normal I/O timeouts.
+            let drained = self.api("DELETE", "/connections", None);
+            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_connections_closed",
+                "elapsedMs":started.elapsed().as_millis(),"error":drained.err()}));
             let closed = self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}})));
             let close_ms = started.elapsed().as_millis();
             while tun_identity().is_some() && Instant::now() < deadline {
@@ -513,6 +521,13 @@ mod integration_tests {
     use crate::model::{Route, Rule, RuleGroup, Subscription};
     #[test]
     fn privileged_stop_closes_tun_before_terminating_owned_process() {
+        check_privileged_stop(Duration::from_secs(4));
+    }
+    #[test]
+    fn healthy_shutdown_does_not_wait_for_grace_period_deadlines() {
+        check_privileged_stop(Duration::ZERO);
+    }
+    fn check_privileged_stop(close_delay: Duration) {
         use std::io::{Read, Write};
         use std::os::windows::io::AsRawHandle;
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -540,6 +555,13 @@ mod integration_tests {
         let worker_released = released.clone();
         let worker = thread::spawn(move || {
             let (mut socket, _) = api.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = [0;4096];
+            let size = socket.read(&mut request).unwrap();
+            assert!(request[..size].starts_with(b"DELETE /connections "));
+            socket.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+            drop(socket);
+            let (mut socket, _) = api.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -555,7 +577,7 @@ mod integration_tests {
             assert!(String::from_utf8_lossy(&request).contains("\"tun\":{\"enable\":false}"));
             // Exceed the former three-second API timeout: the owner must stay
             // alive throughout a slow Close, including deferred adapter release.
-            thread::sleep(Duration::from_secs(4));
+            thread::sleep(close_delay);
             assert_eq!(
                 unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(handle as _, 0)
@@ -573,9 +595,11 @@ mod integration_tests {
         });
         // This fixture has a mock API and no TUN. Do not observe the user's
         // unrelated live Atlas adapter when testing owned-process stop order.
+        let started = Instant::now();
         core.stop_with_tun_observer(|| {
             (!released.load(std::sync::atomic::Ordering::SeqCst)).then_some(1)
         }).unwrap();
+        if close_delay.is_zero() { assert!(started.elapsed()<Duration::from_secs(2)); }
         worker.join().unwrap();
         assert!(core.child.is_none());
         assert!(!core.running());

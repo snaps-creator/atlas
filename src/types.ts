@@ -8,7 +8,7 @@ export type Group = {
   route: Route;
   rules: Rule[];
 };
-export type Server = { name: string; type: string; country?: string | null };
+export type Server = { name: string; type: string; country?: string | null; probeId: string };
 export type Subscription = {
   id: string;
   name: string;
@@ -42,6 +42,7 @@ export type Settings = {
 };
 export type Log = { time: number; level: string; message: string };
 export type Snapshot = {
+  refreshingSubscriptions?: string[];
   buildId?: string;
   revision?: number;
   settings: Settings;

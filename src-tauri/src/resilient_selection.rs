@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, HashSet}, sync::mpsc, time::{Duration, Instant}};
 
-const QUARANTINE: u64 = 300;
+const QUARANTINE: u64 = 30;
 fn remote_probe_failure(error: &str) -> bool {
     matches!(error,"Mihomo API: HTTP 503"|"Mihomo API: HTTP 504")
         || error.contains("Контрольный URL не подтвердил")
@@ -27,11 +27,9 @@ pub(crate) fn candidates(settings: &Settings, proxies: &Value, blocked: &HashSet
         (p["alive"] != true,p["history"].as_array()
             .and_then(|h|h.last()).and_then(|v|v["delay"].as_u64()).filter(|d|*d > 0).unwrap_or(u64::MAX))
     });
-    let mut endpoints = HashSet::new();
-    nodes.into_iter().filter(|n| {
-        // The histories are only a ranking hint. Four new checks below are required.
-        endpoints.insert(endpoint(n))
-    }).filter_map(|n|n["name"].as_str().map(str::to_owned)).collect()
+    // Same IP:port can host different SNI/Reality keys/transports. Every
+    // configured node must remain eligible for a fresh recovery check.
+    nodes.into_iter().filter_map(|n|n["name"].as_str().map(str::to_owned)).collect()
 }
 
 struct Pending { rx: mpsc::Receiver<Value>, generation: u64, repair_only: bool }
@@ -76,7 +74,7 @@ impl Recovery {
     pub fn invalidate(&mut self) {
         self.cancelled.store(true,std::sync::atomic::Ordering::SeqCst);
         self.cancelled=Default::default();
-        self.generation += 1; self.pending = None; self.needed = false;
+        self.generation += 1; self.pending = None; self.needed = false; self.retry_at = None;
         self.scheduled = None; self.samples.clear(); self.last_active = None;
         self.last_reserves = None; self.last_pool = None; self.observed_current = None;
         self.current_since = None; self.improvement = None; self.active = None; self.slow_samples = 0;
@@ -251,10 +249,11 @@ impl Recovery {
             if let Some(peer) = failed_endpoint(line) {
                 let matching: Vec<_> = servers.iter().filter(|n|endpoint(n) == peer).collect();
                 if !matching.is_empty() {
-                    for node in matching { self.blocked.entry(node_key(node)).or_insert(Quarantine {
-                        probe_after: now + Duration::from_secs(QUARANTINE), failures: 1 }); }
-                    self.needed = true;
-                    client.event(json!({"at":crate::model::now(),"kind":"endpoint_quarantined","endpoint":peer,"retryAfterSeconds":QUARANTINE,"release":"two successful probe rounds","trigger":line}));
+                    // A single application connection error is not a failed
+                    // health check, nor evidence against every node at this IP.
+                    // The active monitor confirms failure before replacement.
+                    client.event(json!({"at":crate::model::now(),"kind":"endpoint_connection_error",
+                        "endpoint":peer,"matchingNodes":matching.len(),"trigger":line}));
                 }
             }
         }
@@ -285,7 +284,7 @@ impl Recovery {
                                 let failure = self.blocked.entry(key).or_insert(Quarantine {
                                     probe_after: now, failures: 0 });
                                 failure.failures = failure.failures.saturating_add(1);
-                                let wait = (QUARANTINE.saturating_mul(1u64 << failure.failures.min(3))).min(3600);
+                                let wait = (QUARANTINE.saturating_mul(1u64 << failure.failures.min(2))).min(120);
                                 failure.probe_after = now + Duration::from_secs(wait);
                             }
                         }
@@ -523,6 +522,7 @@ mod tests {
             servers:vec![json!({"name":"Sweden","server":"1.2.3.4","port":443}),json!({"name":"Germany","server":"1.2.3.4","port":443}),json!({"name":"other","server":"5.6.7.8","port":443})]});
         let p=json!({"proxies":{"Sweden":{"alive":true},"Germany":{"alive":true},"other":{"alive":true}}});
         let first = node_key(&s.servers()[0]);
+        assert_eq!(candidates(&s,&p,&HashSet::new(),0),vec!["Sweden","Germany","other"]);
         assert_eq!(candidates(&s,&p,&HashSet::from([first]),0),vec!["Germany","other"]);
         let both = s.servers()[..2].iter().map(node_key).collect();
         assert_eq!(candidates(&s,&p,&both,0),vec!["other"]);

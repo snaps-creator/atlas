@@ -851,12 +851,14 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 {
                     return Err("Сервер отсутствует в подписках".into());
                 }
-                queries.invalidate();
+                let node_paths = settings.servers().iter().filter_map(|node| node["name"].as_str()
+                    .map(|name| format!("/proxies/{}/delay", crate::latency::encode_name(name)))).collect();
+                queries.selection_changed(&node_paths);
                 *network_epoch = network_epoch.wrapping_add(1);
                 recovery.invalidate();
                 let previous = settings.selected.clone();
                 if let Err(error) = core.select(name) {
-                    let rollback = core.select(&previous).and_then(|_| confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ()));
+                    let rollback = core.select(&previous);
                     if let Err(rollback_error) = rollback {
                         explicit_stop = true;
                         return abandon_session(core, guard, configured, active_settings,
@@ -865,16 +867,10 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                     return Err(format!("Команда выбора не подтверждена: {error}; прежний маршрут восстановлен"));
                 }
                 settings.selected = name.to_owned();
-                if let Err(error) = confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS) {
-                    settings.selected = previous.clone();
-                    let rollback = core.select(&previous).and_then(|_| confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ()));
-                    if let Err(rollback_error) = rollback {
-                        explicit_stop = true;
-                        return abandon_session(core, guard, configured, active_settings,
-                            format!("Выбранный сервер не подтверждён: {error}; прежний маршрут не восстановлен: {rollback_error}"));
-                    }
-                    return Err(format!("Выбранный сервер не подтверждён: {error}; прежний маршрут восстановлен"));
-                }
+                // Selection acknowledges the local selector, not remote reachability.
+                // The existing asynchronous health monitor measures the new node.
+                // Waiting for URL tests here monopolizes the IPC channel and makes
+                // unrelated node tests fail with "service busy". WFP is unchanged.
                 Ok(json!({}))
             }
             "status" => {

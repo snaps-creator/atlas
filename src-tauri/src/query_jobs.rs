@@ -12,6 +12,16 @@ pub struct QueryJobs {
     epoch: u64,
 }
 impl QueryJobs {
+    /// A selector change invalidates route observations, not URL tests of
+    /// concrete nodes. Group tests depend on the selection and are cancelled.
+    pub fn selection_changed(&mut self, node_paths: &HashSet<String>) {
+        self.jobs.retain(|_, job| {
+            let keep = job.delay && job.key.as_ref().is_some_and(|key|
+                key.split_once('?').is_some_and(|(path, _)| node_paths.contains(path)));
+            if !keep { job.work.cancelled.store(true, Ordering::SeqCst); }
+            keep
+        });
+    }
     /// Invalidate replies from an earlier network configuration. Workers have
     /// bounded API deadlines; dropping their receivers prevents stale results
     /// from being published into the new session.
@@ -90,6 +100,31 @@ impl Drop for QueryJobs {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn selecting_route_keeps_node_probe_but_cancels_group_and_route_reads() {
+        let mut jobs = QueryJobs::default();
+        let (resume, waiting) = mpsc::channel();
+        let node = jobs.start_keyed(true, Some("/proxies/Berlin/delay?timeout=10000".into()), move |cancelled| {
+            waiting.recv().unwrap();
+            assert!(!cancelled.load(Ordering::SeqCst));
+            Ok(serde_json::json!({"delay":42}))
+        }).unwrap();
+        let group = jobs.start_keyed(true, Some("/proxies/ATLAS/delay?timeout=10000".into()), |_| Ok(Value::Null)).unwrap();
+        let route = jobs.start(false, |_| Ok(Value::Null)).unwrap();
+        jobs.selection_changed(&HashSet::from(["/proxies/Berlin/delay".into()]));
+        assert!(jobs.poll(&group).is_err());
+        assert!(jobs.poll(&route).is_err());
+        resume.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = jobs.poll(&node).unwrap() { assert_eq!(result["delay"],42); break; }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // An old timeout is never reused as the result of a new request.
+        let fresh = jobs.start_keyed(true, Some("/proxies/Berlin/delay?timeout=10000".into()), |_| Ok(Value::Null)).unwrap();
+        assert_ne!(fresh,node);
+    }
     #[test]
     fn stalled_latency_jobs_cannot_consume_operational_capacity() {
         let mut jobs = QueryJobs::default();

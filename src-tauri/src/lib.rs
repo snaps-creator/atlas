@@ -24,6 +24,7 @@ mod service;
 mod session_cleanup;
 mod storage;
 mod subscriptions;
+mod subscription_refresh;
 #[cfg(test)]
 mod site_checks;
 mod support_report;
@@ -81,12 +82,13 @@ impl App {
         }
         for sub in &mut s.subscriptions {
             for p in &mut sub.servers {
-                *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p)});
+                *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p),"probeId":latency::node_identity(p)});
             }
         }
         let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs,"buildId":env!("ATLAS_BUILD_ID")});
         let mut value = value;
         value["controlError"] = json!(self.control_error);
+        value["refreshingSubscriptions"] = json!(subscription_refresh::active());
         value["revision"] = json!(self.revision);
         self.published.set(value.clone());
         value
@@ -411,34 +413,6 @@ impl App {
                     self.save(back)?;
                     return Err(format!("Автозапуск Windows: {e}"));
                 }
-            }
-            "subscription_add" | "subscription_refresh" => {
-                let id = p["id"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let entry = keyring::Entry::new("AtlasVPN", &id)
-                    .map_err(|_| "Диспетчер учётных данных Windows недоступен")?;
-                let url = if action == "subscription_add" {
-                    p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned()
-                } else {
-                    entry
-                        .get_password()
-                        .map_err(|_| "Ссылка подписки отсутствует в хранилище Windows")?
-                };
-                let nodes = match subscriptions::download(&url, self.core.running()) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        if let Some(s) = self.settings.subscriptions.iter_mut().find(|s| s.id == id)
-                        {
-                            s.error = Some(e.clone());
-                            self.store.save(&self.settings)?;
-                        }
-                        return Err(e);
-                    }
-                };
-                self.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned),
-                    (action == "subscription_add").then_some(entry))?;
             }
             "subscription_delete" => {
                 let id = p["id"].as_str().ok_or("Нет ID")?;
@@ -838,14 +812,16 @@ async fn request_inner(
                     a.settings.servers().iter().filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(),
                     a.revision)
             };
+            let identities: std::collections::HashMap<_,_> = settings.servers().iter()
+                .filter_map(|node| node["name"].as_str().map(|name| (name.to_owned(), latency::node_identity(node)))).collect();
             let progress = |name: &str, result: &Value| {
                 let _ = app.emit("latency-result", json!({
-                    "batchId":batch_id,"revision":revision,"name":name,"result":result
+                    "batchId":batch_id,"revision":revision,"name":name,"probeId":identities.get(name),"result":result
                 }));
             };
             let results = if let Some(client) = client { latency::batch_stream(client, &names, &progress)? }
                 else { latency::offline_batch_stream(settings, binary, directory, &names, &progress)? };
-            Ok(json!({"revision":revision,"results":results}))
+            Ok(json!({"revision":revision,"identities":identities,"results":results}))
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "latency" {
@@ -874,6 +850,40 @@ async fn request_inner(
         })
         .await
         .map_err(|e| e.to_string())?;
+    }
+    if matches!(action.as_str(), "subscription_add" | "subscription_refresh") {
+        let captured = app.state::<published_state::ReadState>().get()?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            let p = payload.unwrap_or(Value::Null);
+            let id = p["id"].as_str().map(str::to_owned).unwrap_or_else(||uuid::Uuid::new_v4().to_string());
+            let _lease = subscription_refresh::Lease::take(&id).ok_or("Эта подписка уже обновляется")?;
+            let entry = keyring::Entry::new("AtlasVPN", &id).map_err(|_|"Хранилище Windows недоступно")?;
+            let adding = action == "subscription_add";
+            let url = if adding { p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned() }
+                else { entry.get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")? };
+            // Download never owns the mutation lock: Quit must not wait for HTTPS.
+            let downloaded = subscriptions::download(&url, captured.status == "Connected");
+            let mut a = shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
+            if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("Atlas завершает работу".into());
+            }
+            if !adding && !subscriptions::refresh_is_current(
+                captured.settings.subscriptions.iter().find(|s|s.id == id),
+                a.settings.subscriptions.iter().find(|s|s.id == id)) {
+                return Err("Подписка уже изменена; результат загрузки не применён".into());
+            }
+            match downloaded {
+                Ok(nodes) => a.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned), adding.then_some(entry))?,
+                Err(error) => {
+                    if let Some(sub) = a.settings.subscriptions.iter_mut().find(|s|s.id == id) { sub.error=Some(error.clone()); }
+                    let settings = a.settings.clone();
+                    a.store.save(&settings)?;
+                    a.snapshot();
+                    return Err(error);
+                }
+            }
+            Ok(a.snapshot())
+        }).await.map_err(|e|e.to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
         let queued=std::time::Instant::now();
@@ -1109,48 +1119,7 @@ pub fn run() {
                 })
                 .build(app)?;
             let refresh_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            {
-                let shared = shared.clone();
-                let done = refresh_done.clone();
-                let stop = shutdown.clone();
-                std::thread::spawn(move || {
-                    struct Finish(Arc<std::sync::atomic::AtomicBool>);
-                    impl Drop for Finish { fn drop(&mut self) { self.0.store(true,std::sync::atomic::Ordering::SeqCst); } }
-                    let _finish = Finish(done);
-                    let ids = shared.lock().map(|a|a.settings.subscriptions.iter().map(|s|s.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
-                    for id in ids {
-                        if stop.load(std::sync::atomic::Ordering::SeqCst) { break; }
-                        let started = std::time::Instant::now();
-                        incident_history::record("subscription_refresh_started",json!({"subscription":id,"trigger":"startup"}),&[]);
-                        let result = (|| -> Result<(),String> {
-                            let url = keyring::Entry::new("AtlasVPN",&id).map_err(|_|"Хранилище Windows недоступно")?
-                                .get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")?;
-                            let captured = shared.lock().map_err(|_|"Состояние Atlas недоступно")?.reads.get()?;
-                            let nodes = subscriptions::download(&url,captured.status == "Connected")?;
-                            let mut a = shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
-                            if stop.load(std::sync::atomic::Ordering::SeqCst) { return Err("Atlas завершает работу".into()); }
-                            // Never recreate a subscription deleted while the download was running.
-                            let Some(current) = a.settings.subscriptions.iter().find(|s|s.id==id) else { return Ok(()); };
-                            let before = captured.settings.subscriptions.iter().find(|s|s.id==id);
-                            if !subscriptions::refresh_is_current(before,Some(current)) {
-                                return Err("Подписка уже изменена; фоновый результат не применён".into());
-                            }
-                            a.install_subscription(id.clone(),url,nodes,None,None)?;
-                            a.snapshot();
-                            Ok(())
-                        })();
-                        incident_history::record("subscription_refresh_completed",json!({"subscription":id,"trigger":"startup",
-                            "elapsedMs":started.elapsed().as_millis(),"success":result.is_ok(),"error":result.as_ref().err()}),&[]);
-                        if let Err(error) = result {
-                            if let Ok(mut a) = shared.lock() {
-                                if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id) {sub.error=Some(error.clone());}
-                                a.log("WARN",&format!("Автообновление подписки: {error}"));
-                                a.snapshot();
-                            }
-                        }
-                    }
-                });
-            }
+            subscription_refresh::start(shared.clone(), app.state::<published_state::ReadState>().inner().clone(), shutdown.clone(), refresh_done.clone());
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));

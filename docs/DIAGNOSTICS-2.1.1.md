@@ -1,7 +1,7 @@
 # Atlas Alpha 2.1.1
 
 ## Subscriptions
-All saved subscriptions refresh on application startup. Downloads run outside the application mutation lock. Automatic connection waits until refresh attempts finish. Failed downloads preserve the previous nodes. Deleted subscriptions and newer manually refreshed nodes cannot be overwritten by late startup results. Errors remain visible on the subscription and in the incident history. This release does not schedule periodic subscription downloads.
+All saved subscriptions refresh on application startup. Downloads run outside the application mutation lock. Automatic connection waits until refresh attempts finish. Failed downloads preserve the previous nodes. Deleted subscriptions and newer manually refreshed nodes cannot be overwritten by late startup results. Errors remain visible on the subscription and in the incident history. Each subscription now has an independent 30-minute refresh schedule, plus recovery-triggered attempts at most once per two minutes. At most two downloads run concurrently. The UI shows the last successful update age and per-subscription progress. Manual downloads also run outside the mutation lock; unchanged network configuration does not reload the core.
 
 ## Concurrency
 Read snapshots for server lists, checks and diagnostic requests no longer compete for the mutation mutex. Mutating commands wait instead of returning Atlas busy. Service status is queried outside that mutex; IPC errors are distinct from confirmed process/session termination. Concurrent frontend proxy reads share only the in-flight request. UI retains the known server while explicitly marking a failed status read. Recovery retries local check failures after five seconds.

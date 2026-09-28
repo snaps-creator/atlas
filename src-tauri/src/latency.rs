@@ -5,6 +5,12 @@ use std::path::PathBuf;
 
 pub const DISPLAY_URL: &str = "http://cp.cloudflare.com/generate_204";
 pub const DISPLAY_TIMEOUT_MS: u64 = 10000;
+/// Opaque identity of actual node parameters, independent of UI preferences,
+/// selected route and subscription refresh timestamps. Never expose credentials.
+pub fn node_identity(node: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
+}
 // Match Clash Verge's per-node measurement without saturating the controller.
 pub fn batch_stream(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
     display_batch_stream(client, names, DISPLAY_URL, DISPLAY_TIMEOUT_MS, progress)
@@ -198,6 +204,39 @@ pub(crate) fn encode_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::Subscription;
+    #[test]
+    fn failed_node_recovers_on_next_probe_without_subscription_refresh() {
+        use std::{io::{Read,Write}, net::TcpListener, thread, time::Duration};
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://127.0.0.1:{}/test",origin.local_addr().unwrap().port());
+        origin.set_nonblocking(true).unwrap();
+        let worker = thread::spawn(move || {
+            for responds in [false, true] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let mut connection = loop {
+                    if let Ok((connection,_)) = origin.accept() { break connection; }
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(10));
+                };
+                connection.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let _ = connection.read(&mut [0;2048]);
+                if !responds { continue; }
+                thread::sleep(Duration::from_millis(20));
+                connection.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let mut settings = Settings::default();
+        settings.subscriptions.push(Subscription{id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:vec![json!({"name":"fixture","type":"direct"})]});
+        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
+        with_offline_core(settings,binary,std::env::temp_dir(),|client| {
+            assert_eq!(display_probe(&client,"fixture",&endpoint,3000).status,"unreachable");
+            client.api("PUT","/proxies/ATLAS",Some(json!({"name":"fixture"})))?;
+            assert_eq!(display_probe(&client,"fixture",&endpoint,3000).status,"ok");
+            Ok(())
+        }).unwrap();
+        worker.join().unwrap();
+    }
     #[test]
     fn publishes_fast_result_while_another_node_is_still_blocked() {
         use std::{sync::{mpsc, Mutex}, time::Duration};

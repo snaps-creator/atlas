@@ -6,12 +6,17 @@ export type Latency = {
   measuredAt?: number;
 };
 
-export type LatencyProgress = { batchId: string; revision: number; name: string; result: Latency };
+export type LatencyProgress = { batchId: string; probeId: string; name: string; result: Latency };
 
 export function applyLatencyProgress(previous: Record<string, Latency>, event: LatencyProgress,
-  batchId: string, revision: number | undefined, names: Set<string>): Record<string, Latency> {
-  if (event.batchId !== batchId || event.revision !== revision || !names.has(event.name)) return previous;
+  batchId: string, identities: Record<string,string>, names: Set<string>): Record<string, Latency> {
+  if (event.batchId !== batchId || event.probeId !== identities[event.name] || !names.has(event.name)) return previous;
   return {...previous, [event.name]: {...event.result, measuredAt: Date.now()}};
+}
+
+export function retainNodeLatencies(values: Record<string,Latency>, before: Record<string,string>, after: Record<string,string>) {
+  return Object.fromEntries(Object.entries(values).filter(([name]) =>
+    after[name] !== undefined && before[name] === after[name]));
 }
 
 export function failPendingLatencies(previous: Record<string, Latency>, names: string[], error: unknown): Record<string, Latency> {
