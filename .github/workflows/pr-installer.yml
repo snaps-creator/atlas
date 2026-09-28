@@ -61,7 +61,7 @@ jobs:
         run: ./scripts/package-installer.ps1
       - uses: actions/upload-artifact@v7
         with:
-          name: Atlas-Alpha-2.0.1-Windows-x64-PR-${{ github.event.pull_request.number }}
+          name: Atlas-Windows-x64-PR-${{ github.event.pull_request.number }}
           path: |
             Atlas*Setup.exe
             Atlas*Setup.exe.sig

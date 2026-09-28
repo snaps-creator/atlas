@@ -11,6 +11,13 @@
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
+  ; Recheck with the NEW cleanup implementation as older releases did not
+  ; verify that Atlas-TUN actually disappeared. Do this before registration.
+  ExecWait '"$INSTDIR\Atlas.exe" --cleanup' $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Предыдущая сетевая сессия Atlas не очищена полностью. Новая служба не будет зарегистрирована."
+    Abort
+  ${EndIf}
   ; Tauri's CEF bundle contains upstream bootstrap hosts for a DLL-hosted
   ; application. Atlas is an EXE-hosted application and never launches them.
   ; Remove these unused foreign-named executables after extraction.
@@ -35,5 +42,9 @@
     Abort
   ${EndIf}
   ExecWait '"$INSTDIR\Atlas.exe" --uninstall-service' $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Служба Atlas не удалена. Удаление файлов остановлено, чтобы сохранить возможность восстановления."
+    Abort
+  ${EndIf}
   Delete "$INSTDIR\Atlas.Service.exe"
 !macroend

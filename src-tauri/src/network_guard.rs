@@ -103,6 +103,20 @@ pub fn tun_identity() -> Option<u64> {
     }
 }
 
+pub(crate) fn wait_for_tun_release(timeout: std::time::Duration) -> Result<(), String> {
+    wait_for_tun_release_with(timeout, tun_identity)
+}
+fn wait_for_tun_release_with(timeout: std::time::Duration, identity: impl Fn() -> Option<u64>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while identity().is_some() {
+        if std::time::Instant::now() >= deadline {
+            return Err("Atlas-TUN остался после остановки службы. Очистка не подтверждена; установка или удаление остановлены. Неизвестный интерфейс не изменён".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// Stable identity of physical default routes. Changing Wi-Fi, gateway or VPN
 /// uplink starts a new health epoch without treating the old network's failed
 /// probes as evidence against servers on the new one.
@@ -372,6 +386,11 @@ fn dhcp_conditions(local: u16, remote: u16) -> [FWPM_FILTER_CONDITION0; 3] {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_never_reports_success_with_a_remaining_tun() {
+        assert!(super::wait_for_tun_release_with(std::time::Duration::ZERO,||Some(42)).is_err());
+        assert!(super::wait_for_tun_release_with(std::time::Duration::ZERO,||None).is_ok());
+    }
     use super::*;
     #[test]
     fn dhcp_discovery_and_renewal_share_port_scoped_wfp_conditions() {

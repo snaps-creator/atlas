@@ -786,6 +786,13 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 validate_settings(&s)?;
                 if !*configured { return Err("Нет активной сетевой сессии для обновления".into()); }
                 let previous = active_settings.clone().ok_or("Нет предыдущей конфигурации для отката")?;
+                // Health policy changes must not reload Mihomo or recreate TUN.
+                if previous.selected == s.selected
+                    && crate::config::generate(&previous, "compare")? == crate::config::generate(&s, "compare")? {
+                    recovery.invalidate();
+                    *active_settings = Some(s);
+                    return Ok(json!({"running":true,"policyUpdated":true}));
+                }
                 queries.invalidate();
                 *network_epoch = network_epoch.wrapping_add(1);
                 recovery.invalidate();
