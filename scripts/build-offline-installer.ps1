@@ -32,6 +32,3 @@ try {
     & $compiler /nologo /codepage:65001 /target:winexe /platform:x64 /optimize+ /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /win32icon:src-tauri\icons\icon.ico "/out:Install Atlas.exe" scripts\installer-launcher\Program.cs installer\Payload.cs
     if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed' }
 } finally { Pop-Location }
-
-
-
