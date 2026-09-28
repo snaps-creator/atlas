@@ -51,12 +51,31 @@ impl Core {
     /// A probe-only core has private loopback listeners and never owns TUN,
     /// system proxy settings, or the service's fixed controller ports.
     pub(crate) fn use_ephemeral_ports(&mut self) -> Result<(), String> {
-        let listeners = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("Не удалось выделить порт проверки: {e}")))
-            .collect::<Result<Vec<_>,_>>()?;
-        for (index, listener) in listeners.iter().enumerate() {
-            self.ports[index] = listener.local_addr().map_err(|e| e.to_string())?.port();
+        // Windows can reserve different port ranges for TCP and UDP. Mixed
+        // and DNS listeners need both, so TCP availability alone is insufficient.
+        let mut reservations = Vec::new();
+        let mut ports = [0; 3];
+        for port in &mut ports {
+            let mut last_error = String::new();
+            for _ in 0..128 {
+                let udp = std::net::UdpSocket::bind(("127.0.0.1", 0))
+                    .map_err(|e| format!("Не удалось выделить UDP-порт проверки: {e}"))?;
+                let candidate = udp.local_addr().map_err(|e| e.to_string())?.port();
+                match std::net::TcpListener::bind(("127.0.0.1", candidate)) {
+                    Ok(tcp) => {
+                        *port = candidate;
+                        // Keep all pairs reserved until the entire set is allocated.
+                        reservations.push((tcp, udp));
+                        break;
+                    }
+                    Err(error) => last_error = error.to_string(),
+                }
+            }
+            if *port == 0 {
+                return Err(format!("Не удалось выделить общий TCP/UDP-порт проверки: {last_error}"));
+            }
         }
+        self.ports = ports;
         Ok(())
     }
     fn command(&self) -> Command {
@@ -594,10 +613,7 @@ mod integration_tests {
         std::fs::create_dir_all(&directory).unwrap();
         let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
         let mut core = Core::new(binary, directory.clone());
-        let reservations: Vec<_> = (0..3)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        core.ports = std::array::from_fn(|i| reservations[i].local_addr().unwrap().port());
+        core.use_ephemeral_ports().unwrap();
         let mut settings = Settings::default();
         settings.mode = "system".into();
         // Isolated fixture. No real subscription, credentials or OS proxy changes.
@@ -606,7 +622,6 @@ mod integration_tests {
         tun_candidate.mode = "tun".into();
         core.validate(&tun_candidate)
             .expect("Mihomo must accept dual-stack TUN configuration");
-        drop(reservations);
         core.start(&settings).unwrap();
         assert!(core.running());
         assert!(core.api("GET", "/version", None).unwrap()["version"].is_string());
