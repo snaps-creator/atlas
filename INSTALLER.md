@@ -1,23 +1,28 @@
-# Atlas Alpha 2.0.1 — установщик
+# Установка Atlas Alpha 2.0.1
 
-**[Скачать ZIP с EXE и подписью](https://github.com/snaps-creator/atlas/releases/download/v2.0.1-alpha.1/Atlas-2.0.1-New-Design-Windows-x64.zip)**
+1. Скачайте Code → Download ZIP с GitHub.
+2. Распакуйте архив полностью.
+3. Запустите **Install Atlas.exe**. Папка **installer** должна лежать рядом.
 
-Распакуйте архив и запустите `Atlas Alpha 2.0.1 Setup.exe`.
+Это настоящий Windows x64 EXE. Он собирает установщик из двух локальных файлов, проверяет встроенные размер и SHA-256, затем открывает обычный мастер установки Atlas. Интернет, Git, Node.js и Git LFS для установки не нужны. Используется встроенный в Windows 10/11 .NET Framework 4.x. При повреждённой или неполной загрузке запуск отменяется с сообщением. Отмена UAC также не запускает установку.
 
-В архиве:
-- `Atlas Alpha 2.0.1 Setup.exe` — Windows x64, 161972950 байт.
-- `Atlas Alpha 2.0.1 Setup.exe.sig` — подпись обновлений.
-- `SHA256SUMS.txt` — контрольная сумма EXE.
+Полный установщик нового дизайна имеет размер 161972950 байт и SHA-256 `1a8820c2f85a9d5bb04c33d69bc5d90c91480ac3d665fbcb6a2c77f971a83085`. Его подпись обновлений находится в `installer/atlas-setup.exe.sig`. Подпись проверена перед упаковкой; исходная сборка — PR #34, коммит `024103d`.
 
-SHA-256 EXE: `1a8820c2f85a9d5bb04c33d69bc5d90c91480ac3d665fbcb6a2c77f971a83085`.
-Это проверенная сборка коммита `024103d`, тот же файл находится в корне репозитория. Подпись проверяется командой:
+Запускатель и данные хранятся обычными Git-файлами, каждый меньше 100 МиБ. ZIP исходников содержит реальные байты независимо от настройки «Include Git LFS objects in archives». Старые ZIP нужно скачать заново.
+
+`SHA256SUMS.txt` содержит хэш запускателя. Windows Authenticode отсутствует: Windows может показывать неизвестного издателя. Подпись обновлений Tauri не является Authenticode.
+
+Проверки без установки:
 
 ```powershell
-node scripts/verify-installer.cjs "Atlas Alpha 2.0.1 Setup.exe"
+node scripts/verify-offline-installer.cjs
+./scripts/test-offline-installer.ps1
 ```
 
-`.sig` — подпись обновлений Tauri, не Windows Authenticode.
+Обновление комплекта из нового подписанного установщика:
 
-ZIP из Releases содержит полный EXE и не зависит от Git LFS. В отличие от него, «Code → Download ZIP» упаковывает исходники и требует включённой настройки репозитория «Include Git LFS objects in archives», иначе EXE будет текстовым указателем размером 134 байта. После клонирования Git используйте `git lfs pull`.
+```powershell
+./scripts/build-offline-installer.ps1 -Installer path/to/signed-setup.exe
+```
 
-Технические документы и отчёты находятся в [docs](docs/).
+После обновления нужно пересчитать SHA256SUMS.txt, закоммитить Install Atlas.exe и весь installer/, скачать ZIP ветки с GitHub и повторить проверки. `--verify` проверяет сборку данных и SHA-256 без запуска мастера установки.

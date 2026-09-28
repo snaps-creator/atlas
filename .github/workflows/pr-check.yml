@@ -16,8 +16,6 @@ jobs:
       RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
 
       - name: Initialize MSVC and CMake
         shell: pwsh
@@ -45,6 +43,13 @@ jobs:
 
       - name: Test updater signature verification
         run: node --test scripts/verify-installer.check.cjs
+
+      - name: Verify offline source-archive installer
+        shell: pwsh
+        run: |
+          node scripts/verify-offline-installer.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Offline installer signature failed.' }
+          ./scripts/test-offline-installer.ps1
 
       - name: Verify checked-in installer when present
         shell: pwsh

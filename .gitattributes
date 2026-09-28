@@ -1,1 +1,2 @@
-Atlas[[:space:]]Alpha[[:space:]]2.0.1[[:space:]]Setup.exe filter=lfs diff=lfs merge=lfs -text
+Install[[:space:]]Atlas.exe binary -filter
+installer/atlas-setup.part* binary -filter
