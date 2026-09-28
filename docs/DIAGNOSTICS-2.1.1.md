@@ -1,7 +1,7 @@
 # Atlas Alpha 2.1.1
 
 ## Subscriptions
-All saved subscriptions refresh on application startup. Downloads run outside the application mutation lock. Automatic connection waits until refresh attempts finish. Failed downloads preserve the previous nodes. Deleted subscriptions and newer manually refreshed nodes cannot be overwritten by late startup results. Errors remain visible on the subscription and in the incident history. This release does not schedule periodic subscription downloads.
+All saved subscriptions refresh on application startup. Downloads run outside the application mutation lock. Automatic connection waits until refresh attempts finish. Failed downloads preserve the previous nodes. Deleted subscriptions and newer manually refreshed nodes cannot be overwritten by late startup results. Errors remain visible on the subscription and in the incident history. Each subscription now has an independent 30-minute refresh schedule, plus recovery-triggered attempts at most once per two minutes. At most two downloads run concurrently. The UI shows the last successful update age and per-subscription progress. Manual downloads also run outside the mutation lock; unchanged network configuration does not reload the core.
 
 ## Concurrency
 Read snapshots for server lists, checks and diagnostic requests no longer compete for the mutation mutex. Mutating commands wait instead of returning Atlas busy. Service status is queried outside that mutex; IPC errors are distinct from confirmed process/session termination. Concurrent frontend proxy reads share only the in-flight request. UI retains the known server while explicitly marking a failed status read. Recovery retries local check failures after five seconds.
@@ -14,6 +14,12 @@ Failed service operations carry session/epoch, recent core logs and the last pre
 HTTPS diagnostic probes now use the requested proxy for CONNECT as well as HTTP. Secret redaction runs on JSON string leaves before serialization, retaining parseable nested evidence. No diagnostic collector changes selectors, routes, adapters or firewall configuration.
 
 ## Evidence limits
+The secondary control now uses HTTPS HEAD on cp.cloudflare.com/generate_204 and requires exactly HTTP 204, matching the primary HTTP control. These are two transports to the same Cloudflare service, not independent providers. An HTTP error response is preserved separately from failure to connect. The former trace URL returned 404 for HEAD and is no longer used.
+
+Windows NCSI domains use real DNS answers instead of fake IPv4 addresses. This prevents synthetic IPv4 connections to IPv6-only probe names without enabling IPv6 or changing routing policy. DNS evidence distinguishes CNAME-only replies from replies containing an A record. Native Windows collector output is decoded as OEM before the report is emitted as UTF-8.
+
+Shutdown records and flushes each stage before and after execution: owned core, service, proxy restoration, legacy filters and TUN release. Core evidence includes process ID, initial/remaining TUN LUID, graceful close timing/error and confirmed process exit. Successful Stop replies also return cleanup evidence before the service exits. This improves localization of a stall; it does not prove a Windows driver-level cause by itself.
+
 A silent remote timeout cannot uniquely identify filtering versus peer failure without external evidence. Installer failures before application startup need installer logs. A process killed before delivering IPC evidence can leave a gap. Windows snapshots describe capture time, not an unrecorded past state. Missing evidence is reported; no claim of universal fault identification is made.
 
 ## Safe regression checks

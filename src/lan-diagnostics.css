@@ -11,6 +11,22 @@
   align-items: center;
   justify-content: space-between;
 }
+.lan-diagnostics .lan-unlock-form {
+  display: block;
+  margin: 14px 0;
+}
+.lan-diagnostics .lan-unlock-form label {
+  margin: 0 0 6px;
+}
+.lan-unlock-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.lan-unlock-controls input {
+  max-width: 100%;
+}
 .lan-diagnostics label {
   display: flex;
   flex-direction: column;

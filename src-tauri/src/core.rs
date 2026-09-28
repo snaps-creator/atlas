@@ -409,6 +409,9 @@ impl Core {
             broker.call_cancellable("select", json!({"name":name}), self.continue_running.as_deref())?;
         } else {
             self.api("PUT", "/proxies/ATLAS", Some(json!({"name":name})))?;
+            if self.api("GET", "/proxies/ATLAS", None)?["now"] != name {
+                return Err("Ядро не подтвердило выбранный сервер".into());
+            }
         }
         Ok(())
     }
@@ -424,7 +427,9 @@ impl Core {
         }
         let mut result = Ok(());
         if let Some(broker) = self.broker.take() {
-            result = broker.call("stop", Value::Null).map(|_| ());
+            result = broker.call("stop", Value::Null).map(|evidence| {
+                crate::incident_history::record("service_shutdown_completed", evidence, &[]);
+            });
             let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         }
         if had_broker {
@@ -438,18 +443,41 @@ impl Core {
             };
         }
         if self.elevated && self.child.is_some() {
-            // Run sing-tun's real Close path (adapter, routes, DNS cache) before
-            // TerminateProcess. The local API has a 3-second deadline; a hung
-            // core still falls through to owned-process termination.
-            let _ = self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}})));
+            // PATCH returns only after the core's synchronous TUN Close path.
+            // Do not interrupt driver/route cleanup with the ordinary read
+            // timeout. Keep the owner alive while Windows releases the adapter.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let started = Instant::now();
+            let initial_tun = tun_identity();
+            let pid = self.child.as_ref().map(|c|c.id());
+            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_started",
+                "pid":pid,"tunLuid":initial_tun}));
+            // Explicit exit ends tracked streams before closing the network
+            // stack. Do not wait for their remote peers' normal I/O timeouts.
+            let drained = self.api("DELETE", "/connections", None);
+            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_connections_closed",
+                "elapsedMs":started.elapsed().as_millis(),"error":drained.err()}));
+            let closed = self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}})));
+            let close_ms = started.elapsed().as_millis();
+            while tun_identity().is_some() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_cleanup",
+                "pid":pid,"initialTunLuid":initial_tun,"remainingTunLuid":tun_identity(),
+                "closeMs":close_ms,"elapsedMs":started.elapsed().as_millis(),
+                "closeError":closed.err(),"tunRemainingBeforeTermination":tun_identity().is_some()}));
         }
         if let Some(mut c) = self.child.take() {
             let job = self.job.take();
-            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(2)) {
+            // Windows may finish pending socket I/O after accepting termination.
+            // This is a maximum wait on the process handle, not a fixed delay;
+            // a normally exited process returns immediately.
+            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(5)) {
                 self.child = Some(c);
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 return Err(error);
             }
+            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_process_exited","pid":c.id()}));
         }
         self.started = None;
         self.job = None;
@@ -460,8 +488,10 @@ impl Core {
                 thread::sleep(Duration::from_millis(50));
             }
             if tun_identity().is_some() {
+                self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_remaining","tunLuid":tun_identity()}));
                 return Err("Ядро остановлено, но Atlas-TUN ещё существует; восстановление сети не подтверждено".into());
             }
+            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_released"}));
         }
         result
     }
@@ -471,7 +501,7 @@ impl Drop for Core {
         // The service observes IPC loss and releases its dynamic WFP session.
         if let Some(mut child) = self.child.take() {
             let job = self.job.take();
-            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(2)) {
+            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(5)) {
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 eprintln!("{error}");
             }
@@ -481,12 +511,26 @@ impl Drop for Core {
     }
 }
 
+fn controller_timeout(method: &str, path: &str, body: Option<&Value>) -> Duration {
+    Duration::from_secs(if method == "PATCH" && path == "/configs"
+        && body.is_some_and(|value| value["tun"]["enable"] == false) {
+        15
+    } else if path.contains("/delay?") { 12 } else { 3 })
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;
     use crate::model::{Route, Rule, RuleGroup, Subscription};
     #[test]
     fn privileged_stop_closes_tun_before_terminating_owned_process() {
+        check_privileged_stop(Duration::from_secs(4));
+    }
+    #[test]
+    fn healthy_shutdown_does_not_wait_for_grace_period_deadlines() {
+        check_privileged_stop(Duration::ZERO);
+    }
+    fn check_privileged_stop(close_delay: Duration) {
         use std::io::{Read, Write};
         use std::os::windows::io::AsRawHandle;
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -510,7 +554,16 @@ mod integration_tests {
         core.job = Some(crate::job::Job::attach(&child).unwrap());
         let handle = child.as_raw_handle() as usize;
         core.child = Some(child);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_released = released.clone();
         let worker = thread::spawn(move || {
+            let (mut socket, _) = api.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = [0;4096];
+            let size = socket.read(&mut request).unwrap();
+            assert!(request[..size].starts_with(b"DELETE /connections "));
+            socket.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+            drop(socket);
             let (mut socket, _) = api.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
@@ -525,6 +578,9 @@ mod integration_tests {
             }
             assert!(request.starts_with(b"PATCH /configs "));
             assert!(String::from_utf8_lossy(&request).contains("\"tun\":{\"enable\":false}"));
+            // Exceed the former three-second API timeout: the owner must stay
+            // alive throughout a slow Close, including deferred adapter release.
+            thread::sleep(close_delay);
             assert_eq!(
                 unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(handle as _, 0)
@@ -534,13 +590,28 @@ mod integration_tests {
             socket
                 .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
                 .unwrap();
+            thread::sleep(Duration::from_millis(250));
+            assert_eq!(unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(handle as _, 0)
+            }, windows_sys::Win32::Foundation::WAIT_TIMEOUT);
+            worker_released.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         // This fixture has a mock API and no TUN. Do not observe the user's
         // unrelated live Atlas adapter when testing owned-process stop order.
-        core.stop_with_tun_observer(|| None).unwrap();
+        let started = Instant::now();
+        core.stop_with_tun_observer(|| {
+            (!released.load(std::sync::atomic::Ordering::SeqCst)).then_some(1)
+        }).unwrap();
+        if close_delay.is_zero() { assert!(started.elapsed()<Duration::from_secs(2)); }
         worker.join().unwrap();
         assert!(core.child.is_none());
         assert!(!core.running());
+    }
+    #[test]
+    fn shutdown_timeout_does_not_slow_status_or_other_config_requests() {
+        assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":false}}))), Duration::from_secs(15));
+        assert_eq!(controller_timeout("GET", "/configs", None), Duration::from_secs(3));
+        assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":true}}))), Duration::from_secs(3));
     }
     #[test]
     fn disconnected_stop_does_not_launch_a_broker_for_a_stale_marker() {
@@ -894,6 +965,7 @@ impl ApiClient {
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(15))
             .build().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+        let timeout = controller_timeout(method, path, body.as_ref());
         let method =
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "Некорректный метод")?;
         let mut req = client
@@ -902,7 +974,7 @@ impl ApiClient {
                 format!("http://127.0.0.1:{}{path}", self.controller_port),
             )
             .bearer_auth(&self.secret)
-            .timeout(Duration::from_secs(if path.contains("/delay?") { 12 } else { 3 }));
+            .timeout(timeout);
         if let Some(b) = body {
             req = req.json(&b)
         }

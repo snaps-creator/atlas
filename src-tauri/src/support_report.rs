@@ -57,7 +57,8 @@ pub(crate) fn privileged_snapshot() -> Result<String, String> {
     let generation = state.generation;
     drop(state);
     let mut command = Command::new("powershell.exe");
-    command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_privileged.ps1")]);
+    command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",concat!(include_str!("support_encoding.ps1"), "
+", include_str!("support_privileged.ps1"))]);
     let result = run_bounded(command, Duration::from_secs(24));
     if let Ok(mut state) = lock.lock() {
         state.results.insert(generation,result.clone());
@@ -138,7 +139,8 @@ pub(crate) fn automatic_incident(client: crate::core::ApiClient, secrets: Vec<St
         let p = scope.spawn(||client.support_snapshot().unwrap_or_else(|e|serde_json::json!({"error":e})));
         let w = scope.spawn(|| {
             let mut command = Command::new("powershell.exe");
-            command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_snapshot.ps1")]);
+            command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",concat!(include_str!("support_encoding.ps1"), "
+", include_str!("support_snapshot.ps1"))]);
             run_bounded(command, Duration::from_secs(25)).unwrap_or_else(|e|e)
         });
         let active = crate::support_probes::run(Some(client.clone()), deadline);
@@ -293,6 +295,26 @@ pub(crate) fn redact(text: &str, secrets: &[String]) -> String {
     output
 }
 
+#[test]
+fn native_collector_decodes_oem_and_restores_utf8() {
+    let script = format!(r#"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+{}
+$nativeScript = '$s=[Console]::OpenStandardOutput(); $s.Write([byte[]]@(128,65,13,10),0,4); $s.Flush()'
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($nativeScript))
+$value = Invoke-AtlasNative {{ powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded }}
+$expected = [Text.Encoding]::GetEncoding([int][AtlasReportCodePage]::GetOEMCP()).GetString([byte[]]@(128,65))
+if (-not $value.Contains($expected)) {{ throw 'OEM decoding mismatch' }}
+if ([Console]::OutputEncoding.CodePage -ne 65001) {{ throw 'UTF-8 was not restored' }}
+Write-Output 'encoding-ok'
+"#, include_str!("support_encoding.ps1"));
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let output = run_bounded(command, Duration::from_secs(15)).unwrap();
+    assert!(output.contains("encoding-ok"), "{output}");
+    assert!(!output.contains('\u{fffd}'), "{output}");
+}
+
 fn reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -379,7 +401,8 @@ pub(crate) fn save(
     let os_tx = tx.clone();
     std::thread::spawn(move || {
         let mut command = Command::new("powershell.exe");
-        command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",include_str!("support_snapshot.ps1")]);
+        command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command",concat!(include_str!("support_encoding.ps1"), "
+", include_str!("support_snapshot.ps1"))]);
         let result = run_bounded(command,Duration::from_secs(25));
         let _ = os_tx.send(("windows",serde_json::json!({"text":result.unwrap_or_else(|e|format!("Windows snapshot unavailable: {e}"))})));
     });
@@ -613,7 +636,8 @@ function Find-NetRoute { param($RemoteIPAddress) [pscustomobject]@{InterfaceInde
 function Get-NetIPInterface { [pscustomobject]@{InterfaceAlias='fixture';Dhcp='Enabled'} }
 function Get-WinEvent { param($FilterHashtable,$MaxEvents) [pscustomobject]@{Id=1001;Message='fixture DHCP event'} }
 "#;
-        let script = format!("{stubs}\n{}", include_str!("support_snapshot.ps1"));
+        let script = format!("{stubs}\n{}", concat!(include_str!("support_encoding.ps1"), "
+", include_str!("support_snapshot.ps1")));
         let mut command = Command::new("powershell.exe");
         command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
         // This is a content/failure-isolation test, not a startup benchmark.

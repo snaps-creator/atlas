@@ -224,6 +224,8 @@ impl Broker {
                 file,
                 Duration::from_secs(if matches!(op, "start" | "apply") { 240 }
                     else if op == "select" { 180 }
+                    // Outlive graceful core/TUN teardown and final filter/DNS cleanup.
+                    else if op == "stop" { 60 }
                     else if op == "status" { 2 } else { 15 }),
                 running,
             )
@@ -849,12 +851,14 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 {
                     return Err("Сервер отсутствует в подписках".into());
                 }
-                queries.invalidate();
+                let node_paths = settings.servers().iter().filter_map(|node| node["name"].as_str()
+                    .map(|name| format!("/proxies/{}/delay", crate::latency::encode_name(name)))).collect();
+                queries.selection_changed(&node_paths);
                 *network_epoch = network_epoch.wrapping_add(1);
                 recovery.invalidate();
                 let previous = settings.selected.clone();
                 if let Err(error) = core.select(name) {
-                    let rollback = core.select(&previous).and_then(|_| confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ()));
+                    let rollback = core.select(&previous);
                     if let Err(rollback_error) = rollback {
                         explicit_stop = true;
                         return abandon_session(core, guard, configured, active_settings,
@@ -863,16 +867,10 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                     return Err(format!("Команда выбора не подтверждена: {error}; прежний маршрут восстановлен"));
                 }
                 settings.selected = name.to_owned();
-                if let Err(error) = confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS) {
-                    settings.selected = previous.clone();
-                    let rollback = core.select(&previous).and_then(|_| confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ()));
-                    if let Err(rollback_error) = rollback {
-                        explicit_stop = true;
-                        return abandon_session(core, guard, configured, active_settings,
-                            format!("Выбранный сервер не подтверждён: {error}; прежний маршрут не восстановлен: {rollback_error}"));
-                    }
-                    return Err(format!("Выбранный сервер не подтверждён: {error}; прежний маршрут восстановлен"));
-                }
+                // Selection acknowledges the local selector, not remote reachability.
+                // The existing asynchronous health monitor measures the new node.
+                // Waiting for URL tests here monopolizes the IPC channel and makes
+                // unrelated node tests fail with "service busy". WFP is unchanged.
                 Ok(json!({}))
             }
             "status" => {
@@ -893,6 +891,7 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
             }
             "stop" => {
                 queries.invalidate();
+                recovery.invalidate();
                 *network_epoch = network_epoch.wrapping_add(1);
                 *session_id = None;
                 let paused = guard.as_ref().map(|policy| policy.pause(&core.binary)).unwrap_or(Ok(()));
@@ -902,7 +901,6 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 if stopped.is_ok() { *guard = None; }
                 *configured = false;
                 *active_settings = None;
-                recovery.invalidate();
                 explicit_stop = true;
                 // Attempt every cleanup even if core termination failed. Never
                 // acknowledge Stop before releasing filters and cached fake IPs.
@@ -911,7 +909,10 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 let errors: Vec<_> = [paused, stopped, filters, dns].into_iter()
                     .filter_map(Result::err).collect();
                 if !errors.is_empty() { return Err(errors.join("; ")); }
-                Ok(json!({}))
+                let shutdown = core.client().logs().unwrap_or_default().into_iter()
+                    .filter(|line| line.starts_with("ATLAS_EVENT ") && line.contains("core_shutdown_"))
+                    .collect::<Vec<_>>();
+                Ok(json!({"shutdownEvents":shutdown}))
             }
             _ => Err("Неизвестная команда сетевой службы".into()),
         })();

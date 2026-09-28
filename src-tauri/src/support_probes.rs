@@ -24,7 +24,8 @@ fn http_with(endpoint: &str, proxy: Option<&str>, timeout: Duration) -> Value {
     let path = if proxy.is_some() { "local_mixed_proxy" } else { "windows_default_path" };
     match response {
         Ok(r) => json!({"path":path,"endpoint":endpoint,"controlHost":host,"startedAt":at,"elapsedMs":started.elapsed().as_millis(),
-            "httpResponded":true,"controlSucceeded":r.status().is_success(),"status":r.status().as_u16(),"remoteAddress":r.remote_addr().map(|a|a.to_string())}),
+            "httpResponded":true,"method":"HEAD","expectedStatus":crate::latency::expected_status(endpoint),
+            "controlSucceeded":r.status().as_u16()==crate::latency::expected_status(endpoint),"status":r.status().as_u16(),"remoteAddress":r.remote_addr().map(|a|a.to_string())}),
         Err(e) => json!({"path":path,"endpoint":endpoint,"controlHost":host,"startedAt":at,"elapsedMs":started.elapsed().as_millis(),
             "httpResponded":false,"controlSucceeded":false,"timeout":e.is_timeout(),"connectError":e.is_connect(),"errorChain":error_chain(&e)}),
     }
@@ -97,7 +98,8 @@ fn dns_verdict(result: &Value) -> &'static str {
     }
     match result["Status"].as_u64() {
         Some(3) => "NXDOMAIN", Some(2) => "SERVFAIL", Some(5) => "REFUSED",
-        Some(0) if result["Answer"].as_array().is_some_and(|a|!a.is_empty()) => "ANSWER",
+        Some(0) if result["Answer"].as_array().is_some_and(|a|a.iter().any(|r|r["type"]==1)) => "ANSWER",
+        Some(0) if result["Answer"].as_array().is_some_and(|a|!a.is_empty()) => "NO_ADDRESS",
         Some(0) => "NO_ANSWER", Some(_) => "DNS_ERROR", None => "QUERY_FAILED",
     }
 }
@@ -175,6 +177,8 @@ mod tests {
         assert_eq!(dns_verdict(&json!({"Status":3})),"NXDOMAIN");
         assert_eq!(dns_verdict(&json!({"Status":2})),"SERVFAIL");
         assert_eq!(dns_verdict(&json!({"Status":0})),"NO_ANSWER");
+        assert_eq!(dns_verdict(&json!({"Status":0,"Answer":[{"type":5,"data":"alias.invalid"}]})),"NO_ADDRESS");
+        assert_eq!(dns_verdict(&json!({"Status":0,"Answer":[{"type":1,"data":"192.0.2.1"}]})),"ANSWER");
         assert_eq!(dns_verdict(&json!({"error":"timeout"})),"QUERY_FAILED");
         assert!(valid_dns_name("crl.anydesk.com"));
         assert!(!valid_dns_name("a.com&name=other.com"));
@@ -208,6 +212,27 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(result["path"],"local_mixed_proxy");
         assert_eq!(result["httpResponded"],false);
+    }
+    #[test]
+    fn control_requires_exact_status_instead_of_any_http_success() {
+        for status in [204, 200, 404] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request = [0;2048];
+                let size = socket.read(&mut request).unwrap();
+                assert!(request[..size].starts_with(b"HEAD "));
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let result = http_with(&format!("http://{address}/"), None, Duration::from_secs(2));
+            worker.join().unwrap();
+            assert_eq!(result["status"], status);
+            assert_eq!(result["httpResponded"], true);
+            assert_eq!(result["controlSucceeded"], status == 204);
+            assert_eq!(result["expectedStatus"], 204);
+        }
     }
     #[test]
     fn http_probe_records_status_and_bounds_a_stalled_peer() {

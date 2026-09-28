@@ -60,7 +60,10 @@ export function LanDiagnostics() {
       if (t) void request("lan_lock", { token: t }).catch(() => {});
     };
   }, []);
-  const call = async <T,>(action: string, payload: Record<string, unknown> = {}) => {
+  const call = async <T,>(
+    action: string,
+    payload: Record<string, unknown> = {},
+  ) => {
     const session = liveToken.current;
     const result = await request<T>(action, { ...payload, token: session });
     if (liveToken.current !== session) throw new Error("Просмотр закрыт");
@@ -78,11 +81,15 @@ export function LanDiagnostics() {
     discoveryBusy.current = true;
     setDiscovering(true);
     try {
-      const result = await call<{peers: Peer[]}>("lan_discover");
+      const result = await call<{ peers: Peer[] }>("lan_discover");
       setDiscovered(result.peers);
       await refresh();
-    } catch (e) { if (liveToken.current) setError(String(e)); }
-    finally { discoveryBusy.current = false; setDiscovering(false); }
+    } catch (e) {
+      if (liveToken.current) setError(String(e));
+    } finally {
+      discoveryBusy.current = false;
+      setDiscovering(false);
+    }
   }
   async function run(task: () => Promise<void>) {
     setBusy(true);
@@ -169,6 +176,7 @@ export function LanDiagnostics() {
           нужен.
         </p>
         <form
+          className="lan-unlock-form"
           onSubmit={(e) => {
             e.preventDefault();
             void run(async () => {
@@ -184,9 +192,12 @@ export function LanDiagnostics() {
             });
           }}
         >
-          <label>
+          <label htmlFor="lan-unlock-password">
             {configured ? "Пароль" : "Задайте общий пароль на этом ПК"}
+          </label>
+          <div className="lan-unlock-controls">
             <input
+              id="lan-unlock-password"
               type="password"
               autoComplete={configured ? "current-password" : "new-password"}
               minLength={8}
@@ -195,14 +206,14 @@ export function LanDiagnostics() {
               onChange={(e) => setPassword(e.target.value)}
               required
             />
-          </label>
-          <button disabled={busy} type="submit">
-            {busy
-              ? "Проверяем…"
-              : configured
-                ? "Открыть"
-                : "Сохранить пароль и открыть"}
-          </button>
+            <button disabled={busy} type="submit">
+              {busy
+                ? "Проверяем…"
+                : configured
+                  ? "Открыть"
+                  : "Сохранить пароль и открыть"}
+            </button>
+          </div>
         </form>
         <p role="alert">{error}</p>
       </section>
@@ -269,9 +280,9 @@ export function LanDiagnostics() {
         </label>
       </div>
       <p className="footnote">
-        Для входящих подключений используется TCP {state?.port ?? 17943} и UDP 17944 для поиска, только
-        локальная сеть. Компьютер должен быть включён, Atlas — запущен;
-        подключение VPN не обязательно.
+        Для входящих подключений используется TCP {state?.port ?? 17943} и UDP
+        17944 для поиска, только локальная сеть. Компьютер должен быть включён,
+        Atlas — запущен; подключение VPN не обязательно.
       </p>
       <button
         disabled={busy}
@@ -291,46 +302,74 @@ export function LanDiagnostics() {
       {state?.listenerError && (
         <p role="alert">Не удалось включить приём: {state.listenerError}</p>
       )}
-      {state?.enabled && state.discoveryError && <p role="alert">Не удалось включить обнаружение: {state.discoveryError}</p>}
+      {state?.enabled && state.discoveryError && (
+        <p role="alert">
+          Не удалось включить обнаружение: {state.discoveryError}
+        </p>
+      )}
       <div className="lan-heading">
         <h3>Найдены в сети</h3>
-        <button disabled={discovering} onClick={() => void discover()}>{discovering ? "Поиск…" : "Обновить список"}</button>
+        <button disabled={discovering} onClick={() => void discover()}>
+          {discovering ? "Поиск…" : "Обновить список"}
+        </button>
       </div>
-      <p>Здесь появляются компьютеры с включённым обменом Atlas и одинаковым паролем. Выберите имя — IP вводить не нужно.</p>
+      <p>
+        Здесь появляются компьютеры с включённым обменом Atlas и одинаковым
+        паролем. Выберите имя — IP вводить не нужно.
+      </p>
       <div className="lan-peers">
-        {discovered.map(p => <article className="lan-peer" key={p.id}>
-          <strong>{p.name}</strong><span>На связи · {p.address}</span>
-          <button disabled={busy} onClick={() => void run(async () => { await fetchPeer(p); await refresh(); })}>Открыть диагностику</button>
-        </article>)}
+        {discovered.map((p) => (
+          <article className="lan-peer" key={p.id}>
+            <strong>{p.name}</strong>
+            <span>На связи · {p.address}</span>
+            <button
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  await fetchPeer(p);
+                  await refresh();
+                })
+              }
+            >
+              Открыть диагностику
+            </button>
+          </article>
+        ))}
       </div>
-      {!discovering && !discovered.length && <p>Компьютеры не найдены. На них должны быть включены обмен и приём в брандмауэре; функция поиска требует обновления Atlas на этих ПК.</p>}
-      <details><summary>Подключиться по IP вручную</summary>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void run(async () => {
-            const r = await call<Report>("lan_fetch", {
-              address: address.trim(),
+      {!discovering && !discovered.length && (
+        <p>
+          Компьютеры не найдены. На них должны быть включены обмен и приём в
+          брандмауэре; функция поиска требует обновления Atlas на этих ПК.
+        </p>
+      )}
+      <details>
+        <summary>Подключиться по IP вручную</summary>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void run(async () => {
+              const r = await call<Report>("lan_fetch", {
+                address: address.trim(),
+              });
+              setReport(r);
+              setCached(false);
+              setOnline((v) => ({ ...v, [r.deviceId]: true }));
+              setAddress("");
+              await refresh();
             });
-            setReport(r);
-            setCached(false);
-            setOnline((v) => ({ ...v, [r.deviceId]: true }));
-            setAddress("");
-            await refresh();
-          });
-        }}
-      >
-        <label>
-          Добавить компьютер по локальному IP
-          <input
-            placeholder="192.168.1.25"
-            value={address}
-            onChange={(e) => setAddress(e.target.value)}
-            required
-          />
-        </label>
-        <button disabled={busy}>Подключить</button>
-      </form>
+          }}
+        >
+          <label>
+            Добавить компьютер по локальному IP
+            <input
+              placeholder="192.168.1.25"
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              required
+            />
+          </label>
+          <button disabled={busy}>Подключить</button>
+        </form>
       </details>
       <p role="alert">{error}</p>
       <div className="lan-peers">

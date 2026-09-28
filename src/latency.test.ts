@@ -1,17 +1,29 @@
 import { expect, test, vi } from "vitest";
-import { applyLatencyProgress, failPendingLatencies, boundedLatency, boundedBatch, historyLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, boundedLatency, boundedBatch, historyLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
+
+test("смена выбора сохраняет результаты; замена одной подписки не стирает остальные", () => {
+  const values: Record<string,Latency> = {Berlin:{status:"ok",delay:42,attempts:1}, Paris:{status:"testing",delay:null,attempts:0}};
+  const before = {Berlin:"b1",Paris:"p1"};
+  expect(retainNodeLatencies(values,before,{...before})).toEqual(values);
+  const after = {Berlin:"b2",Paris:"p1"};
+  const kept = retainNodeLatencies(values,before,after);
+  expect(kept).toEqual({Paris:values.Paris});
+  const event = {batchId:"batch",probeId:"p1",name:"Paris",result:{status:"ok" as const,delay:50,attempts:1}};
+  expect(applyLatencyProgress(kept,event,"batch",after,new Set(["Berlin","Paris"])).Paris.delay).toBe(50);
+  expect(applyLatencyProgress(kept,{...event,name:"Berlin",probeId:"b1"},"batch",after,new Set(["Berlin","Paris"]))).toBe(kept);
+});
 
 test("готовый сервер появляется до завершения остальных; поздние чужие результаты игнорируются", () => {
   const pending: Latency = {status:"testing",delay:null,attempts:0};
   const initial = {fast: pending, slow: pending};
   const names = new Set(["fast", "slow"]);
-  const event = {batchId:"current",revision:7,name:"fast",result:{status:"ok" as const,delay:42,attempts:1}};
-  const next = applyLatencyProgress(initial,event,"current",7,names);
+  const event = {batchId:"current",probeId:"node-v1",name:"fast",result:{status:"ok" as const,delay:42,attempts:1}};
+  const next = applyLatencyProgress(initial,event,"current",{fast:"node-v1",slow:"slow-v1"},names);
   expect(next.fast.delay).toBe(42);
   expect(next.slow.status).toBe("testing");
-  expect(applyLatencyProgress(next,{...event,batchId:"old"},"current",7,names)).toBe(next);
-  expect(applyLatencyProgress(next,{...event,revision:6},"current",7,names)).toBe(next);
-  expect(applyLatencyProgress(next,{...event,name:"foreign"},"current",7,names)).toBe(next);
+  expect(applyLatencyProgress(next,{...event,batchId:"old"},"current",{fast:"node-v1",slow:"slow-v1"},names)).toBe(next);
+  expect(applyLatencyProgress(next,{...event,probeId:"node-v0"},"current",{fast:"node-v1",slow:"slow-v1"},names)).toBe(next);
+  expect(applyLatencyProgress(next,{...event,name:"foreign"},"current",{fast:"node-v1",slow:"slow-v1"},names)).toBe(next);
   const failed = failPendingLatencies(next,["fast","slow"],"deadline");
   expect(failed.fast).toEqual(next.fast);
   expect(failed.slow.status).toBe("error");

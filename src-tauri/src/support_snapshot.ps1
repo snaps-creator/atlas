@@ -8,7 +8,7 @@ function Section($name, [scriptblock]$read) {
     finally { Write-Output ("Section completed in " + $sectionStart.ElapsedMilliseconds + ' ms') }
 }
 Section 'Time' { Get-Date -Format o }
-Section 'Windows time synchronization status' { w32tm.exe /query /status }
+Section 'Windows time synchronization status' { Invoke-AtlasNative { w32tm.exe /query /status } }
 Section 'Atlas service' {
     Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'" |
         Select-Object Name, State, Status, ProcessId, ExitCode, StartMode
