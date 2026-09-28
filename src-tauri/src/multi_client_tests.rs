@@ -18,10 +18,9 @@ fn isolated_core() -> Core {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe"),
         dir,
     );
-    let ports: Vec<_> = (0..3)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    core.ports = std::array::from_fn(|i| ports[i].local_addr().unwrap().port());
+    // Windows reserves different TCP and UDP ranges. A free TCP port does
+    // not imply that Mihomo can bind DNS/mixed UDP on the same number.
+    core.use_ephemeral_ports().unwrap();
     core
 }
 

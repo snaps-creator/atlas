@@ -469,7 +469,10 @@ impl Core {
         }
         if let Some(mut c) = self.child.take() {
             let job = self.job.take();
-            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(2)) {
+            // Windows may finish pending socket I/O after accepting termination.
+            // This is a maximum wait on the process handle, not a fixed delay;
+            // a normally exited process returns immediately.
+            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(5)) {
                 self.child = Some(c);
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 return Err(error);
@@ -498,7 +501,7 @@ impl Drop for Core {
         // The service observes IPC loss and releases its dynamic WFP session.
         if let Some(mut child) = self.child.take() {
             let job = self.job.take();
-            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(2)) {
+            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(5)) {
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 eprintln!("{error}");
             }
