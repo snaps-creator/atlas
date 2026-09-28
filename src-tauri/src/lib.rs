@@ -579,6 +579,16 @@ async fn request_inner(
     payload: Option<Value>,
 ) -> Result<Value, String> {
     let shared = state.inner().clone();
+    if action == "frontend_diagnostic" {
+        let value=payload.unwrap_or(Value::Null);
+        let text=|key: &str,limit|value[key].as_str().unwrap_or("").chars().take(limit).collect::<String>();
+        incident_history::record("frontend_event",json!({"area":text("area",80),"stage":text("stage",80),"detail":text("detail",4096)}),&[]);
+        let directory=app.state::<published_state::ReadState>().get()?.directory.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            incident_history::flush(&directory.join("incident-history.ndjson"))?;
+            Ok(json!({"recorded":true}))
+        }).await.map_err(|e|e.to_string())?;
+    }
     if action.starts_with("lan_") {
         let lan=app.state::<lan_diagnostics::Lan>().inner().clone();
         return tauri::async_runtime::spawn_blocking(move || lan.command(&action,payload.unwrap_or(Value::Null)))

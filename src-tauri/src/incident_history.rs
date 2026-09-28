@@ -49,6 +49,8 @@ pub fn load(path: &Path) {
     }
 }
 pub fn flush(path: &Path) -> Result<(), String> {
+    static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
+    let _writer = WRITER.get_or_init(Default::default).lock().map_err(|_| "History writer unavailable")?;
     use std::io::Write;
     let (all, new, sequence, first) = {
         let h = history().lock().map_err(|_| "History unavailable")?;
