@@ -9,7 +9,7 @@ Section 'Collector identity' {
     [pscustomobject]@{Time=(Get-Date -Format o);Elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}
 }
 $filterIds = @()
-Section 'WFP event collection status' { & "$env:SystemRoot\System32\netsh.exe" wfp show options optionsfor=netevents }
+Section 'WFP event collection status' { Invoke-AtlasNative { & "$env:SystemRoot\System32\netsh.exe" wfp show options optionsfor=netevents } }
 Section 'Installed service and core binary identity' {
     Get-CimInstance Win32_Process | Where-Object {$_.Name -in @('Atlas.exe','Atlas.Service.exe','Atlas.Core.exe','atlas-vpn.exe','mihomo.exe','verge-mihomo.exe','verge-mihomo-alpha.exe')} |
         ForEach-Object {
@@ -25,11 +25,12 @@ Section 'Recent WFP events for running cores' {
     Get-CimInstance Win32_Process | Where-Object {$_.Name -in @('Atlas.Core.exe','mihomo.exe','verge-mihomo.exe','verge-mihomo-alpha.exe')} |
         Select-Object -First 3 | ForEach-Object {
             if ($_.ExecutablePath) {
-                $eventText = (& "$env:SystemRoot\System32\netsh.exe" wfp show netevents file=- "appid=$($_.ExecutablePath)" timewindow=1800 | Out-String)
+                $imagePath = $_.ExecutablePath
+                $eventText = Invoke-AtlasNative { & "$env:SystemRoot\System32\netsh.exe" wfp show netevents file=- "appid=$imagePath" timewindow=1800 }
                 if ($eventText -match '(?i)FWP_E_INVALID_INTERVAL|0x80320021') {
                     # Some Windows builds reject the relative WFP interval.
                     # Retry the same read without it; never alter capture options.
-                    $eventText = (& "$env:SystemRoot\System32\netsh.exe" wfp show netevents file=- "appid=$($_.ExecutablePath)" | Out-String)
+                    $eventText = Invoke-AtlasNative { & "$env:SystemRoot\System32\netsh.exe" wfp show netevents file=- "appid=$imagePath" }
                 }
                 Write-Output $eventText
                 foreach ($match in [regex]::Matches($eventText,'(?i)<filterId>\s*(\d+)\s*</filterId>')) { $script:filterIds += $match.Groups[1].Value }

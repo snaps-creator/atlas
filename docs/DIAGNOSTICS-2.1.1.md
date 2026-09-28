@@ -14,6 +14,12 @@ Failed service operations carry session/epoch, recent core logs and the last pre
 HTTPS diagnostic probes now use the requested proxy for CONNECT as well as HTTP. Secret redaction runs on JSON string leaves before serialization, retaining parseable nested evidence. No diagnostic collector changes selectors, routes, adapters or firewall configuration.
 
 ## Evidence limits
+The secondary control now uses HTTPS HEAD on cp.cloudflare.com/generate_204 and requires exactly HTTP 204, matching the primary HTTP control. These are two transports to the same Cloudflare service, not independent providers. An HTTP error response is preserved separately from failure to connect. The former trace URL returned 404 for HEAD and is no longer used.
+
+Windows NCSI domains use real DNS answers instead of fake IPv4 addresses. This prevents synthetic IPv4 connections to IPv6-only probe names without enabling IPv6 or changing routing policy. DNS evidence distinguishes CNAME-only replies from replies containing an A record. Native Windows collector output is decoded as OEM before the report is emitted as UTF-8.
+
+Shutdown records and flushes each stage before and after execution: owned core, service, proxy restoration, legacy filters and TUN release. Core evidence includes process ID, initial/remaining TUN LUID, graceful close timing/error and confirmed process exit. Successful Stop replies also return cleanup evidence before the service exits. This improves localization of a stall; it does not prove a Windows driver-level cause by itself.
+
 A silent remote timeout cannot uniquely identify filtering versus peer failure without external evidence. Installer failures before application startup need installer logs. A process killed before delivering IPC evidence can leave a gap. Windows snapshots describe capture time, not an unrecorded past state. Missing evidence is reported; no claim of universal fault identification is made.
 
 ## Safe regression checks

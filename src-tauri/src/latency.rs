@@ -119,12 +119,13 @@ pub(crate) fn batch_at(client: ApiClient, names: &[String], endpoint: &str) -> R
     }
     Ok(Value::Object(results))
 }
-pub const SECONDARY_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
+// Same Cloudflare connectivity endpoint over TLS, not an independent provider.
+// /cdn-cgi/trace does not reliably support the HEAD request used by Mihomo.
+pub const SECONDARY_URL: &str = "https://cp.cloudflare.com/generate_204";
 pub const ENDPOINTS: [&str; 2] = [DISPLAY_URL, SECONDARY_URL];
-pub fn expected_status(endpoint: &str) -> u16 {
-    if endpoint == SECONDARY_URL { 200 } else { 204 }
+pub fn expected_status(_endpoint: &str) -> u16 {
+    204
 }
-const CONTROL_STATUS_ERROR: &str = "Контрольный URL не подтвердил ожидаемый HTTP 204 (per-URL health)";
 pub(crate) fn verified_probe(client: &ApiClient, name: &str, endpoint: &str) -> Result<Value,String> {
     let path = format!("/proxies/{}/delay?timeout={DISPLAY_TIMEOUT_MS}&expected={}&url={}",encode_name(name),expected_status(endpoint),encode_name(endpoint));
     let result = client.api("GET",&path,None)?;
@@ -136,7 +137,7 @@ pub(crate) fn verified_probe(client: &ApiClient, name: &str, endpoint: &str) -> 
         client.event(json!({"kind":"control_status_rejected","at":crate::model::now(),"name":name,
             "controlHost":url::Url::parse(endpoint).ok().and_then(|u|u.host_str().map(str::to_owned)),
             "expectedStatus":expected_status(endpoint),"returnedDelay":result["delay"],"health":health}));
-        return Err(format!("{CONTROL_STATUS_ERROR}; expected={}, returnedDelay={}, perUrlAlive={}",
+        return Err(format!("Контрольный URL не подтвердил ожидаемый HTTP {} (per-URL health); returnedDelay={}, perUrlAlive={}",
             expected_status(endpoint),result["delay"],health["alive"]));
     }
     if result["delay"].as_u64().is_none() { return Err("Ядро не вернуло задержку".into()); }

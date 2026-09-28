@@ -224,6 +224,8 @@ impl Broker {
                 file,
                 Duration::from_secs(if matches!(op, "start" | "apply") { 240 }
                     else if op == "select" { 180 }
+                    // Outlive graceful core/TUN teardown and final filter/DNS cleanup.
+                    else if op == "stop" { 60 }
                     else if op == "status" { 2 } else { 15 }),
                 running,
             )
@@ -893,6 +895,7 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
             }
             "stop" => {
                 queries.invalidate();
+                recovery.invalidate();
                 *network_epoch = network_epoch.wrapping_add(1);
                 *session_id = None;
                 let paused = guard.as_ref().map(|policy| policy.pause(&core.binary)).unwrap_or(Ok(()));
@@ -902,7 +905,6 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 if stopped.is_ok() { *guard = None; }
                 *configured = false;
                 *active_settings = None;
-                recovery.invalidate();
                 explicit_stop = true;
                 // Attempt every cleanup even if core termination failed. Never
                 // acknowledge Stop before releasing filters and cached fake IPs.
@@ -911,7 +913,10 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 let errors: Vec<_> = [paused, stopped, filters, dns].into_iter()
                     .filter_map(Result::err).collect();
                 if !errors.is_empty() { return Err(errors.join("; ")); }
-                Ok(json!({}))
+                let shutdown = core.client().logs().unwrap_or_default().into_iter()
+                    .filter(|line| line.starts_with("ATLAS_EVENT ") && line.contains("core_shutdown_"))
+                    .collect::<Vec<_>>();
+                Ok(json!({"shutdownEvents":shutdown}))
             }
             _ => Err("Неизвестная команда сетевой службы".into()),
         })();

@@ -27,6 +27,65 @@ fn isolated_core() -> Core {
 
 #[test]
 fn batch_62_nodes_finishes_with_three_successes_and_59_timeouts() { check_batch_62(3); }
+
+#[test]
+fn windows_ipv6_probe_gets_no_fake_ipv4_when_upstream_has_no_address() {
+    use std::net::UdpSocket;
+    let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+    upstream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let address = upstream.local_addr().unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let worker_done = done.clone();
+    let worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !worker_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let mut packet = [0; 4096];
+            if let Ok((size, peer)) = upstream.recv_from(&mut packet) {
+                let mut response = packet[..size].to_vec();
+                response[2] = 0x81; response[3] = 0x80;
+                response[6..12].fill(0); // Authoritative fixture: NOERROR / no A record.
+                upstream.send_to(&response, peer).unwrap();
+            }
+        }
+    });
+    let mut core = isolated_core();
+    let mut settings = Settings::default();
+    settings.mode = "system".into();
+    settings.dns.fake_ip = true;
+    settings.dns.ipv6 = false;
+    settings.subscriptions.push(Subscription { id:"fixture".into(), name:"fixture".into(),
+        masked_url:String::new(), updated_at:0, error:None,
+        servers:vec![json!({"name":"fixture","type":"direct"})] });
+    let mut config: Value = serde_yaml::from_str(&crate::config::generate(&settings, &core.secret).unwrap()).unwrap();
+    config["external-controller"] = json!(format!("127.0.0.1:{}", core.ports[1]));
+    config["mixed-port"] = json!(core.ports[0]);
+    config["dns"]["listen"] = json!(format!("127.0.0.1:{}", core.ports[2]));
+    config["dns"]["nameserver"] = json!([format!("udp://{address}")]);
+    config["dns"]["default-nameserver"] = json!(["127.0.0.1"]);
+    let path = core.directory.join("windows-probe.yaml");
+    std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let child = core.command().arg("-d").arg(&core.directory).arg("-f").arg(path).spawn().unwrap();
+    core.job = Some(crate::job::Job::attach(&child).unwrap()); core.child = Some(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while core.api("GET", "/version", None).is_err() {
+        assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(20));
+    }
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    for (name, expected_answers) in [("ipv6.msftconnecttest.com", 0), ("ipv6.msftncsi.com", 0), ("ordinary.invalid", 1)] {
+        let mut query = vec![0x12,0x34,1,0,0,1,0,0,0,0,0,0];
+        for label in name.split('.') { query.push(label.len() as u8); query.extend(label.as_bytes()); }
+        query.extend([0,0,1,0,1]);
+        socket.send_to(&query, ("127.0.0.1", core.ports[2])).unwrap();
+        let mut response = [0;4096];
+        let size = socket.recv(&mut response).unwrap();
+        assert!(size >= 12);
+        assert_eq!(response[3] & 15, 0, "{name}");
+        assert_eq!(u16::from_be_bytes([response[6],response[7]]), expected_answers, "{name}");
+    }
+    done.store(true, Ordering::SeqCst); worker.join().unwrap();
+    core.stop().unwrap(); let dir = core.directory.clone(); drop(core); std::fs::remove_dir_all(dir).unwrap();
+}
 #[test]
 fn batch_62_nodes_all_timeout_finishes() { check_batch_62(0); }
 fn check_batch_62(healthy: usize) {

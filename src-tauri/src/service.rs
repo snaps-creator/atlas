@@ -60,7 +60,7 @@ unsafe extern "system" fn control(
 ) -> u32 {
     if code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN {
         STOPPING.store(true, Ordering::SeqCst);
-        report(SERVICE_STOP_PENDING, 0, NO_ERROR, 5000);
+        report(SERVICE_STOP_PENDING, 0, NO_ERROR, 60000);
     }
     NO_ERROR
 }
@@ -325,7 +325,9 @@ pub fn stop_and_wait() -> Result<(), String> {
         }
         let mut status: SERVICE_STATUS = std::mem::zeroed();
         let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // SCM stop can arrive while the owned core is still releasing TUN.
+        // Its deadline must outlive that cleanup, just like the IPC Stop call.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let outcome = loop {
             let mut process: SERVICE_STATUS_PROCESS = std::mem::zeroed();
             let mut needed = 0;
@@ -335,7 +337,7 @@ pub fn stop_and_wait() -> Result<(), String> {
             }
             if process.dwCurrentState == SERVICE_STOPPED { break Ok(()); }
             if std::time::Instant::now() >= deadline {
-                break Err("Служба Atlas не остановилась за 20 секунд; защита сети сохранена".into());
+                break Err("Служба Atlas не остановилась за 60 секунд; защита сети сохранена".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         };

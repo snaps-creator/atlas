@@ -61,6 +61,10 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     selection.retain(|n| seen.insert(n.clone()));
     let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"select","proxies":names},{"name":"FAILOVER","type":"select","proxies":names}],"rules":rules::compile(s)?});
     doc["mode"] = json!(s.routing_mode);
+    // Never invent an IPv4 address for Windows IPv6 connectivity probes.
+    // Return real DNS answers (including NODATA); keep routing/IPv6 policy intact.
+    doc["dns"]["fake-ip-filter-mode"] = json!("blacklist");
+    doc["dns"]["fake-ip-filter"] = json!(["+.msftconnecttest.com", "+.msftncsi.com"]);
     // Pin global traffic to Atlas instead of Mihomo's generated DIRECT default.
     doc["proxy-groups"]
         .as_array_mut()

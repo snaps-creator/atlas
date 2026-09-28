@@ -544,11 +544,23 @@ fn cleanup_network_session(
     directory: &std::path::Path,
     clear_legacy_filters: bool,
 ) -> Result<(), String> {
-    let owned_core = core.map(|core| core.stop()).unwrap_or(Ok(()));
-    let service = service::stop_and_wait();
-    let proxy = windows::restore(&directory.join("proxy-restore.json"));
-    let legacy = if clear_legacy_filters { network_guard::clear() } else { Ok(()) };
-    let tun = network_guard::wait_for_tun_release(std::time::Duration::from_secs(10));
+    let stage = |name: &str, operation: &mut dyn FnMut() -> Result<(), String>| {
+        let started = std::time::Instant::now();
+        incident_history::record("shutdown_stage_started", json!({"stage":name}), &[]);
+        let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
+        let result = operation();
+        incident_history::record("shutdown_stage_completed", json!({"stage":name,
+            "elapsedMs":started.elapsed().as_millis(),"error":result.as_ref().err()}), &[]);
+        let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
+        result
+    };
+    let mut core = core;
+    let owned_core = stage("core", &mut || core.as_deref_mut().map(|c|c.stop()).unwrap_or(Ok(())));
+    let service = stage("service", &mut || service::stop_and_wait());
+    let proxy = stage("proxy_restore", &mut || windows::restore(&directory.join("proxy-restore.json")));
+    let legacy = stage("legacy_filters", &mut || if clear_legacy_filters { network_guard::clear() } else { Ok(()) });
+    let tun = stage("tun_release", &mut || network_guard::wait_for_tun_release(std::time::Duration::from_secs(10)));
+    let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
     let errors: Vec<_> = [owned_core, service, proxy, legacy, tun].into_iter()
         .filter_map(Result::err).collect();
     if errors.is_empty() {
