@@ -51,6 +51,16 @@ Section 'OS and resource pressure' {
     Get-Process | Where-Object {$_.ProcessName -match 'atlas|mihomo|clash'} |
         Select-Object ProcessName,Id,CPU,WorkingSet64,HandleCount,@{Name='ThreadCount';Expression={$_.Threads.Count}}
 }
+Section 'Recent Windows restarts and bugchecks' {
+    # Read-only System log evidence is needed even when Atlas's privileged
+    # service never started after a crash. Event 41 alone is not a cause.
+    Get-WinEvent -FilterHashtable @{
+        LogName='System'
+        Id=@(41,1001,1074,6008)
+        StartTime=(Get-Date).AddDays(-3)
+    } -MaxEvents 24 |
+        Select-Object TimeCreated,Id,ProviderName,Message
+}
 Section 'Adapter packet counters' {
     Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes,ReceivedDiscardedPackets,OutboundDiscardedPackets,ReceivedPacketErrors,OutboundPacketErrors
 }

@@ -9,7 +9,8 @@ use windows_sys::{
     Win32::{
         Foundation::HANDLE,
         NetworkManagement::{
-            IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid},
+            IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid,
+                GetIfEntry2Ex, MibIfEntryNormalWithoutStatistics, MIB_IF_ROW2},
             Ndis::NET_LUID_LH, WindowsFilteringPlatform::*,
         },
     },
@@ -95,12 +96,44 @@ fn guid_value(guid: GUID) -> u128 {
         | u64::from_be_bytes(guid.data4) as u128
 }
 
-pub fn tun_identity() -> Option<u64> {
+fn tun_probe() -> (Option<u64>, Option<u32>) {
     unsafe {
         let mut tun: NET_LUID_LH = std::mem::zeroed();
-        (ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut tun) == 0)
-            .then_some(tun.Value)
+        if ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut tun) != 0 {
+            return (None, None);
+        }
+        let mut row: MIB_IF_ROW2 = std::mem::zeroed();
+        row.InterfaceLuid = tun;
+        // Alias lookup can outlive a Wintun adapter after an abrupt reboot.
+        // Ask IP Helper whether the interface itself still exists. This variant
+        // avoids querying driver statistics while Windows is recovering.
+        let status = GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut row);
+        (Some(tun.Value), Some(status))
     }
+}
+
+fn present_tun(alias: Option<u64>, row_status: Option<u32>) -> Option<u64> {
+    match row_status {
+        // ERROR_FILE_NOT_FOUND / ERROR_NOT_FOUND: stale alias, no interface.
+        Some(2 | 1168) => None,
+        // Other errors are not proof of absence: retain the collision guard.
+        _ => alias,
+    }
+}
+
+pub fn tun_identity() -> Option<u64> {
+    let (alias, row_status) = tun_probe();
+    present_tun(alias, row_status)
+}
+
+pub(crate) fn tun_diagnostic() -> serde_json::Value {
+    let (alias, row_status) = tun_probe();
+    serde_json::json!({
+        "aliasLuid": alias,
+        "interfaceQueryCode": row_status,
+        "presentLuid": present_tun(alias, row_status),
+        "meaning": "An alias alone is not proof that a live TUN interface remains",
+    })
 }
 
 pub(crate) fn wait_for_tun_release(timeout: std::time::Duration) -> Result<(), String> {
@@ -405,6 +438,14 @@ mod tests {
     fn cleanup_never_reports_success_with_a_remaining_tun() {
         assert!(super::wait_for_tun_release_with(std::time::Duration::ZERO,||Some(42)).is_err());
         assert!(super::wait_for_tun_release_with(std::time::Duration::ZERO,||None).is_ok());
+    }
+
+    #[test]
+    fn stale_alias_is_not_a_live_tun_but_unknown_query_failure_stays_blocked() {
+        assert_eq!(super::present_tun(Some(42), Some(2)), None);
+        assert_eq!(super::present_tun(Some(42), Some(1168)), None);
+        assert_eq!(super::present_tun(Some(42), Some(0)), Some(42));
+        assert_eq!(super::present_tun(Some(42), Some(87)), Some(42));
     }
     use super::*;
     #[test]

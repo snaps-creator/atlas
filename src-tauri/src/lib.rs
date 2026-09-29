@@ -657,6 +657,7 @@ async fn request_inner(
     }
     if action == "diagnostics_export" {
         // Export must remain usable while connect/apply holds the application lock.
+        let tun_interface = network_guard::tun_diagnostic();
         let (context, client, secrets) = match shared.try_lock() {
             Ok(a) => {
                 let mut secrets = Vec::new();
@@ -665,7 +666,7 @@ async fn request_inner(
                     "routingMode":a.settings.routing_mode,"tunStack":a.settings.tun_stack,
                     "selected":a.settings.selected,"autoTestIntervalSeconds":a.settings.auto_test_interval_seconds,
                     "activeCheckIntervalSeconds":10,"autoSearchPingMs":a.settings.auto_search_ping_ms,
-                    "error":a.error,"logs":a.logs,
+                    "error":a.error,"logs":a.logs,"tunInterface":tun_interface,
                     "connectionConfiguration":support_report::configuration_evidence(&a.settings),
                     "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});
                 (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
@@ -673,7 +674,8 @@ async fn request_inner(
             Err(_) => match app.state::<support_report::Access>().get() {
                 Some(cached) => (json!({"stateRead":"cached: application lock busy","capturedAt":cached.captured_at,
                     "revision":cached.revision,"connectionConfiguration":cached.configuration,
-                    "publishedState":app.state::<published_state::PublishedState>().get()}).to_string(),Some(cached.client),cached.secrets),
+                    "publishedState":app.state::<published_state::PublishedState>().get(),
+                    "tunInterface":tun_interface}).to_string(),Some(cached.client),cached.secrets),
                 None => ("Atlas занят: кэш диагностической сессии недоступен. Снимок Windows собирается независимо.".into(),None,Vec::new()),
             },
         };

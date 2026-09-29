@@ -1,4 +1,4 @@
-# Incident TXT, schema 3 (working tree; not yet installed)
+# Incident TXT, schema 4
 
 The 22 September follow-up is described in [RELIABILITY-FIXES.md](RELIABILITY-FIXES.md).
 It fixes URL path encoding and pseudo-node filtering, requires per-URL HTTP 204
@@ -40,7 +40,10 @@ before closing Atlas or rebooting. Beta 17.2 includes a matching signed installe
   is explicitly a sample, not a fresh assertion about every node in the pool.
 - Adapters, MTU/metrics, addresses and DHCP lease times, DNS, routes, neighbor state,
   error/discard counters, system proxy, DNS socket owners, core TCP states/source IPs,
-  bounded route lookups, boot time and resource pressure.
+  bounded route lookups, boot time and resource pressure. The ordinary Windows
+  snapshot also records recent System events 41, 1001, 1074 and 6008 after a
+  reboot, even when the Atlas service is stopped. Event 41 alone does not
+  identify what caused the restart.
 - An asynchronous service-side privileged snapshot: running binary paths, versions
   and SHA-256, WFP collection status, existing WFP events, Security 5152/5157 drops,
   filter details associated with Atlas/Mihomo or recorded drop IDs, firewall profile
