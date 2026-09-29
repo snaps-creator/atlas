@@ -72,20 +72,15 @@ jobs:
             "released=false" >> $env:GITHUB_OUTPUT
           }
 
-      - name: Build and publish signed update
+      - name: Build, verify interface and publish signed update
         if: steps.release-version.outputs.released != 'true'
-        uses: tauri-apps/tauri-action@v1
+        shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: v__VERSION__
-          releaseName: Atlas __VERSION__
-          releaseBody: Автоматическое обновление Atlas. Подробности изменений — в связанных pull requests.
-          releaseDraft: false
-          # This is the application's update channel: /releases/latest must resolve it.
-          # The displayed product version remains Alpha; each build has a unique semver.
-          prerelease: false
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
+        run: |
+          npm run tauri -- build --bundles nsis
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          ./scripts/publish-verified-update.ps1 -Installer ("t/release/bundle/nsis/Atlas_" + $version + "_x64-setup.exe")
