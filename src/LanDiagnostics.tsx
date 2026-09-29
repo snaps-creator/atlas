@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { download, request } from "./api";
 import "./lan-diagnostics.css";
 
@@ -39,6 +39,7 @@ export function LanDiagnostics() {
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [report, setReport] = useState<Report>();
+  const [tigerEggOpen, setTigerEggOpen] = useState(false);
   const [cached, setCached] = useState(false),
     [online, setOnline] = useState<Record<string, boolean>>({});
   const [discovered, setDiscovered] = useState<Peer[]>([]);
@@ -179,6 +180,12 @@ export function LanDiagnostics() {
           className="lan-unlock-form"
           onSubmit={(e) => {
             e.preventDefault();
+              if (password === "00000001") {
+                setPassword("");
+                setError("");
+                setTigerEggOpen(true);
+                return;
+              }
             void run(async () => {
               const v = await request<{ token: string }>("lan_unlock", {
                 password,
@@ -203,7 +210,16 @@ export function LanDiagnostics() {
               minLength={8}
               maxLength={256}
               value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                const value = e.target.value;
+                if (value === "00000001") {
+                  setPassword("");
+                  setError("");
+                  setTigerEggOpen(true);
+                  return;
+                }
+                setPassword(value);
+              }}
               required
             />
             <button disabled={busy} type="submit">
@@ -216,6 +232,7 @@ export function LanDiagnostics() {
           </div>
         </form>
         <p role="alert">{error}</p>
+        <TigerEgg open={tigerEggOpen} onClose={() => setTigerEggOpen(false)} />
       </section>
     );
   return (
@@ -452,6 +469,53 @@ export function LanDiagnostics() {
         </div>
       )}
     </section>
+  );
+}
+
+function TigerEgg({ open, onClose }: { open: boolean; onClose: () => void }) {
+  useEffect(() => {
+    if (!open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  const confetti = Array.from({ length: 84 }, (_, index) => {
+    const angle = (index * 137.5 * Math.PI) / 180;
+    const distance = 120 + (index % 5) * 42;
+    const style = {
+      "--confetti-x": `${Math.cos(angle) * distance}px`,
+      "--confetti-y": `${Math.sin(angle) * distance + 130}px`,
+      "--confetti-rotation": `${(index * 83) % 720}deg`,
+      "--confetti-color": ["#ffcf4a", "#ff6685", "#39d6be", "#8f83ff", "#ff914d"][index % 5],
+      "--confetti-delay": `${(index % 9) * 35}ms`,
+    } as CSSProperties;
+    return <i className="tiger-confetti-piece" style={style} key={index} />;
+  });
+
+  return (
+    <div className="tiger-egg-backdrop" onMouseDown={onClose}>
+      <section
+        className="tiger-egg-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="tiger-egg-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="tiger-confetti" aria-hidden="true">{confetti}</div>
+        <button className="tiger-egg-close" type="button" onClick={onClose} aria-label="Закрыть">
+          ×
+        </button>
+        <h2 id="tiger-egg-title">Ха!, попалась!</h2>
+        <img src="/lan-tiger.jpg" alt="Любопытный тигр" />
+        <button className="tiger-egg-okay" type="button" onClick={onClose}>
+          Ого!
+        </button>
+      </section>
+    </div>
   );
 }
 function PeerRow({

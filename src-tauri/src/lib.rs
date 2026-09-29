@@ -2,6 +2,7 @@ mod applications;
 mod background_probe;
 mod broker;
 mod cancellation;
+mod connection_retry;
 mod config;
 mod core;
 mod country;
@@ -255,6 +256,26 @@ impl App {
                 Ok(())
             }
             Err(e) => {
+                if self.core.service_status().is_some_and(|status| status["state"] == "ProtectedPause") {
+                    self.core.continue_running = None;
+                    self.status = "ProtectedPause".into();
+                    let error = format!("Служба Atlas продолжает восстановление существующей VPN-сессии: {e}");
+                    self.error = Some(error.clone());
+                    self.log("WARN", &error);
+                    return Err(error);
+                }
+                // A service may have accepted this desktop connection while
+                // keeping an already healthy session. A failed reattach or
+                // configuration reconciliation must not tear that session
+                // down as generic start-failure cleanup.
+                if self.core.running() {
+                    self.core.continue_running = None;
+                    self.status = "Connected".into();
+                    let error = format!("Существующее VPN-подключение продолжает работать; новые настройки не применены: {e}");
+                    self.error = Some(error.clone());
+                    self.log("WARN", &error);
+                    return Err(error);
+                }
                 let directory = self.core.directory.clone();
                 let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
                 let cleanup_failed = cleanup.is_err();
@@ -657,6 +678,7 @@ async fn request_inner(
     }
     if action == "diagnostics_export" {
         // Export must remain usable while connect/apply holds the application lock.
+        let tun_interface = network_guard::tun_diagnostic();
         let (context, client, secrets) = match shared.try_lock() {
             Ok(a) => {
                 let mut secrets = Vec::new();
@@ -665,7 +687,7 @@ async fn request_inner(
                     "routingMode":a.settings.routing_mode,"tunStack":a.settings.tun_stack,
                     "selected":a.settings.selected,"autoTestIntervalSeconds":a.settings.auto_test_interval_seconds,
                     "activeCheckIntervalSeconds":10,"autoSearchPingMs":a.settings.auto_search_ping_ms,
-                    "error":a.error,"logs":a.logs,
+                    "error":a.error,"logs":a.logs,"tunInterface":tun_interface,
                     "connectionConfiguration":support_report::configuration_evidence(&a.settings),
                     "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});
                 (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
@@ -673,7 +695,8 @@ async fn request_inner(
             Err(_) => match app.state::<support_report::Access>().get() {
                 Some(cached) => (json!({"stateRead":"cached: application lock busy","capturedAt":cached.captured_at,
                     "revision":cached.revision,"connectionConfiguration":cached.configuration,
-                    "publishedState":app.state::<published_state::PublishedState>().get()}).to_string(),Some(cached.client),cached.secrets),
+                    "publishedState":app.state::<published_state::PublishedState>().get(),
+                    "tunInterface":tun_interface}).to_string(),Some(cached.client),cached.secrets),
                 None => ("Atlas занят: кэш диагностической сессии недоступен. Снимок Windows собирается независимо.".into(),None,Vec::new()),
             },
         };
@@ -1148,6 +1171,7 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));
+                let mut reconnect_retry = connection_retry::ConnectionRetry::default();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if shutdown.load(std::sync::atomic::Ordering::SeqCst)
@@ -1196,6 +1220,20 @@ pub fn run() {
                             a.log("INFO", "Служба восстановила проверенное соединение");
                         } else if !a.core.service_reachable() {
                             a.status = "Error".into();
+                        }
+                    }
+                    if a.status == "Connected" && service_running == Some(true) {
+                        reconnect_retry.reset();
+                    }
+                    let wants_connection = intent.load(std::sync::atomic::Ordering::SeqCst);
+                    if reconnect_retry.due(std::time::Instant::now(), wants_connection, a.status == "Error") {
+                        a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
+                        match a.connect() {
+                            Ok(()) => reconnect_retry.reset(),
+                            Err(error) => {
+                                reconnect_retry.failed(std::time::Instant::now());
+                                a.log("WARN", &format!("Повторное подключение не удалось; следующая попытка будет позже: {error}"));
+                            }
                         }
                     }
                     a.snapshot();

@@ -451,6 +451,19 @@ struct Scheduler {
     health: HealthState,
     queries: crate::query_jobs::QueryJobs,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingSessionAction { StartFresh, Attach, Reconcile, WaitForRecovery, Inconsistent }
+
+fn existing_session_action(configured: bool, core_running: bool, guard_owned: bool, settings_match: bool) -> ExistingSessionAction {
+    match (configured, core_running, guard_owned, settings_match) {
+        (false, _, _, _) => ExistingSessionAction::StartFresh,
+        (true, true, _, true) => ExistingSessionAction::Attach,
+        (true, true, _, false) => ExistingSessionAction::Reconcile,
+        (true, false, true, _) => ExistingSessionAction::WaitForRecovery,
+        (true, false, false, _) => ExistingSessionAction::Inconsistent,
+    }
+}
+
 struct HealthState {
     last_recovery_scan: Instant,
     last_health: Instant,
@@ -739,12 +752,55 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;
-                if *configured && core.running() {
-                    let previous = active_settings.as_ref().ok_or("Нет активной конфигурации службы")?;
-                    if !crate::config::same_network_config(previous, &s) || previous.selected != s.selected {
-                        return Err("Служба уже подключена с другими настройками; сначала примените изменения или отключите VPN".into());
+                let settings_match = active_settings.as_ref().is_some_and(|previous|
+                    crate::config::same_network_config(previous, &s) && previous.selected == s.selected);
+                match existing_session_action(*configured, core.running(), guard.is_some() && active_settings.is_some(), settings_match) {
+                    ExistingSessionAction::Attach => return Ok(json!({"running":true,"reattached":true})),
+                    ExistingSessionAction::WaitForRecovery => {
+                        // This service owns the paused session and its guard.
+                        // Let its health state machine finish recovery; treating
+                        // its own TUN as a competing client would deadlock recovery.
+                        return Ok(json!({"running":false,"recovering":true}));
                     }
-                    return Ok(json!({"running":true,"reattached":true}));
+                    ExistingSessionAction::Inconsistent => return Err(
+                        "Служба Atlas потеряла ядро сессии без подтверждённой защиты; автоматический запуск остановлен".into()),
+                    ExistingSessionAction::StartFresh => {}
+                    ExistingSessionAction::Reconcile => {
+                    let previous = active_settings.clone().ok_or("Нет активной конфигурации службы")?;
+                    // The desktop may have restarted with newer persisted
+                    // settings than the still-running service. Reconcile the
+                    // existing core transactionally instead of rejecting the
+                    // attach or starting a second TUN.
+                    queries.invalidate();
+                    *network_epoch = network_epoch.wrapping_add(1);
+                    recovery.invalidate();
+                    if let Err(error) = core.apply(&s) {
+                        if !core.running() {
+                            explicit_stop = true;
+                            return abandon_session(core, guard, configured, active_settings,
+                                format!("Не удалось восстановить существующую сессию: {error}"));
+                        }
+                        return Err(format!("Существующая сессия работает; новые настройки не применены: {error}"));
+                    }
+                    let confirmed = guard.as_ref().ok_or_else(|| "Защита сети отсутствует при повторном подключении".to_owned())
+                        .and_then(|policy| confirm_session(core, policy, &s));
+                    if let Err(error) = confirmed {
+                        let rollback = core.apply(&previous).and_then(|_| {
+                            let policy = guard.as_ref().ok_or("Защита сети отсутствует при откате повторного подключения")?;
+                            confirm_session(core, policy, &previous)
+                        });
+                        if let Err(rollback_error) = rollback {
+                            explicit_stop = true;
+                            return abandon_session(core, guard, configured, active_settings,
+                                format!("Новые настройки при повторном подключении не подтверждены: {error}; откат не подтверждён: {rollback_error}"));
+                        }
+                        health.reset();
+                        return Err(format!("Новые настройки не подтверждены; прежняя VPN-сессия восстановлена: {error}"));
+                    }
+                    *active_settings = Some(s);
+                    health.reset();
+                    return Ok(json!({"running":true,"reattached":true,"configurationUpdated":true}));
+                    }
                 }
                 queries.invalidate();
                 network_guard::check_competing_routes()?;
@@ -907,6 +963,15 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 *session_id = None;
                 let paused = guard.as_ref().map(|policy| policy.pause(&core.binary)).unwrap_or(Ok(()));
                 let stopped = core.stop();
+                // Wintun can keep the Atlas adapter installed after its core
+                // exits. Once the core is confirmed stopped, remove only
+                // routes bound to that verified, inactive adapter so the
+                // disconnected machine cannot keep sending traffic into it.
+                let tun_routes = if stopped.is_ok() {
+                    network_guard::clear_routes_for_reusable_tun().map(|removed| {
+                        core.client().event(json!({"kind":"inactive_tun_routes_cleared","removed":removed}));
+                    })
+                } else { Ok(()) };
                 // Keep the dynamic protection until the service's final
                 // owned-process teardown if the core did not stop cleanly.
                 if stopped.is_ok() { *guard = None; }
@@ -917,7 +982,7 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 // acknowledge Stop before releasing filters and cached fake IPs.
                 let filters = network_guard::clear();
                 let dns = crate::session_cleanup::flush_dns();
-                let errors: Vec<_> = [paused, stopped, filters, dns].into_iter()
+                let errors: Vec<_> = [paused, stopped, tun_routes, filters, dns].into_iter()
                     .filter_map(Result::err).collect();
                 if !errors.is_empty() { return Err(errors.join("; ")); }
                 let shutdown = core.client().logs().unwrap_or_default().into_iter()
@@ -1050,6 +1115,15 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reconnect_reattaches_reconciles_or_waits_without_treating_own_tun_as_competing() {
+        assert_eq!(existing_session_action(false, false, false, false), ExistingSessionAction::StartFresh);
+        assert_eq!(existing_session_action(true, true, true, true), ExistingSessionAction::Attach);
+        assert_eq!(existing_session_action(true, true, true, false), ExistingSessionAction::Reconcile);
+        assert_eq!(existing_session_action(true, false, true, false), ExistingSessionAction::WaitForRecovery);
+        assert_eq!(existing_session_action(true, false, false, false), ExistingSessionAction::Inconsistent);
+    }
+
     #[test]
     fn cancel_interrupts_start_reply_and_reaches_service_without_another_command() {
         let (server, client) = pipe_pair();

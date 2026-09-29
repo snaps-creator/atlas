@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$OutputDirectory, [switch]$AsSystem, [switch]$ConfirmedIsolatedVm)
+param([Parameter(Mandatory=$true)][string]$OutputDirectory, [ValidateRange(2,5)][int]$Cycles=2, [switch]$AsSystem, [switch]$ConfirmedIsolatedVm)
 $ErrorActionPreference = 'Stop'
 if (-not $ConfirmedIsolatedVm) { throw 'This TUN fault test is restricted to an isolated Windows VM.' }
 $computer = Get-CimInstance Win32_ComputerSystem
@@ -11,7 +11,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Pri
 }
 if ($AsSystem) {
     $taskName = 'Atlas-Adapter-Probe-' + [guid]::NewGuid().ToString('N')
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -OutputDirectory "' + $OutputDirectory + '" -ConfirmedIsolatedVm'
+$arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -OutputDirectory "' + $OutputDirectory + '" -Cycles ' + $Cycles + ' -ConfirmedIsolatedVm'
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     try {
@@ -27,8 +27,9 @@ if ($AsSystem) {
     return
 }
 $binary = Join-Path (Split-Path $PSScriptRoot -Parent) 'src-tauri\resources\Atlas.Core.exe'
-if (Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue) {
-    throw 'Atlas-TUN already exists; refusing to touch an existing adapter.'
+$existing = Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue
+if ($existing -and ($existing.InterfaceDescription -notmatch 'Wintun' -or $existing.Status -eq 'Up')) {
+    throw 'Atlas-TUN is not a confirmed inactive Wintun adapter; refusing to touch it.'
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $routesBefore = @(Get-NetRoute | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','0.0.0.0/1','128.0.0.0/1','::/0','::/1','8000::/1') } | ForEach-Object { "$($_.InterfaceIndex):$($_.DestinationPrefix):$($_.NextHop):$($_.RouteMetric)" } | Sort-Object)
@@ -52,32 +53,46 @@ dns:
   enable: false
   fake-ip-range: 198.19.0.1/16
 '@ | Set-Content -LiteralPath $config -Encoding utf8
-$process = $null
 $http = New-Object System.Net.WebClient
 $http.Proxy = $null
 # Warm up PowerShell JSON and HTTP code before starting the measured process.
 '{}' | ConvertFrom-Json | Out-Null
 try { $null = $http.DownloadString('http://127.0.0.1:19992/configs') } catch {}
+$results = @()
 try {
-    $process = Start-Process -FilePath $binary -ArgumentList @('-d', ('"' + $OutputDirectory + '"'), '-f', ('"' + $config + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log')
-    $deadline = (Get-Date).AddSeconds(60)
-    $adapter = $null
-    $observations = @()
-    for ($sample = 0; $sample -lt 100; $sample++) {
-        try {
-            $api = $http.DownloadString('http://127.0.0.1:19992/configs') | ConvertFrom-Json
-            $observations += [pscustomobject]@{Time=[DateTime]::UtcNow.ToString('o');TunEnabled=$api.tun.enable}
-            if ($api.tun.enable) { break }
-        } catch {}
-        Start-Sleep -Milliseconds 50
+    for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
+        $before = Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue
+        if ($before -and ($before.InterfaceDescription -notmatch 'Wintun' -or $before.Status -eq 'Up')) {
+            throw "Cycle $cycle refused: Atlas-TUN is not an inactive Wintun adapter."
+        }
+        $process = Start-Process -FilePath $binary -ArgumentList @('-d', ('"' + $OutputDirectory + '"'), '-f', ('"' + $config + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory "stdout-$cycle.log") -RedirectStandardError (Join-Path $OutputDirectory "stderr-$cycle.log")
+        $deadline = (Get-Date).AddSeconds(60)
+        $apiReady = $false
+        $adapter = $null
+        do {
+            try {
+                $api = $http.DownloadString('http://127.0.0.1:19992/configs') | ConvertFrom-Json
+                $apiReady = $api.tun.enable -eq $true
+            } catch {}
+            $adapter = Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue
+            $process.Refresh()
+            if ($apiReady -and $adapter) { break }
+            if ($process.HasExited) { throw "Mihomo exited before TUN became ready in cycle $cycle." }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        if (-not $apiReady -or -not $adapter) { throw "TUN did not become ready in cycle $cycle." }
+        $results += [pscustomobject]@{Cycle=$cycle; ReusedExistingAdapter=[bool]$before; InterfaceGuid=$adapter.InterfaceGuid; InterfaceIndex=$adapter.ifIndex; Status=$adapter.Status; ApiTunEnabled=$apiReady}
+        Stop-Process -Id $process.Id -Force
+        $process.WaitForExit()
+        $process = $null
+        $downDeadline = (Get-Date).AddSeconds(15)
+        do {
+            Start-Sleep -Milliseconds 250
+            $adapter = Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue
+        } while ($adapter -and $adapter.Status -eq 'Up' -and (Get-Date) -lt $downDeadline)
+        if ($adapter -and $adapter.Status -eq 'Up') { throw "Atlas-TUN remained operational after core exit in cycle $cycle." }
     }
-    $observations | ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'api-readiness.json')
-    do {
-        Start-Sleep -Milliseconds 500
-        $process.Refresh()
-        $adapter = Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue
-    } while (-not $adapter -and -not $process.HasExited -and (Get-Date) -lt $deadline)
-    [pscustomobject]@{ Found=[bool]$adapter; Status=$adapter.Status; InterfaceIndex=$adapter.ifIndex; CoreExited=$process.HasExited } | ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'result.json')
+    $results | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $OutputDirectory 'result.json')
 } finally {
     $http.Dispose()
     if ($process -and -not $process.HasExited) {
@@ -85,5 +100,5 @@ try {
         $process.WaitForExit()
     }
     $routesAfter = @(Get-NetRoute | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','0.0.0.0/1','128.0.0.0/1','::/0','::/1','8000::/1') } | ForEach-Object { "$($_.InterfaceIndex):$($_.DestinationPrefix):$($_.NextHop):$($_.RouteMetric)" } | Sort-Object)
-    [pscustomobject]@{ RoutingUnchanged = -not [bool](Compare-Object $routesBefore $routesAfter); AdapterRemoved = -not [bool](Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue) } | ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'cleanup.json')
+    [pscustomobject]@{ RoutingUnchanged = -not [bool](Compare-Object $routesBefore $routesAfter); AdapterMayPersist = [bool](Get-NetAdapter -Name 'Atlas-TUN' -IncludeHidden -ErrorAction SilentlyContinue); Cycles=$results.Count; Results=$results } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $OutputDirectory 'cleanup.json')
 }

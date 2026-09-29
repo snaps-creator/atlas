@@ -23,8 +23,15 @@ Implemented changes:
   Mihomo's interface monitor; they no longer trigger a second full reload in
   Atlas. A changed TUN LUID rebinds the guard only. Missing TUN fails health checks.
 - The desktop retries failed connections with bounded exponential backoff, up to
-  60 seconds between attempts. Disconnect/Exit cancel recovery intent before
-  waiting for application state. A startup delay does not suspend monitoring.
+  60 seconds between attempts while the user or startup preference still wants
+  Atlas connected. Disconnect/Exit cancel recovery intent before waiting for
+  application state. A startup delay does not suspend monitoring.
+- Reconnecting to an existing network service now reattaches to a matching live
+  session, transactionally applies changed saved settings with rollback, or
+  waits for the owning service's protected-pause recovery. It does not treat its
+  own recovering TUN as a competing VPN or stop a healthy existing session just
+  because a start/reattach command returned an error. A stale alias is checked
+  against the actual Windows interface table before it blocks a fresh start.
 - Tray Exit starts graceful cleanup with an eight-second process-exit deadline.
   An independent service watchdog gives cleanup five seconds after parent exit
   or SCM stop, even if the service command loop is blocked. Closing the service
@@ -42,6 +49,10 @@ Required live acceptance (not performed on the user's active network):
 3. Sleep/resume and TUN adapter recreation: verify route recovery and WFP LUID.
 4. Kill/hang only the test installation's core; verify recovery, cancellation,
    no duplicate cores and eventual removal of owned filters on Exit.
+   Also restart the desktop while the service is connected, reconnect while the
+   service is in ProtectedPause, and retry after the service itself has exited.
+   After explicit disconnect, confirm routes attached to an inactive Atlas
+   Wintun are removed while the adapter itself is allowed to remain installed.
 5. Switch servers during latency tests and invoke Exit during an outstanding
    operation. Verify UI responsiveness and service cleanup after fallback exit.
 6. Remote VPN outage: manual selection is preserved; AUTO/FAILOVER remain governed

@@ -664,6 +664,7 @@ function Get-WinEvent { param($FilterHashtable,$MaxEvents) [pscustomobject]@{Id=
             "192.168.1.1",
             "fixture route unavailable",
             "Interface metrics and DHCP state",
+            "Recent Windows restarts and bugchecks",
             "fixture DHCP event",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
