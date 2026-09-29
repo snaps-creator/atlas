@@ -10,8 +10,10 @@ use windows_sys::{
         Foundation::HANDLE,
         NetworkManagement::{
             IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid,
-                GetIfEntry2Ex, MibIfEntryNormalWithoutStatistics, MIB_IF_ROW2},
-            Ndis::NET_LUID_LH, WindowsFilteringPlatform::*,
+                DeleteIpForwardEntry2, GetIfEntry2Ex, MibIfEntryNormalWithoutStatistics,
+                MIB_IF_ROW2},
+            Ndis::{IfOperStatusDown, IfOperStatusLowerLayerDown, IfOperStatusNotPresent,
+                NET_LUID_LH}, WindowsFilteringPlatform::*,
         },
     },
 };
@@ -96,11 +98,20 @@ fn guid_value(guid: GUID) -> u128 {
         | u64::from_be_bytes(guid.data4) as u128
 }
 
-fn tun_probe() -> (Option<u64>, Option<u32>) {
+#[derive(Clone, Debug, Default)]
+struct TunProbe {
+    alias_luid: Option<u64>,
+    query_code: Option<u32>,
+    oper_status: Option<i32>,
+    interface_type: Option<u32>,
+    description: Option<String>,
+}
+
+fn tun_probe() -> TunProbe {
     unsafe {
         let mut tun: NET_LUID_LH = std::mem::zeroed();
         if ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut tun) != 0 {
-            return (None, None);
+            return TunProbe::default();
         }
         let mut row: MIB_IF_ROW2 = std::mem::zeroed();
         row.InterfaceLuid = tun;
@@ -108,12 +119,19 @@ fn tun_probe() -> (Option<u64>, Option<u32>) {
         // Ask IP Helper whether the interface itself still exists. This variant
         // avoids querying driver statistics while Windows is recovering.
         let status = GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut row);
-        (Some(tun.Value), Some(status))
+        TunProbe {
+            alias_luid: Some(tun.Value),
+            query_code: Some(status),
+            oper_status: (status == 0).then_some(row.OperStatus),
+            interface_type: (status == 0).then_some(row.Type),
+            description: (status == 0).then(|| String::from_utf16_lossy(&row.Description)
+                .trim_matches('\0').to_owned()),
+        }
     }
 }
 
-fn present_tun(alias: Option<u64>, row_status: Option<u32>) -> Option<u64> {
-    match row_status {
+fn present_tun(alias: Option<u64>, query_code: Option<u32>) -> Option<u64> {
+    match query_code {
         // ERROR_FILE_NOT_FOUND / ERROR_NOT_FOUND: stale alias, no interface.
         Some(2 | 1168) => None,
         // Other errors are not proof of absence: retain the collision guard.
@@ -121,19 +139,72 @@ fn present_tun(alias: Option<u64>, row_status: Option<u32>) -> Option<u64> {
     }
 }
 
+fn reusable_wintun(probe: &TunProbe) -> bool {
+    let description = probe.description.as_deref().unwrap_or_default();
+    probe.query_code == Some(0)
+        && probe.interface_type == Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL)
+        && description.to_ascii_lowercase().contains("wintun")
+        && probe.oper_status.is_some_and(|status| status == IfOperStatusDown
+            || status == IfOperStatusLowerLayerDown || status == IfOperStatusNotPresent)
+}
+
+fn active_tun(probe: &TunProbe) -> Option<u64> {
+    let alias = present_tun(probe.alias_luid, probe.query_code)?;
+    if reusable_wintun(probe) { None } else { Some(alias) }
+}
+
 pub fn tun_identity() -> Option<u64> {
-    let (alias, row_status) = tun_probe();
-    present_tun(alias, row_status)
+    active_tun(&tun_probe())
 }
 
 pub(crate) fn tun_diagnostic() -> serde_json::Value {
-    let (alias, row_status) = tun_probe();
+    let probe = tun_probe();
     serde_json::json!({
-        "aliasLuid": alias,
-        "interfaceQueryCode": row_status,
-        "presentLuid": present_tun(alias, row_status),
-        "meaning": "An alias alone is not proof that a live TUN interface remains",
+        "aliasLuid": probe.alias_luid,
+        "interfaceQueryCode": probe.query_code,
+        "presentLuid": present_tun(probe.alias_luid, probe.query_code),
+        "operStatus": probe.oper_status,
+        "interfaceType": probe.interface_type,
+        "description": probe.description,
+        "reusableWintun": reusable_wintun(&probe),
+        "activeLuid": active_tun(&probe),
+        "meaning": "A verified, down Wintun adapter may persist after its process exits and can be reused",
     })
+}
+
+/// Remove only route entries tied to Atlas' exact, verified Wintun adapter,
+/// and only while Windows reports that adapter down. This repairs split-default
+/// routes left by a hard core/service crash without touching other VPN routes.
+pub(crate) fn clear_routes_for_reusable_tun() -> Result<usize, String> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND},
+        NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_ROW2},
+        Networking::WinSock::AF_UNSPEC,
+    };
+    let probe = tun_probe();
+    let Some(luid) = probe.alias_luid else { return Ok(0); };
+    let stale_alias = matches!(probe.query_code, Some(2 | 1168));
+    if !stale_alias && !reusable_wintun(&probe) {
+        return Err(format!("Интерфейс Atlas-TUN занят или не подтверждён как выключенный Wintun (LUID {luid})"));
+    }
+    unsafe {
+        let mut table = ptr::null_mut();
+        checked(GetIpForwardTable2(AF_UNSPEC, &mut table), "чтение маршрутов Atlas-TUN")?;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let stale: Vec<MIB_IPFORWARD_ROW2> = rows.iter()
+            .filter(|route| route.InterfaceLuid.Value == luid)
+            .copied().collect();
+        FreeMibTable(table.cast());
+        let mut removed = 0;
+        for route in stale {
+            let status = DeleteIpForwardEntry2(&route);
+            if status == 0 { removed += 1; }
+            else if status != ERROR_NOT_FOUND && status != ERROR_FILE_NOT_FOUND {
+                return Err(format!("Не удалось удалить устаревший маршрут Atlas-TUN: код Windows {status:#x}"));
+            }
+        }
+        Ok(removed)
+    }
 }
 
 pub(crate) fn wait_for_tun_release(timeout: std::time::Duration) -> Result<(), String> {
@@ -143,7 +214,7 @@ fn wait_for_tun_release_with(timeout: std::time::Duration, identity: impl Fn() -
     let deadline = std::time::Instant::now() + timeout;
     while identity().is_some() {
         if std::time::Instant::now() >= deadline {
-            return Err("Atlas-TUN остался после остановки службы. Очистка не подтверждена; установка или удаление остановлены. Неизвестный интерфейс не изменён".into());
+            return Err("Atlas-TUN всё ещё активен после остановки службы. Очистка не подтверждена; неизвестный интерфейс не изменён".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -187,8 +258,9 @@ pub fn check_competing_routes() -> Result<(), String> {
         NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2},
         Networking::WinSock::AF_UNSPEC,
     };
+    clear_routes_for_reusable_tun()?;
     if tun_identity().is_some() {
-        return Err("Интерфейс Atlas-TUN уже существует до запуска ядра. Его происхождение не подтверждено; Atlas не будет его менять".into());
+        return Err("Интерфейс Atlas-TUN активен или его тип нельзя подтвердить; запуск остановлен без изменения адаптера".into());
     }
     unsafe {
         let mut table = ptr::null_mut();
@@ -198,9 +270,9 @@ pub fn check_competing_routes() -> Result<(), String> {
         )?;
         let rows =
             std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
-        let conflict = rows
-            .iter()
-            .any(|row| row.DestinationPrefix.PrefixLength == 1 && row.Loopback == 0);
+        let atlas_luid = tun_probe().alias_luid;
+        let conflict = rows.iter().any(|row| row.DestinationPrefix.PrefixLength == 1
+            && row.Loopback == 0 && Some(row.InterfaceLuid.Value) != atlas_luid);
         FreeMibTable(table.cast());
         if conflict {
             return Err("Обнаружен активный маршрут другого VPN. Отключите его перед подключением Atlas. Сетевые настройки не изменены.".into());
@@ -227,7 +299,7 @@ impl Guard {
     }
     pub fn reset_for_recovery(&self) -> Result<(), String> {
         if tun_identity().is_some() {
-            return Err("Старый Atlas-TUN ещё существует; восстановление остановлено".into());
+            return Err("Atlas-TUN всё ещё активен; восстановление остановлено".into());
         }
         *self.owned_tun.lock().map_err(|_| "Не удалось сбросить идентификатор TUN")? = None;
         Ok(())
@@ -446,6 +518,24 @@ mod tests {
         assert_eq!(super::present_tun(Some(42), Some(1168)), None);
         assert_eq!(super::present_tun(Some(42), Some(0)), Some(42));
         assert_eq!(super::present_tun(Some(42), Some(87)), Some(42));
+    }
+    #[test]
+    fn down_verified_wintun_is_reusable_but_active_or_unknown_interfaces_are_not() {
+        let mut probe = super::TunProbe { alias_luid: Some(42), query_code: Some(0),
+            oper_status: Some(super::IfOperStatusDown),
+            interface_type: Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL),
+            description: Some("Wintun Userspace Tunnel".into()) };
+        assert!(super::reusable_wintun(&probe));
+        assert_eq!(super::active_tun(&probe), None);
+        probe.oper_status = Some(super::IfOperStatusUp);
+        assert!(!super::reusable_wintun(&probe));
+        assert_eq!(super::active_tun(&probe), Some(42));
+        probe.oper_status = Some(super::IfOperStatusDown);
+        probe.description = Some("Third-party virtual adapter".into());
+        assert_eq!(super::active_tun(&probe), Some(42));
+        probe.description = Some("Wintun Userspace Tunnel".into());
+        probe.query_code = Some(87);
+        assert_eq!(super::active_tun(&probe), Some(42));
     }
     use super::*;
     #[test]

@@ -170,6 +170,9 @@ impl Core {
     pub fn service_reachable(&self) -> bool {
         self.broker.as_ref().is_some_and(|broker| broker.alive())
     }
+    pub fn service_status(&self) -> Option<Value> {
+        self.broker.as_ref()?.call("status", Value::Null).ok()
+    }
     pub fn running(&mut self) -> bool {
         if self.xray.as_mut().is_some_and(|runtime|!runtime.healthy()) {return false;}
         if let Some(broker) = &self.broker {
@@ -203,11 +206,24 @@ impl Core {
             )
             .map_err(|e| e.to_string())?;
             self.broker = Some(broker.clone());
-            if let Err(error) =
-                broker.call_cancellable("start", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())
-            {
-                let _ = self.stop();
-                return Err(error);
+            // Do not issue Stop on a failed Start reply: the service may already
+            // own a healthy session. The caller checks service state and keeps
+            // any confirmed connection alive.
+            let response = broker.call_cancellable("start", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())?;
+            if response["recovering"] == true {
+                let deadline = Instant::now() + Duration::from_secs(240);
+                loop {
+                    if self.cancelled() { return Err("Подключение отменено".into()); }
+                    if Instant::now() >= deadline {
+                        return Err("Служба Atlas не завершила восстановление за 240 секунд".into());
+                    }
+                    let status = broker.call_cancellable("status", Value::Null, self.continue_running.as_deref())?;
+                    if status["running"] == true && status["guard"] == true { break; }
+                    if status["state"] == "Disconnected" {
+                        return Err("Служба Atlas завершила восстановление без активной VPN-сессии".into());
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
             }
             self.started = Some(Instant::now());
             return Ok(());
@@ -515,7 +531,7 @@ impl Core {
             }
             if tun_identity().is_some() {
                 self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_remaining","tunLuid":tun_identity()}));
-                return Err("Ядро остановлено, но Atlas-TUN ещё существует; восстановление сети не подтверждено".into());
+                return Err("Ядро остановлено, но Atlas-TUN всё ещё активен; восстановление сети не подтверждено".into());
             }
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_released"}));
         }
