@@ -511,7 +511,7 @@ function TigerEgg({ open, onClose }: { open: boolean; onClose: () => void }) {
         <button className="tiger-egg-close" type="button" onClick={onClose} aria-label="Закрыть">
           ×
         </button>
-        <h2 id="tiger-egg-title">Ха!, попалась!</h2>
+        <h2 id="tiger-egg-title">Ха, попалась!</h2>
         <img src="/lan-tiger.jpg" alt="Любопытный тигр" />
         <button className="tiger-egg-okay" type="button" onClick={onClose}>
           Ого!
