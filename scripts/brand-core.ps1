@@ -1,4 +1,4 @@
-param([string]$Executable = (Join-Path (Split-Path $PSScriptRoot -Parent) 'src-tauri\resources\Atlas.Core.exe'))
+param([string]$Executable = (Join-Path (Split-Path $PSScriptRoot -Parent) 'src-tauri\resources\Atlas.Core.exe'), [ValidateSet('Mihomo','Xray')][string]$Engine = 'Mihomo')
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "Core not found: $Executable" }
 if ((Get-AuthenticodeSignature -LiteralPath $Executable).Status -ne 'NotSigned') {
@@ -41,12 +41,14 @@ function New-VersionString([string]$Key, [string]$Value) {
     return New-VersionBlock $Key $bytes ($Value.Length + 1) 1 @()
 }
 
+$component = if ($Engine -eq 'Xray') { 'Atlas.Xray' } else { 'Atlas.Core' }
+$engineVersion = if ($Engine -eq 'Xray') { [Version]'26.3.27.0' } else { [Version]'1.19.29.0' }
 $strings = @(
-    (New-VersionString 'FileDescription' 'Atlas.Core — Mihomo network engine'),
-    (New-VersionString 'ProductName' 'Atlas Core (Mihomo)'),
-    (New-VersionString 'FileVersion' '1.19.29.0'),
-    (New-VersionString 'OriginalFilename' 'Atlas.Core.exe'),
-    (New-VersionString 'Comments' 'Mihomo open-source component; see LICENSE-mihomo')
+    (New-VersionString 'FileDescription' "$component — $Engine network engine"),
+    (New-VersionString 'ProductName' "Atlas Core ($Engine)"),
+    (New-VersionString 'FileVersion' $engineVersion.ToString()),
+    (New-VersionString 'OriginalFilename' "$component.exe"),
+    (New-VersionString 'Comments' "$Engine open-source component; see LICENSE-$($Engine.ToLowerInvariant())")
 )
 $table = New-VersionBlock '040904B0' ([byte[]]@()) 0 1 $strings
 $stringFileInfo = New-VersionBlock 'StringFileInfo' ([byte[]]@()) 0 1 @($table)
@@ -55,8 +57,8 @@ $varFileInfo = New-VersionBlock 'VarFileInfo' ([byte[]]@()) 0 1 @($translation)
 $fixedStream = [IO.MemoryStream]::new()
 $fixedWriter = [IO.BinaryWriter]::new($fixedStream)
 foreach ($value in @(
-    4277077181, 0x00010000, 0x00010013, 0x001D0000,
-    0x00010013, 0x001D0000, 0x0000003F, 0,
+    4277077181, 0x00010000, (($engineVersion.Major -shl 16) -bor $engineVersion.Minor), (($engineVersion.Build -shl 16) -bor $engineVersion.Revision),
+    (($engineVersion.Major -shl 16) -bor $engineVersion.Minor), (($engineVersion.Build -shl 16) -bor $engineVersion.Revision), 0x0000003F, 0,
     0x00040004, 1, 0, 0, 0
 )) { $fixedWriter.Write([uint32]$value) }
 $version = New-VersionBlock 'VS_VERSION_INFO' $fixedStream.ToArray() 52 0 @($stringFileInfo, $varFileInfo)
@@ -76,7 +78,7 @@ if (-not $committed) {
     throw "EndUpdateResource failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
 }
 $info = (Get-Item -LiteralPath $Executable).VersionInfo
-if (-not $info.FileDescription.StartsWith('Atlas') -or $info.FileVersion -ne '1.19.29.0') {
+if (-not $info.FileDescription.StartsWith('Atlas') -or $info.FileVersion -ne $engineVersion.ToString()) {
     throw 'Version resource verification failed'
 }
 Write-Output "$($info.FileDescription) $($info.FileVersion)"

@@ -1,3 +1,4 @@
+import { serverDisplayName } from "./serverDisplayName";
 import { useEffect, useState } from "react";
 import { request } from "./api";
 import { historyLatency, type Latency, type ProxyHealth } from "./latency";
@@ -61,8 +62,8 @@ export function ActiveServer({
     const timer = window.setInterval(poll, 5000);
     return () => { alive = false; window.clearInterval(timer); };
   }, [connected, onChange]);
-  return <div className="active-server" title={value?.name}>
-    <strong>{connected ? value?.name ?? "—" : "—"}</strong>
+  return <div className="active-server" title={value ? serverDisplayName(value.name) : undefined}>
+    <strong>{connected ? (value ? serverDisplayName(value.name) : "—") : "—"}</strong>
     <small className={connected && (controlError || value?.status === "unreachable" || poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "pool-error" : ""} title={controlError ?? poolHealth?.text}>{connected && controlError ? "Не удалось обновить статус" : connected && (poolHealth?.phase === "all_timeout" || poolHealth?.phase === "refreshing") ? "Все проверки — таймаут" : connected && value?.status === "unreachable" ? "Таймаут выбранного сервера" : connected && value?.delay != null ? `${value.delay} мс` : "—"}</small>
   </div>;
 }

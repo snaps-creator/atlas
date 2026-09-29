@@ -24,6 +24,9 @@ mod service;
 mod session_cleanup;
 mod storage;
 mod subscriptions;
+mod xray_config;
+mod xray_runtime;
+mod subscription_options;
 mod subscription_refresh;
 #[cfg(test)]
 mod site_checks;
@@ -81,6 +84,12 @@ impl App {
             }
         }
         for sub in &mut s.subscriptions {
+            sub.options.fallback_url = sub.options.fallback_url.as_deref().map(subscriptions::mask);
+            sub.options.effective_url = sub.options.effective_url.as_deref().map(subscriptions::mask);
+            // Provider directives can contain private URLs. The UI only edits
+            // the explicit User-Agent override through its dedicated command.
+            sub.options.parameters.clear();
+            sub.options.provider_id = None;
             for p in &mut sub.servers {
                 *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p),"probeId":latency::node_identity(p)});
             }
@@ -93,7 +102,8 @@ impl App {
         self.published.set(value.clone());
         value
     }
-    fn install_subscription(&mut self, id: String, url: String, mut nodes: Vec<Value>, label: Option<String>, entry: Option<keyring::Entry>) -> Result<(),String> {
+    fn install_subscription(&mut self, id: String, url: String, downloaded: subscriptions::Downloaded, label: Option<String>, entry: Option<keyring::Entry>) -> Result<(),String> {
+                let mut nodes=downloaded.nodes;
                 for (i, node) in nodes.iter_mut().enumerate() {
                     let name = node["name"].as_str().unwrap_or("Сервер");
                     node["name"] = json!(format!("{} · {}-{}", name, &id[..8], i + 1));
@@ -104,6 +114,7 @@ impl App {
                     .or_else(|| old.map(|i| next.subscriptions[i].name.clone()))
                     .unwrap_or("Подписка".into());
                 let sub = Subscription {
+                    options: downloaded.options,
                     id: id.clone(),
                     name,
                     masked_url: subscriptions::mask(&url),
@@ -413,6 +424,18 @@ impl App {
                     self.save(back)?;
                     return Err(format!("Автозапуск Windows: {e}"));
                 }
+            }
+            "subscription_user_agent" => {
+                let id = p["id"].as_str().ok_or("Не выбрана подписка")?;
+                let agent = p["userAgent"].as_str().ok_or("Не указан User-Agent")?.trim();
+                if !agent.is_empty() { subscription_options::validate_agent(agent)?; }
+                let mut next = self.settings.clone();
+                let sub = next.subscriptions.iter_mut().find(|s| s.id == id)
+                    .ok_or("Подписка не найдена")?;
+                sub.options.user_agent_override = (!agent.is_empty()).then(||agent.to_owned());
+                // Download metadata does not alter the active network configuration.
+                self.store.save(&next)?;
+                self.settings = next;
             }
             "subscription_delete" => {
                 let id = p["id"].as_str().ok_or("Нет ID")?;
@@ -862,7 +885,9 @@ async fn request_inner(
             let url = if adding { p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned() }
                 else { entry.get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")? };
             // Download never owns the mutation lock: Quit must not wait for HTTPS.
-            let downloaded = subscriptions::download(&url, captured.status == "Connected");
+            let options=captured.settings.subscriptions.iter().find(|s|s.id==id)
+                .map(|s|s.options.clone()).unwrap_or_default();
+            let downloaded = subscriptions::download(&url, captured.status == "Connected", &options);
             let mut a = shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
             if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("Atlas завершает работу".into());

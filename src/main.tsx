@@ -1,3 +1,4 @@
+import { serverDisplayName } from "./serverDisplayName";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { diagnosticEvent } from "./diagnosticEvents";
 import React, { useEffect, useState, useCallback, useRef } from "react";
@@ -784,7 +785,7 @@ function App() {
                           <Globe2 size={16} />
                           {s?.selected === "AUTO"
                             ? "Автоматический выбор"
-                            : s?.selected}
+                            : s?.selected && serverDisplayName(s.selected)}
                           <ChevronRight size={14} />
                         </button>
                       </div>
@@ -978,6 +979,10 @@ function App() {
                         <SubscriptionCard key={sub.id} sub={sub}
                           refreshing={data?.refreshingSubscriptions?.includes(sub.id) ?? false}
                           canDelete={!busy && !connected}
+                          saveUserAgent={async (userAgent) => {
+                            await request<Snapshot>("subscription_user_agent", { id: sub.id, userAgent });
+                            await refresh();
+                          }}
                           refresh={async () => {
                             await request<Snapshot>("subscription_refresh", { id: sub.id });
                             await refresh();
@@ -989,7 +994,7 @@ function App() {
                   ) : (
                     empty(
                       "Подключите вашего провайдера",
-                      "Поддерживаются Clash/Mihomo YAML, Base64 и распространённые proxy URI.",
+                      "Поддерживаются Clash/Mihomo YAML, Xray JSON, Base64 и proxy URI.",
                       addButton,
                     )
                   )}

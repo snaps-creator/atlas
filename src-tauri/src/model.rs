@@ -48,6 +48,8 @@ pub struct RuleGroup {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Subscription {
+    #[serde(default)]
+    pub options: crate::subscription_options::Options,
     pub id: String,
     pub name: String,
     pub masked_url: String,

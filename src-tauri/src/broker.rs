@@ -22,6 +22,9 @@ use windows_sys::Win32::{
 const LIMIT: usize = 16 * 1024 * 1024;
 const SERVICE_PIPE: &str = r"\\.\pipe\Atlas-Network-Service";
 const EMBEDDED_CORE: &[u8] = include_bytes!("../resources/Atlas.Core.exe");
+const EMBEDDED_XRAY: &[u8] = include_bytes!("../resources/Atlas.Xray.exe");
+const XRAY_GEOIP: &[u8] = include_bytes!("../resources/xray-assets/geoip.dat");
+const XRAY_GEOSITE: &[u8] = include_bytes!("../resources/xray-assets/geosite.dat");
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -294,6 +297,10 @@ fn secure_directory() -> Result<PathBuf, String> {
             return Err(error("Не удалось создать защищённый каталог"));
         }
         std::fs::write(directory.join("Atlas.Core.exe"), EMBEDDED_CORE).map_err(|e| e.to_string())?;
+        std::fs::write(directory.join("Atlas.Xray.exe"), EMBEDDED_XRAY).map_err(|e| e.to_string())?;
+        std::fs::create_dir(directory.join("xray-assets")).map_err(|e|e.to_string())?;
+        std::fs::write(directory.join("xray-assets/geoip.dat"),XRAY_GEOIP).map_err(|e|e.to_string())?;
+        std::fs::write(directory.join("xray-assets/geosite.dat"),XRAY_GEOSITE).map_err(|e|e.to_string())?;
         Ok(directory)
     }
 }
@@ -304,6 +311,10 @@ pub fn validate_settings(settings: &Settings) -> Result<(), String> {
     }
     for node in settings.servers() {
         let kind = node["type"].as_str().ok_or("Отсутствует тип сервера")?;
+        if kind=="xray" {
+            crate::xray_config::controlled_profile(&node["xray"],json!({"tag":"atlas-validation"}))?;
+            continue;
+        }
         if ![
             "ss",
             "vmess",

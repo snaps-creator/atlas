@@ -466,7 +466,7 @@ mod tests {
             }
         });
         let mut settings=Settings::default();
-        settings.subscriptions.push(crate::model::Subscription{id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+        settings.subscriptions.push(crate::model::Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"slow","server":"127.0.0.1","port":1}),json!({"name":"fast","server":"127.0.0.1","port":2})]});
         let (tx,rx)=mpsc::channel();
         std::thread::spawn(move || { let _=tx.send(verify_replacement(&ApiClient::loopback_fixture(port),&settings,&HashSet::new(),None,Default::default())); });
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn quarantine_is_bound_to_node_configuration() {
         let mut s=Settings::default();
-        s.subscriptions.push(crate::model::Subscription{id:"x".into(),name:"x".into(),masked_url:"".into(),updated_at:0,error:None,
+        s.subscriptions.push(crate::model::Subscription { options: Default::default(),id:"x".into(),name:"x".into(),masked_url:"".into(),updated_at:0,error:None,
             servers:vec![json!({"name":"Sweden","server":"1.2.3.4","port":443}),json!({"name":"Germany","server":"1.2.3.4","port":443}),json!({"name":"other","server":"5.6.7.8","port":443})]});
         let p=json!({"proxies":{"Sweden":{"alive":true},"Germany":{"alive":true},"other":{"alive":true}}});
         let first = node_key(&s.servers()[0]);
