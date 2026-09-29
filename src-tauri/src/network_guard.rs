@@ -527,7 +527,7 @@ mod tests {
             description: Some("Wintun Userspace Tunnel".into()) };
         assert!(super::reusable_wintun(&probe));
         assert_eq!(super::active_tun(&probe), None);
-        probe.oper_status = Some(super::IfOperStatusUp);
+        probe.oper_status = Some(windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp);
         assert!(!super::reusable_wintun(&probe));
         assert_eq!(super::active_tun(&probe), Some(42));
         probe.oper_status = Some(super::IfOperStatusDown);
