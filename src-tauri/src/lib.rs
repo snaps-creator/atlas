@@ -1,3 +1,4 @@
+pub use session_cleanup::verify_desktop_owner;
 mod applications;
 mod background_probe;
 mod broker;

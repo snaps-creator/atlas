@@ -165,10 +165,7 @@ impl Broker {
                 }
                 crate::service::verify_server_pid(server_pid)?;
                 nonblocking(&file)?;
-                let hello = receive_cancellable(&mut file, Duration::from_secs(10), running)?;
-                if hello["ready"] != true {
-                    return Err("Сетевая служба не готова".into());
-                }
+                receive_service_ready(&mut file, running)?;
                 return Ok(Self {
                     pipe: Mutex::new(Some(file)),
                 });
@@ -250,6 +247,20 @@ impl Broker {
             Ok(reply["result"].clone())
         }
     }
+}
+fn receive_service_ready(pipe: &mut File, running: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    let hello = receive_cancellable(pipe, Duration::from_secs(10), running)?;
+    if hello["ready"] == true { return Ok(()); }
+    let reason = hello["error"].as_str().unwrap_or("Сетевая служба не готова").to_owned();
+    let _ = send(pipe, &json!({"startupErrorReceived":true}));
+    crate::incident_history::record("service_startup_failed", json!({"error":reason}), &[]);
+    Err(reason)
+}
+fn send_startup_failure(pipe: &mut File, reason: &str) -> Result<(), String> {
+    send(pipe, &json!({"ready":false,"error":reason}))?;
+    // Keep the frame alive until the desktop consumes it; never wait indefinitely.
+    let _ = receive(pipe, Duration::from_secs(1));
+    Ok(())
 }
 pub(crate) fn verify_process_image(pid: u32, expected: &std::path::Path) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -691,7 +702,10 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
     core.continue_running = Some(session_running.clone());
     // Watch the desktop before validation or any other potentially blocking
     // request, including cancellation while a connection is still starting.
-    *cleanup_observer = Some(crate::session_cleanup::start_observer(&core.directory, *desktop_pid)?);
+    match crate::session_cleanup::start_observer(&core.directory, *desktop_pid) {
+        Ok(observer) => *cleanup_observer = Some(observer),
+        Err(error) => { let _ = send_startup_failure(&mut pipe, &error); return Err(error); }
+    }
     send(&mut pipe, &json!({"ready":true}))?;
     let mut explicit_stop = false;
     loop {
@@ -1122,6 +1136,14 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observer_startup_error_reaches_desktop_before_pipe_closes() {
+        let (mut server, mut client) = pipe_pair();
+        let message = "Наблюдатель очистки Atlas: отказ проверки владельца";
+        let worker = thread::spawn(move || send_startup_failure(&mut server, message));
+        assert_eq!(receive_service_ready(&mut client, None).unwrap_err(), message);
+        worker.join().unwrap().unwrap();
+    }
     #[test]
     fn reconnect_reattaches_reconciles_or_waits_without_treating_own_tun_as_competing() {
         assert_eq!(existing_session_action(false, false, false, false), ExistingSessionAction::StartFresh);

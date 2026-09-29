@@ -14,6 +14,7 @@ foreach ($entry in @(@('Atlas.Xray.exe','brandedSha256'),@('xray-assets/geoip.da
     if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $manifest.($entry[1])) { throw "Packaged resource hash differs: $($entry[0])" }
 }
 & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $extract 'Atlas.exe')
+& (Join-Path $PSScriptRoot 'test-service-identity.ps1') -Executable (Join-Path $extract 'Atlas.exe')
 # Remove only this uniquely created test directory, never an installation.
 $resolved = [IO.Path]::GetFullPath($extract)
 $expectedRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'

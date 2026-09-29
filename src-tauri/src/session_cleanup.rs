@@ -44,7 +44,7 @@ pub(crate) fn start_observer(directory: &Path, desktop_pid: u32) -> Result<std::
         .creation_flags(0x08000000)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Наблюдатель очистки Atlas: {e}"))?;
     let mut output = child.stdout.take().ok_or("Нет канала наблюдателя")?;
@@ -78,7 +78,11 @@ pub(crate) fn start_observer(directory: &Path, desktop_pid: u32) -> Result<std::
     }
     let _ = child.kill();
     let _ = child.wait();
-    Err("Наблюдатель очистки Atlas не готов; запуск TUN отменён".into())
+    let mut detail = String::new();
+    if let Some(stderr) = child.stderr.take() { let _ = stderr.take(4096).read_to_string(&mut detail); }
+    let detail = detail.trim();
+    Err(if detail.is_empty() { "Наблюдатель очистки Atlas не готов; запуск TUN отменён".into() }
+        else { format!("Наблюдатель очистки Atlas: {detail}; запуск TUN отменён") })
 }
 
 pub(crate) fn after_process_exit(
@@ -139,6 +143,13 @@ fn owned_session_directory(directory: &Path, root: &Path) -> Result<(), String> 
     Ok(())
 }
 
+// The observer runs as Atlas.Service.exe, while its desktop owner is Atlas.exe.
+// Keep the exact protected installation directory; never accept a name alone.
+pub fn verify_desktop_owner(pid: u32, service_image: &Path) -> Result<(), String> {
+    crate::broker::verify_process_image(pid, &service_image.with_file_name("Atlas.exe"))
+        .map_err(|e| format!("Не подтверждён процесс интерфейса Atlas: {e}"))
+}
+
 /// Internal executable mode authenticated against SCM, without starting the UI.
 pub(crate) fn run(service_pid: u32, desktop_pid: u32, directory: &Path) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, service_pid) };
@@ -150,7 +161,7 @@ pub(crate) fn run(service_pid: u32, desktop_pid: u32, directory: &Path) -> Resul
     let owner = unsafe { OpenProcess(SYNCHRONIZE, 0, desktop_pid) };
     if owner.is_null() { return Err("Владелец сетевой сессии Atlas не найден".into()); }
     let owner = unsafe { OwnedHandle::from_raw_handle(owner) };
-    crate::broker::verify_process_image(desktop_pid, &std::env::current_exe().map_err(|e| e.to_string())?)?;
+    verify_desktop_owner(desktop_pid, &std::env::current_exe().map_err(|e| e.to_string())?)?;
     let root = PathBuf::from(std::env::var_os("ProgramData").ok_or("ProgramData is unavailable")?);
     owned_session_directory(directory, &root)?;
     std::io::stdout()
@@ -187,6 +198,27 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+    #[test]
+    fn installed_service_accepts_its_desktop_but_rejects_another_directory() {
+        let root = std::env::temp_dir().join(format!("atlas-owner-test-{}", uuid::Uuid::new_v4()));
+        let foreign = root.join("other");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let desktop = root.join("Atlas.exe");
+        let service = root.join("Atlas.Service.exe");
+        let shell = std::env::var_os("COMSPEC").unwrap();
+        for path in [&desktop, &service, &foreign.join("Atlas.exe")] { std::fs::copy(&shell, path).unwrap(); }
+        let mut child = Command::new(&desktop).args(["/d", "/c", "set /p ATLAS_OWNER_TEST="])
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000).spawn().unwrap();
+        let job = crate::job::Job::attach(&child).unwrap();
+        let old_check = crate::broker::verify_process_image(child.id(), &service);
+        let valid = verify_desktop_owner(child.id(), &service);
+        let wrong_directory = verify_desktop_owner(child.id(), &foreign.join("Atlas.Service.exe"));
+        let _ = child.kill(); let _ = child.wait(); drop(job);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(old_check.is_err(), "regression fixture must reproduce the old mismatch");
+        assert!(valid.is_ok(), "installed Atlas.exe must be accepted: {valid:?}");
+        assert!(wrong_directory.is_err(), "an identically named foreign executable must stay rejected");
+    }
     #[test]
     fn cleanup_waits_for_real_process_death_including_forced_termination() {
         let mut child = Command::new("powershell.exe")
