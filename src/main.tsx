@@ -585,7 +585,7 @@ function App() {
         <main>
           {page === "Updates" && (
             <>
-              <div className="page-heading"><h1>Обновления</h1></div>
+              <div className="page-heading updates-page-heading"><h1>Обновления</h1></div>
               <section className="settings-section update-settings">
                 <h2>Текущая версия</h2>
                 <p>{versionLabel || "Версия недоступна"}{appVersion ? ` · ${appVersion}` : ""}</p>

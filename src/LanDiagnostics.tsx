@@ -180,12 +180,12 @@ export function LanDiagnostics() {
           className="lan-unlock-form"
           onSubmit={(e) => {
             e.preventDefault();
-              if (password === "00000001") {
-                setPassword("");
-                setError("");
-                setTigerEggOpen(true);
-                return;
-              }
+            if (password === "00000001") {
+              setPassword("");
+              setError("");
+              setTigerEggOpen(true);
+              return;
+            }
             void run(async () => {
               const v = await request<{ token: string }>("lan_unlock", {
                 password,
@@ -337,8 +337,10 @@ export function LanDiagnostics() {
       <div className="lan-peers">
         {discovered.map((p) => (
           <article className="lan-peer" key={p.id}>
-            <strong>{p.name}</strong>
-            <span>На связи · {p.address}</span>
+            <div className="lan-peer-meta">
+              <strong>{p.name}</strong>
+              <span>На связи · {p.address}</span>
+            </div>
             <button
               disabled={busy}
               onClick={() =>

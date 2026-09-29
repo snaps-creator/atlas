@@ -131,6 +131,9 @@ td, th { padding: 17px 14px; }
 .alert { color: var(--ink); background: var(--surface); border: 1px dashed var(--outline); border-radius: 15px; padding: 20px; }
 .update-banner { padding: 25px; gap: 20px; }
 .page-heading { margin-bottom: 35px; }
+.updates-page-heading { margin: 0 0 32px; }
+.updates-page-heading h1 { margin: 0; }
+.update-settings { margin-top: 0; }
 .update-progress { border-radius: 0; }
 .main-footer { margin: 20px 40px 0; padding: 25px 0; font-size: 9px; letter-spacing: .05em; }
 .empty { padding: 65px 30px; border: 1px solid var(--line); border-radius: 15px; }
