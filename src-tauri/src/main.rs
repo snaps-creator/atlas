@@ -26,6 +26,22 @@ fn main() {
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     let args: Vec<String> = std::env::args().collect();
+    // Packaged service/desktop identity acceptance, with no SCM, VPN or settings.
+    if std::env::var_os("ATLAS_SERVICE_IDENTITY_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        if args.get(1).is_some_and(|s| s == "--identity-owner") {
+            let _ = std::io::stdin().read_line(&mut String::new());
+            return;
+        }
+        if args.get(1).is_some_and(|s| s == "--identity-check") {
+            let result = args.get(2).and_then(|pid| pid.parse::<u32>().ok())
+                .ok_or("Нет PID владельца".to_owned())
+                .and_then(|pid| std::env::current_exe().map_err(|e| e.to_string())
+                    .and_then(|path| atlas::verify_desktop_owner(pid, &path)));
+            if let Err(error) = &result { eprintln!("{error}"); }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+        std::process::exit(2);
+    }
     if args.get(1).is_some_and(|s| s == "--watch-network-session") {
         let result = args
             .get(2)
@@ -36,6 +52,7 @@ fn main() {
                 .ok_or("Нет PID владельца сессии".to_owned())
                 .and_then(|desktop_pid| args.get(4).ok_or("Нет каталога сессии".to_owned())
                     .and_then(|directory| atlas::watch_network_session(pid, desktop_pid, std::path::Path::new(directory)))));
+        if let Err(error) = &result { eprintln!("{error}"); }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     if args.get(1).is_some_and(|s| s == "--check-network-service") {
