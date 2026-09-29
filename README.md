@@ -2,7 +2,7 @@
 
 **Atlas** — VPN-клиент для Windows с быстрым выбором сервера, гибкими правилами маршрутизации и понятной диагностикой соединения. Добавьте подписку, подключитесь и управляйте трафиком из одного приложения: вручную, автоматически или по правилам для конкретных сайтов и программ.
 
-Текущая версия исходников — **Alpha 2.1.4**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
+Текущая версия исходников — **Alpha 2.2.2**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)

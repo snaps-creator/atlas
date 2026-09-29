@@ -168,6 +168,7 @@ function App() {
     }, 2500);
     return () => clearInterval(timer);
   }, [refresh]);
+  const updateBusy = useRef(false);
   useEffect(() => {
     if (!native) return;
     const polling = startUpdatePolling(
@@ -189,8 +190,9 @@ function App() {
         setUpdateCheckedAt(Date.now());
       },
       {
+        shouldCheck: () => !updateBusy.current,
         onStart: () => { setUpdateCheckStatus("checking"); setUpdateCheckError(""); },
-        onCurrent: () => { setUpdateCheckStatus("current"); setUpdateCheckedAt(Date.now()); },
+        onCurrent: () => { setAvailableUpdate(null); setUpdateCheckStatus("current"); setUpdateCheckedAt(Date.now()); },
       },
     );
     checkUpdatesNow.current = polling.checkNow;
@@ -317,14 +319,18 @@ function App() {
   }
   async function installUpdate() {
     if (!availableUpdate || updateStatus === "downloading" || updateStatus === "installing") return;
+    updateBusy.current = true;
     setUpdateStatus("downloading");
     setUpdateProgress(0);
     setUpdateError("");
     let downloaded = 0;
     let total = 0;
     try {
-      await diagnosticEvent("updater", "download_started", availableUpdate.version);
-      await availableUpdate.download((event) => {
+      const latest = await check({ timeout: 15000 });
+      if (!latest) { setAvailableUpdate(null); setUpdateStatus("idle"); return; }
+      setAvailableUpdate(latest);
+      await diagnosticEvent("updater", "download_started", latest.version);
+      await latest.download((event) => {
         if (event.event === "Started") {
           total = event.data.contentLength ?? 0;
         } else if (event.event === "Progress") {
@@ -340,13 +346,13 @@ function App() {
       // Frontend status can lag behind a crashed/restarting core or service.
       // Always run backend cleanup and wait for it before the updater replaces files.
       await request("disconnect");
-      await diagnosticEvent("updater", "install_started", availableUpdate.version);
-      await availableUpdate.install({ restartAfterInstall: true });
+      await diagnosticEvent("updater", "install_started", latest.version);
+      await latest.install({ restartAfterInstall: true });
     } catch (reason) {
       setUpdateStatus("error");
       setUpdateError(`Не удалось установить обновление: ${String(reason)}`);
       void diagnosticEvent("updater", "update_failed", reason);
-    }
+    } finally { updateBusy.current = false; }
   }
   const s = data?.settings;
   const servers = s?.subscriptions.flatMap((v) => v.servers) ?? [];
@@ -593,7 +599,7 @@ function App() {
                 <p>{versionLabel || "Версия недоступна"}{appVersion ? ` · ${appVersion}` : ""}</p>
                 <p>Автоматическая проверка при запуске и каждые 6 часов.</p>
                 <button
-                  disabled={!native || updateCheckStatus === "checking" || !!availableUpdate}
+                  disabled={!native || updateCheckStatus === "checking" || updateStatus === "downloading" || updateStatus === "installing"}
                   onClick={() => void checkUpdatesNow.current?.()}
                 >
                   <RefreshCw size={16} className={updateCheckStatus === "checking" ? "spin" : undefined} />

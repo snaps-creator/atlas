@@ -57,6 +57,11 @@ jobs:
           ./scripts/copy-installer.ps1
           node scripts/verify-installer.cjs
           if ($LASTEXITCODE -ne 0) { throw 'Updater signature verification failed.' }
+      - name: Verify packaged interface and process cleanup
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          ./scripts/test-packaged-installer.ps1 -Installer "t/release/bundle/nsis/Atlas_${version}_x64-setup.exe"
       - name: Package real installer and signature
         shell: pwsh
         run: ./scripts/package-installer.ps1

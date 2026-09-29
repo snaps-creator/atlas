@@ -41,7 +41,7 @@ describe("update polling", () => {
     expect(check).toHaveBeenCalledTimes(2);
     stop();
   });
-  it("does not overlap requests and stops after finding an update", async () => {
+  it("does not overlap requests and keeps checking after finding an update", async () => {
     vi.useFakeTimers();
     let resolve!: (value: string | null) => void;
     const check = vi.fn(() => new Promise<string | null>(done => { resolve = done; }));
@@ -53,7 +53,7 @@ describe("update polling", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(found).toHaveBeenCalledWith("new-version");
     await vi.advanceTimersByTimeAsync(UPDATE_CHECK_INTERVAL_MS * 2);
-    expect(check).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledTimes(2);
   });
   it("cancels the first StrictMode effect before making a request", async () => {
     vi.useFakeTimers();
@@ -75,4 +75,25 @@ describe("update polling", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(found).not.toHaveBeenCalled();
   });
+  it("replaces an offered update without installing the intermediate version", async () => {
+    vi.useFakeTimers();
+    const check = vi.fn().mockResolvedValueOnce("2.2.1").mockResolvedValueOnce("2.2.2").mockResolvedValue(null);
+    const found = vi.fn(), current = vi.fn();
+    const polling = startUpdatePolling(check, found, vi.fn(), { onCurrent: current });
+    await vi.advanceTimersByTimeAsync(0);
+    await polling.checkNow();
+    expect(found.mock.calls.map(c => c[0])).toEqual(["2.2.1", "2.2.2"]);
+    await polling.checkNow();
+    expect(current).toHaveBeenCalledTimes(1);
+    polling();
+  });
+  it("does not replace an installer while a download is active", async () => {
+    vi.useFakeTimers(); let busy = true;
+    const check = vi.fn().mockResolvedValue("latest");
+    const polling = startUpdatePolling(check, vi.fn(), vi.fn(), { shouldCheck: () => !busy });
+    await vi.advanceTimersByTimeAsync(0); await polling.checkNow();
+    expect(check).not.toHaveBeenCalled();
+    busy = false; await polling.checkNow(); expect(check).toHaveBeenCalledTimes(1); polling();
+  });
+
 });

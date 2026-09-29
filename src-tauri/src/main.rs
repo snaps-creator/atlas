@@ -1,26 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#[tauri_runtime_cef::cef_entry_point]
 fn main() {
-    // Equivalent to CEF's entry-point dispatch, with ownership established
-    // before a helper initializes. A late helper exits if its GUI already died.
-    if std::env::args().any(|arg| arg.starts_with("--type=")) {
-        if atlas::DesktopJob::join().is_err() { std::process::exit(1); }
-        tauri_runtime_cef::run_cef_helper_process();
-        return;
-    }
     // A short, side-effect-free UI launch for process-name acceptance. It
     // deliberately bypasses Atlas setup, stored preferences, service and VPN.
     if std::env::var_os("ATLAS_UI_PROCESS_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1")) {
         use tauri::Manager;
-        let _desktop_job = atlas::DesktopJob::new().expect("Desktop process ownership");
+
         let smoke_cache = std::env::temp_dir().join(format!("atlas-cef-smoke-{}", uuid::Uuid::new_v4()));
         let result = tauri::Builder::default()
             .runtime(tauri_runtime_cef::Cef::default().root_cache_path(smoke_cache))
+            .invoke_handler(tauri::generate_handler![ui_smoke_ready])
+            .on_page_load(|webview, _| {
+                let _ = webview.eval(r#"(() => { const timer = setInterval(() => { if (document.querySelector('main') && document.querySelectorAll('button').length >= 5) { clearInterval(timer); window.__TAURI_INTERNALS__.invoke('ui_smoke_ready', { title: document.title, buttons: document.querySelectorAll('button').length }); } }, 100); })()"#);
+            })
             .setup(|app| {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(12));
-                    handle.exit(0);
+                    handle.exit(1);
                 });
                 Ok(())
             })
@@ -71,9 +69,16 @@ fn main() {
     if std::env::args().any(|arg| arg == "--cleanup") {
         std::process::exit(if atlas::cleanup().is_ok() { 0 } else { 1 });
     }
-    let _desktop_job = match atlas::DesktopJob::new() {
-        Ok(job) => job,
-        Err(error) => { eprintln!("{error}"); std::process::exit(1); }
-    };
     atlas::run();
+}
+
+// Only registered in the isolated UI acceptance mode above. A window/process
+// existing is not success: React must render and CEF IPC must reach this command.
+#[tauri::command]
+fn ui_smoke_ready(app: tauri::AppHandle, title: String, buttons: usize) {
+    if buttons < 5 { return; }
+    if let Some(path) = std::env::var_os("ATLAS_UI_SMOKE_REPORT") {
+        if std::fs::write(path, serde_json::json!({"rendered":true,"title":title,"buttons":buttons,"version":env!("CARGO_PKG_VERSION")}).to_string()).is_err() { app.exit(2); return; }
+    }
+    std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(500)); app.exit(0); });
 }

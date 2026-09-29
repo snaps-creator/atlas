@@ -4,18 +4,17 @@ export function startUpdatePolling<T>(
   check: () => Promise<T | null>,
   onUpdate: (update: T) => void,
   onError: (error: unknown) => void,
-  events: { onStart?: () => void; onCurrent?: () => void } = {},
+  events: { onStart?: () => void; onCurrent?: () => void; shouldCheck?: () => boolean } = {},
 ) {
   let active = true;
   let running = false;
   const inspect = async () => {
-    if (!active || running) return;
+    if (!active || running || events.shouldCheck?.() === false) return;
     running = true;
     try {
       events.onStart?.();
       const update = await check();
       if (active && update !== null) {
-        stop(); // Keep the offered update; do not replace it while downloading.
         onUpdate(update);
       } else if (active) {
         events.onCurrent?.();
