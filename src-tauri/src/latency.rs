@@ -226,7 +226,7 @@ mod tests {
             }
         });
         let mut settings = Settings::default();
-        settings.subscriptions.push(Subscription{id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})]});
         let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
         with_offline_core(settings,binary,std::env::temp_dir(),|client| {
@@ -304,7 +304,7 @@ mod tests {
         let mut settings=Settings::default();
         settings.mode="tun".into();
         settings.selected="fixture".into();
-        settings.subscriptions.push(Subscription{id:"fixture".into(),name:"fixture".into(),
+        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),
             masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})]});
         let binary=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");

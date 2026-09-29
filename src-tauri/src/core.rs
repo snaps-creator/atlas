@@ -16,6 +16,7 @@ pub struct Core {
     pub directory: PathBuf,
     pub child: Option<Child>,
     job: Option<crate::job::Job>,
+    xray: Option<crate::xray_runtime::Runtime>,
     broker: Option<std::sync::Arc<crate::broker::Broker>>,
     elevated: bool,
     secret: String,
@@ -31,6 +32,7 @@ impl Core {
             directory,
             child: None,
             job: None,
+            xray: None,
             broker: None,
             elevated: false,
             secret: format!(
@@ -87,7 +89,21 @@ impl Core {
         c
     }
     pub fn validate(&self, s: &Settings) -> Result<PathBuf, String> {
+        let prepared=crate::xray_runtime::Prepared::new(s,&self.binary,&self.directory)?.cancellable(self.continue_running.clone());
+        prepared.validate()?;
+        self.validate_mapped(&prepared.settings)
+    }
+    fn validate_mapped(&self, s: &Settings) -> Result<PathBuf, String> {
         let yaml = config::generate(s, &self.secret)?;
+        let yaml=if s.servers().iter().any(|n|n["atlas-xray-bridge"]==true) {
+            let mut doc: Value=serde_yaml::from_str(&yaml).map_err(|e|e.to_string())?;
+            let path=self.binary.with_file_name("Atlas.Xray.exe");
+            let path=path.to_str().ok_or("Некорректный путь Xray")?;
+            if path.contains([',','\n','\r']) {return Err("Путь установки содержит неподдерживаемые символы для правила Xray".into());}
+            doc["rules"].as_array_mut().ok_or("Отсутствуют правила маршрутизации")?
+                .insert(0,json!(format!("PROCESS-PATH,{path},DIRECT")));
+            serde_yaml::to_string(&doc).map_err(|e|e.to_string())?
+        } else {yaml};
         let yaml = if self.ports != [17890, 19090, 11053] {
             let mut doc: Value = serde_yaml::from_str(&yaml).map_err(|e| e.to_string())?;
             doc["mixed-port"] = json!(self.ports[0]);
@@ -155,6 +171,7 @@ impl Core {
         self.broker.as_ref().is_some_and(|broker| broker.alive())
     }
     pub fn running(&mut self) -> bool {
+        if self.xray.as_mut().is_some_and(|runtime|!runtime.healthy()) {return false;}
         if let Some(broker) = &self.broker {
             if !broker.alive() {
                 let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
@@ -199,7 +216,9 @@ impl Core {
             std::net::TcpListener::bind(("127.0.0.1", port))
                 .map_err(|_| format!("Порт {port} занят другим приложением"))?;
         }
-        let path = self.validate(s)?;
+        let prepared=crate::xray_runtime::Prepared::new(s,&self.binary,&self.directory)?.cancellable(self.continue_running.clone());
+        let path=self.validate_mapped(&prepared.settings)?;
+        let xray=prepared.start_logged(self.logs.clone())?;
         self.child = Some(
             self.command()
                 .stdout(Stdio::piped())
@@ -211,6 +230,7 @@ impl Core {
                 .spawn()
                 .map_err(|_| "Не удалось запустить Mihomo")?,
         );
+        self.xray=Some(xray);
         self.logs.lock().map_err(|_| "Журнал недоступен")?.clear();
         let child = self.child.as_mut().unwrap();
         let mut outputs: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
@@ -353,10 +373,13 @@ impl Core {
             broker.call_cancellable("apply", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())?;
             return Ok(());
         }
-        let path = self.validate(s)?;
+        let prepared=crate::xray_runtime::Prepared::new(s,&self.binary,&self.directory)?.cancellable(self.continue_running.clone());
+        prepared.validate()?;
+        let path=self.validate_mapped(&prepared.settings)?;
         if !self.running() {
             return Ok(());
         }
+        let next_xray=prepared.start_logged(self.logs.clone())?;
         let old = self.directory.join("last-working.yaml");
         let previous = std::fs::read(&old).map_err(|e| format!("Не удалось сохранить конфигурацию для отката: {e}"))?;
         let selected = self.api("GET", "/proxies/ATLAS", None)?["now"]
@@ -402,6 +425,7 @@ impl Core {
             }
             return Err(e);
         }
+        self.xray=Some(next_xray);
         Ok(())
     }
     pub fn select(&self, name: &str) -> Result<(), String> {
@@ -420,6 +444,8 @@ impl Core {
     }
 
     fn stop_with_tun_observer(&mut self, tun_identity: impl Fn() -> Option<u64>) -> Result<(), String> {
+        if let Some(runtime)=self.xray.as_mut() {runtime.stop()?;}
+        self.xray=None;
         let had_privileged_core = self.elevated && self.child.is_some();
         let had_broker = self.broker.is_some();
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
@@ -522,6 +548,40 @@ fn controller_timeout(method: &str, path: &str, body: Option<&Value>) -> Duratio
 mod integration_tests {
     use super::*;
     use crate::model::{Route, Rule, RuleGroup, Subscription};
+    #[test]
+    fn real_xray_bridge_survives_selection_reload_and_stops_with_core() {
+        use std::io::{Read,Write};
+        let directory=std::env::temp_dir().join(format!("atlas-xray-chain-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
+        let mut core=Core::new(binary,directory.clone());core.use_ephemeral_ports().unwrap();
+        let mut settings=Settings::default();settings.mode="system".into();settings.selected="fixture".into();
+        settings.routing_mode=crate::model::RoutingMode::Global;
+        settings.subscriptions.push(Subscription {options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:vec![json!({"name":"fixture","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}})]});
+        core.start(&settings).unwrap();
+        let target=std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();target.set_nonblocking(true).unwrap();
+        let target_port=target.local_addr().unwrap().port();
+        let worker=thread::spawn(move || {
+            for _ in 0..2 {
+                let deadline=Instant::now()+Duration::from_secs(10);
+                let (mut stream,_)=loop {match target.accept() {Ok(v)=>break v,Err(_) if Instant::now()<deadline=>thread::sleep(Duration::from_millis(10)),Err(e)=>panic!("{e}")}};
+                stream.set_nonblocking(false).unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut data=[0;4096];let read=stream.read(&mut data).unwrap();assert!(read>0);
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\natlas").unwrap();
+            }
+        });
+        let client=reqwest::blocking::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{}",core.ports[0])).unwrap()).timeout(Duration::from_secs(5)).build().unwrap();
+        for reload in [false,true] {
+            if reload {core.apply(&settings).unwrap();}
+            core.select("fixture").unwrap();
+            let response=client.get(format!("http://127.0.0.1:{target_port}/")).send().unwrap().text().unwrap();
+            assert_eq!(response,"atlas");assert!(core.running());
+        }
+        core.stop().unwrap();assert!(core.xray.is_none());assert!(!core.running());
+        worker.join().unwrap();drop(core);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn privileged_stop_closes_tun_before_terminating_owned_process() {
         check_privileged_stop(Duration::from_secs(4));
@@ -640,7 +700,7 @@ mod integration_tests {
         core.use_ephemeral_ports().unwrap();
         let mut settings = Settings::default();
         settings.mode = "system".into();
-        settings.subscriptions.push(Subscription { id:"fixture".into(), name:"fixture".into(),
+        settings.subscriptions.push(Subscription { options: Default::default(), id:"fixture".into(), name:"fixture".into(),
             masked_url:String::new(), updated_at:0, error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})] });
         for cycle in 0..50 {
@@ -666,7 +726,7 @@ mod integration_tests {
         );
         let mut s = Settings::default();
         s.default_route = Route::Proxy;
-        s.subscriptions.push(Subscription {id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
+        s.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         for text in ["version: 1\ndefault-route: proxy\nrules: []", "version: 1\ndefault-route: proxy\nrules:\n - {domain-suffix: example.com, route: direct}\n - {ip-cidr: 192.0.2.0/24, route: block, no-resolve: true}"] {
             let import = crate::portable::parse(text).unwrap(); s.groups = import.groups;
             for stack in [crate::model::TunStack::Gvisor, crate::model::TunStack::Mixed] {
@@ -688,7 +748,7 @@ mod integration_tests {
         let mut settings = Settings::default();
         settings.mode = "system".into();
         // Isolated fixture. No real subscription, credentials or OS proxy changes.
-        settings.subscriptions.push(Subscription {id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
+        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         let mut tun_candidate = settings.clone();
         tun_candidate.mode = "tun".into();
         core.validate(&tun_candidate)

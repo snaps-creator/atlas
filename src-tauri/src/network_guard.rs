@@ -58,7 +58,7 @@ impl Drop for Engine {
     }
 }
 unsafe fn erase(engine: HANDLE, sublayer: &GUID, filter_base: u128) -> Result<(), String> {
-    for i in 0..(10 + crate::lan_policy::PREFIXES.len() as u128) {
+    for i in 0..(12 + crate::lan_policy::PREFIXES.len() as u128) {
         let r = FwpmFilterDeleteByKey0(engine, &GUID::from_u128(filter_base + i));
         if r != 0 && r != 0x80320003 {
             return Err(format!("Не удалось удалить фильтр Атласа: {r:#x}"));
@@ -222,6 +222,12 @@ impl Guard {
                 FwpmGetAppIdFromFileName0(wide(&core.to_string_lossy()).as_ptr(), &mut app_id),
                 "идентификатор ядра",
             )?;
+            let mut xray_app_id=ptr::null_mut();
+            let xray_path=core.with_file_name("Atlas.Xray.exe");
+            if xray_path.is_file() {
+                let code=FwpmGetAppIdFromFileName0(wide(&xray_path.to_string_lossy()).as_ptr(),&mut xray_app_id);
+                if code!=0 {FwpmFreeMemory0(&mut app_id as *mut _ as *mut _);return Err(format!("Идентификатор Xray: {code}"));}
+            }
             let outcome = (|| {
                 checked(FwpmTransactionBegin0(e.0, 0), "транзакция")?;
                 erase(e.0, &SESSION_SUBLAYER, SESSION_FILTER_BASE)?;
@@ -238,6 +244,14 @@ impl Guard {
                 .into_iter()
                 .enumerate()
                 {
+                    if !xray_app_id.is_null() {
+                        let mut condition: FWPM_FILTER_CONDITION0=std::mem::zeroed();
+                        condition.fieldKey=FWPM_CONDITION_ALE_APP_ID;
+                        condition.matchType=FWP_MATCH_EQUAL;
+                        condition.conditionValue.r#type=FWP_BYTE_BLOB_TYPE;
+                        condition.conditionValue.Anonymous.byteBlob=xray_app_id;
+                        permit(e.0,(10+crate::lan_policy::PREFIXES.len()+family) as u128,layer,name.as_mut_ptr(),&mut [condition])?;
+                    }
                     for kind in 0..4 {
                         if kind == 2 && !tun_ready {
                             continue;
@@ -335,6 +349,7 @@ impl Guard {
                 FwpmTransactionAbort0(e.0);
             }
             FwpmFreeMemory0(&mut app_id as *mut _ as *mut _);
+            if !xray_app_id.is_null() {FwpmFreeMemory0(&mut xray_app_id as *mut _ as *mut _);}
             if outcome.is_ok() && tun_ready {
                 *self.owned_tun.lock().map_err(|_| "Не удалось записать идентификатор TUN")? = tun_instance;
             }

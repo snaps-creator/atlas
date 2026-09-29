@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 /// Compare only generated network settings, ignoring the selector's initial order.
 /// UI preferences must never cause TUN reconfiguration.
 pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
+    if previous.servers()!=next.servers() {return false;}
     if previous.auto_test_interval_seconds != next.auto_test_interval_seconds { return false; }
     if previous.auto_search_ping_ms != next.auto_search_ping_ms { return false; }
     let mut comparison = next.clone();
@@ -21,7 +22,14 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     {
         return Err("Интервал проверки серверов должен быть от 30 секунд до 60 минут".into());
     }
-    let proxies = s.servers();
+    let mut proxies = s.servers();
+    let xray=proxies.iter().any(|n|n["type"]=="xray" || n["atlas-xray-bridge"]==true);
+    // Shape-only validation. Runtime preparation supplies actual authenticated
+    // loopback endpoints before any generated configuration can be launched.
+    for node in &mut proxies {
+        if node["type"]=="xray" {*node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":9});}
+        if let Some(object)=node.as_object_mut() {object.remove("atlas-xray-bridge");}
+    }
     if proxies.is_empty() {
         return Err("Сначала добавьте подписку с серверами".into());
     }
@@ -61,6 +69,14 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     selection.retain(|n| seen.insert(n.clone()));
     let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"select","proxies":names},{"name":"FAILOVER","type":"select","proxies":names}],"rules":rules::compile(s)?});
     doc["mode"] = json!(s.routing_mode);
+    // Global mode would bypass PROCESS-PATH rules and feed Xray's outbound
+    // back into its own SOCKS inbound. Preserve Global/Direct semantics with
+    // explicit MATCH rules while allowing the owned Xray path to dial directly.
+    if xray {
+        doc["mode"]=json!("rule");
+        if s.routing_mode==RoutingMode::Global {doc["rules"]=json!(["MATCH,ATLAS"]);}
+        if s.routing_mode==RoutingMode::Direct {doc["rules"]=json!(["MATCH,DIRECT"]);}
+    }
     // Never invent an IPv4 address for Windows IPv6 connectivity probes.
     // Return real DNS answers (including NODATA); keep routing/IPv6 policy intact.
     doc["dns"]["fake-ip-filter-mode"] = json!("blacklist");
@@ -143,7 +159,7 @@ mod tests {
     fn generated_dns_and_route() {
         let mut s = Settings::default();
         s.mode = "system".into();
-        s.subscriptions.push(Subscription{id:"a".into(),name:"test".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"test","type":"ss","server":"127.0.0.1","port":443,"cipher":"aes-128-gcm","password":"test"})]});
+        s.subscriptions.push(Subscription { options: Default::default(),id:"a".into(),name:"test".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"test","type":"ss","server":"127.0.0.1","port":443,"cipher":"aes-128-gcm","password":"test"})]});
         let mut ui = s.clone();
         ui.theme = "light".into();
         ui.selected = "test".into();

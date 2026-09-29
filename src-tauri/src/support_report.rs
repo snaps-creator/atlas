@@ -213,6 +213,16 @@ pub(crate) fn configuration_evidence(settings: &crate::model::Settings) -> Value
                 "client-fingerprint", "servername", "sni", "alpn", "packet-encoding", "interface-name", "dialer-proxy", "ip-version"] {
                 if let Some(value) = node.get(field) { safe.insert(field.into(), value.clone()); }
             }
+            if node["type"]=="xray" {
+                let outbounds: Vec<_>=node["xray"]["outbounds"].as_array().into_iter().flatten().map(|outbound| {
+                    let stream=&outbound["streamSettings"];
+                    serde_json::json!({"protocol":outbound["protocol"],"network":stream["network"],"security":stream["security"],
+                        "fingerprint":stream["tlsSettings"]["fingerprint"].as_str().or_else(||stream["realitySettings"]["fingerprint"].as_str()),
+                        "fragment":outbound["settings"]["fragment"],"noisesConfigured":outbound["settings"].get("noises").is_some(),
+                        "finalMaskConfigured":stream.get("finalmask").is_some()})
+                }).collect();
+                safe.insert("xrayOutbounds".into(),serde_json::json!(outbounds));
+            }
             Value::Object(safe)
         }).collect();
         serde_json::json!({"name":sub.name,"updatedAt":sub.updated_at,"nodes":nodes})
@@ -234,9 +244,11 @@ pub(crate) fn collect_secrets(value: &Value, result: &mut Vec<String>) {
                     "secret",
                     "key",
                     "authorization",
+                    "fallbackurl",
+                    "effectiveurl",
                 ]
                 .iter()
-                .any(|k| key.contains(k))
+                .any(|k| key.contains(k)) || key=="id" || key=="pass" || key=="shortid"
                 {
                     if let Some(s) = value.as_str().filter(|s| !s.is_empty()) {
                         result.push(s.to_owned());
@@ -509,7 +521,7 @@ mod tests {
     #[test]
     fn endpoint_comparison_omits_credentials_and_subscription_urls() {
         let mut s = crate::model::Settings::default();
-        s.subscriptions.push(crate::model::Subscription { id:"id".into(), name:"office".into(),
+        s.subscriptions.push(crate::model::Subscription { options: Default::default(), id:"id".into(), name:"office".into(),
             masked_url:"https://private-subscription".into(), updated_at:123, error:None,
             servers:vec![serde_json::json!({"name":"node","type":"vless","server":"192.0.2.1","port":443,
                 "uuid":"private-uuid","password":"private-pass","reality-opts":{"public-key":"private-key"}})] });

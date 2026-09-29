@@ -19,9 +19,13 @@ pub fn mask(s: &str) -> String {
         .unwrap_or_else(|| "********".into())
 }
 pub fn parse(text: &str) -> Result<Vec<Value>, String> {
+    parse_options(text,&Default::default())
+}
+fn parse_options(text: &str, options: &crate::subscription_options::Options) -> Result<Vec<Value>,String> {
     if text.len() > 8 * 1024 * 1024 {
         return Err("Подписка превышает 8 МБ".into());
     }
+    if let Some(nodes)=crate::xray_config::import_json(text)? {return validate(nodes);}
     if let Ok(doc) = serde_yaml::from_str::<Value>(text) {
         if let Some(proxies) = doc.get("proxies").and_then(Value::as_array) {
             return validate(proxies.clone());
@@ -33,8 +37,16 @@ pub fn parse(text: &str) -> Result<Vec<Value>, String> {
     } else {
         decoded = text.to_owned()
     }
+    if let Some(nodes)=crate::xray_config::import_json(&decoded)? {return validate(nodes);}
     let mut nodes = vec![];
     for line in decoded.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.starts_with("vless://") || line.starts_with("trojan://") {
+            let line=crate::xray_config::with_provider_fragment(line,options)?;
+            if let Some(mut node)=crate::xray_config::uri(&line)? {
+                crate::xray_config::apply_provider_noises(&mut node,options)?;
+                nodes.push(node);continue;
+            }
+        }
         if let Some(raw) = line.strip_prefix("vmess://") {
             let v: Value =
                 serde_json::from_str(&decode(raw)?).map_err(|_| "Некорректный VMess URI")?;
@@ -169,15 +181,29 @@ fn validate(nodes: Vec<Value>) -> Result<Vec<Value>, String> {
     }
     Ok(nodes)
 }
-pub fn download(raw: &str, connected: bool) -> Result<Vec<Value>, String> {
-    let u = url::Url::parse(raw).map_err(|_| "Некорректный URL подписки")?;
-    if u.scheme() != "https"
-        || u.host_str().is_none()
-        || !u.username().is_empty()
-        || u.password().is_some()
-    {
-        return Err("Подписка должна использовать HTTPS без userinfo".into());
+pub struct Downloaded {
+    pub nodes: Vec<Value>,
+    pub options: crate::subscription_options::Options,
+}
+pub fn download(raw: &str, connected: bool, options: &crate::subscription_options::Options) -> Result<Downloaded, String> {
+    download_with(raw, options, |url| download_one(url, connected, options))
+}
+fn download_with(raw: &str, options: &crate::subscription_options::Options,
+    mut fetch: impl FnMut(&str) -> Result<Downloaded, String>) -> Result<Downloaded, String> {
+    let primary=options.effective_url.as_deref().unwrap_or(raw);
+    match fetch(primary) {
+        Ok(result)=>Ok(result),
+        Err(primary_error)=> {
+            if let Some(fallback)=options.fallback_url.as_deref().filter(|u|*u!=primary) {
+                fetch(fallback).map_err(|fallback_error|
+                    format!("Основной адрес: {primary_error}; резервный адрес: {fallback_error}"))
+            } else { Err(primary_error) }
+        }
     }
+}
+fn download_one(raw: &str, connected: bool, options: &crate::subscription_options::Options) -> Result<Downloaded, String> {
+    crate::subscription_options::validate_agent(options.effective_user_agent())?;
+    let u = crate::subscription_options::https_url(raw)?;
     let mut builder = reqwest::blocking::Client::builder().no_proxy();
     if connected {
         builder = builder.proxy(
@@ -186,13 +212,13 @@ pub fn download(raw: &str, connected: bool) -> Result<Vec<Value>, String> {
         );
     }
     let client = builder
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(if options.fallback_url.is_some() { 9 } else { 30 }))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "Ошибка HTTPS клиента")?;
     let mut response = client
         .get(u)
-        .header("User-Agent", concat!("Atlas/",env!("CARGO_PKG_VERSION")," mihomo"))
+        .header("User-Agent", options.effective_user_agent())
         .send()
         .map_err(|e| {
             let mut chain=e.to_string();
@@ -208,16 +234,78 @@ pub fn download(raw: &str, connected: bool) -> Result<Vec<Value>, String> {
         ));
     }
     use std::io::Read;
+    let headers=response.headers().iter().filter_map(|(k,v)|v.to_str().ok().map(|v|(k.as_str().to_owned(),v.to_owned()))).collect();
     let mut body = String::new();
     (&mut response)
         .take(8 * 1024 * 1024 + 1)
         .read_to_string(&mut body)
         .map_err(|_| "Не удалось прочитать подписку")?;
-    parse(&body)
+    if body.len()>8*1024*1024 { return Err("Подписка превышает 8 МБ".into()); }
+    parse_response(&body, &headers, options, raw)
+}
+fn parse_response(body: &str, headers: &std::collections::BTreeMap<String,String>,
+    options: &crate::subscription_options::Options, source: &str) -> Result<Downloaded,String> {
+    // Remove outer directives before decoding: a fallback URL in a comment
+    // must not cause a Base64 payload to be treated as plaintext proxy URIs.
+    let (body,options)=crate::subscription_options::extract(body,headers,options,source)?;
+    let (body,options)=if !body.contains("://") && crate::xray_config::import_json(&body)?.is_none()
+        && serde_yaml::from_str::<Value>(&body).ok().and_then(|v|v.get("proxies").cloned()).is_none() {
+        let decoded=decode(&body.split_whitespace().collect::<String>())?;
+        crate::subscription_options::extract(&decoded,headers,&options,source)?
+    } else { (body,options) };
+    Ok(Downloaded {nodes:parse_options(&body,&options)?,options})
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn response_accepts_metadata_outside_and_inside_base64() {
+        let uri="trojan://test@example.com:443#Test";
+        let headers=std::collections::BTreeMap::from([("change-user-agent".into(),"Header/1".into())]);
+        for body in [
+            format!("#providerid: vendor\n#fallback-url: https://backup.example/key\n{}",STANDARD.encode(uri)),
+            STANDARD.encode(format!("#providerid: vendor\n#fallback-url: https://backup.example/key\n#change-user-agent: Body/1\n{uri}")),
+        ] {
+            let result=parse_response(&body,&headers,&Default::default(),"https://a.example/key").unwrap();
+            assert_eq!(result.nodes.len(),1);
+            assert_eq!(result.options.fallback_url.as_deref(),Some("https://backup.example/key"));
+            assert_eq!(result.options.effective_user_agent(),"Header/1");
+        }
+    }
+    #[test]
+    fn migrated_primary_uses_fallback_only_after_failure() {
+        let options = crate::subscription_options::Options {
+            effective_url: Some("https://new.example/key".into()),
+            fallback_url: Some("https://backup.example/key".into()),
+            ..Default::default()
+        };
+        let mut requested = Vec::new();
+        let result = download_with("https://old.example/key", &options, |url| {
+            requested.push(url.to_owned());
+            if requested.len() == 1 { return Err("HTTP 503".into()); }
+            Ok(Downloaded { nodes: vec![json!({"name":"backup"})], options: options.clone() })
+        }).unwrap();
+        assert_eq!(requested, ["https://new.example/key", "https://backup.example/key"]);
+        assert_eq!(result.nodes[0]["name"], "backup");
+        requested.clear();
+        download_with("https://old.example/key", &options, |url| {
+            requested.push(url.to_owned());
+            Ok(Downloaded { nodes: vec![], options: options.clone() })
+        }).unwrap();
+        assert_eq!(requested, ["https://new.example/key"]);
+    }
+    #[test]
+    fn fallback_does_not_loop_back_to_primary() {
+        let options = crate::subscription_options::Options {
+            fallback_url: Some("https://a.example/key".into()), ..Default::default()
+        };
+        let mut calls = 0;
+        let result = download_with("https://a.example/key", &options, |_| {
+            calls += 1; Err("timeout".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
     #[test]
     fn url_secret_never_displayed() {
         assert_eq!(
@@ -241,34 +329,35 @@ mod tests {
     #[test]
     fn tls_uri_preserves_fingerprint_and_alpn_outside_reality() {
         let nodes = parse("vless://00000000-0000-0000-0000-000000000001@example.com:443?security=tls&type=ws&fp=firefox&alpn=h2%2Chttp%2F1.1&sni=tls.example&host=ws.example&path=%2Fsocket#TLS").unwrap();
-        let node = &nodes[0];
-        assert_eq!(node["client-fingerprint"], "firefox");
-        assert_eq!(node["alpn"], json!(["h2","http/1.1"]));
-        assert_eq!(node["servername"], "tls.example");
-        assert_eq!(node["ws-opts"]["path"], "/socket");
-        assert_eq!(node["ws-opts"]["headers"]["Host"], "ws.example");
-        assert!(node.get("skip-cert-verify").is_none());
+        let stream = &nodes[0]["xray"]["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["tlsSettings"]["fingerprint"], "firefox");
+        assert_eq!(stream["tlsSettings"]["alpn"], json!(["h2","http/1.1"]));
+        assert_eq!(stream["tlsSettings"]["serverName"], "tls.example");
+        assert_eq!(stream["wsSettings"]["path"], "/socket");
+        assert_eq!(stream["wsSettings"]["headers"]["Host"], "ws.example");
+        assert!(stream["tlsSettings"].get("allowInsecure").is_none());
         let plain = parse("vless://id@example.com:443?security=none&fp=firefox&alpn=h2#plain").unwrap();
-        assert!(plain[0].get("client-fingerprint").is_none());
-        assert!(plain[0].get("alpn").is_none());
+        assert!(plain[0]["xray"]["outbounds"][0]["streamSettings"].get("tlsSettings").is_none());
     }
 }
 
 /// A delayed refresh must not overwrite a newer manual refresh or restore a deleted subscription.
 pub(crate) fn refresh_is_current(before: Option<&crate::model::Subscription>, current: Option<&crate::model::Subscription>) -> bool {
-    matches!((before,current),(Some(a),Some(b)) if a.id==b.id && a.updated_at==b.updated_at && a.servers==b.servers)
+    matches!((before,current),(Some(a),Some(b)) if a.id==b.id && a.updated_at==b.updated_at && a.servers==b.servers && a.options==b.options)
 }
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
     #[test]
     fn stale_or_deleted_subscription_is_never_overwritten() {
-        let a=crate::model::Subscription{id:"a".into(),name:"A".into(),masked_url:String::new(),updated_at:10,error:None,servers:vec![json!({"server":"old"})]};
+        let a=crate::model::Subscription { options: Default::default(),id:"a".into(),name:"A".into(),masked_url:String::new(),updated_at:10,error:None,servers:vec![json!({"server":"old"})]};
         assert!(refresh_is_current(Some(&a),Some(&a)));
         assert!(!refresh_is_current(Some(&a),None));
         let mut b=a.clone(); b.updated_at=11;
         assert!(!refresh_is_current(Some(&a),Some(&b)));
-        b.updated_at=10; b.servers=vec![json!({"server":"new"})];
+        b.updated_at=10; b.options.user_agent=Some("changed".into());
+        assert!(!refresh_is_current(Some(&a),Some(&b)));
+        b.options=a.options.clone(); b.servers=vec![json!({"server":"new"})];
         assert!(!refresh_is_current(Some(&a),Some(&b)));
     }
 }

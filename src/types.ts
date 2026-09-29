@@ -10,6 +10,7 @@ export type Group = {
 };
 export type Server = { name: string; type: string; country?: string | null; probeId: string };
 export type Subscription = {
+  options?: { userAgent: string | null; userAgentOverride: string | null; updateIntervalHours: number | null };
   id: string;
   name: string;
   maskedUrl: string;

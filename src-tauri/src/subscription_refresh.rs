@@ -14,11 +14,11 @@ impl Lease {
 }
 impl Drop for Lease { fn drop(&mut self) { busy().lock().unwrap_or_else(|e|e.into_inner()).remove(&self.0); } }
 
-fn reason(startup: bool, updated: u64, last_attempt: Option<u64>, now: u64, failed: bool) -> Option<&'static str> {
+fn reason(startup: bool, updated: u64, last_attempt: Option<u64>, now: u64, failed: bool, interval_seconds: u64) -> Option<&'static str> {
     if startup && last_attempt.is_none() { return Some("startup"); }
     if last_attempt.is_some_and(|at|now.saturating_sub(at)<120) { return None; }
     if failed { return Some("recovery"); }
-    (now.saturating_sub(updated)>=1800).then_some("periodic")
+    (now.saturating_sub(updated)>=interval_seconds).then_some("periodic")
 }
 fn failed_nodes(lines: &[String], now: u64) -> HashSet<String> {
     let mut failures = HashMap::new();
@@ -64,7 +64,7 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                 if in_flight.len()>=2 { break; }
                 let failed = sub.servers.iter().any(|n|n["name"].as_str().is_some_and(|n|failed.contains(n)))
                     || (snapshot.status=="Error" && shared.try_lock().is_ok_and(|a|a.reconnect.load(Ordering::SeqCst)));
-                let Some(trigger)=reason(outstanding.contains(&sub.id),sub.updated_at,attempts.get(&sub.id).copied(),now,failed) else { continue; };
+                let Some(trigger)=reason(outstanding.contains(&sub.id),sub.updated_at,attempts.get(&sub.id).copied(),now,failed,sub.options.refresh_interval_seconds()) else { continue; };
                 let Some(lease)=Lease::take(&sub.id) else { continue; };
                 let id=sub.id.clone(); attempts.insert(id.clone(),now); in_flight.insert(id.clone());
                 let (shared,reads,stop,tx)=(shared.clone(),reads.clone(),stop.clone(),tx.clone());
@@ -75,7 +75,9 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                         let before=reads.get()?;
                         let url=keyring::Entry::new("AtlasVPN",&id).map_err(|_|"Хранилище Windows недоступно")?
                             .get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")?;
-                        let nodes=subscriptions::download(&url,before.status=="Connected")?;
+                        let options=before.settings.subscriptions.iter().find(|s|s.id==id)
+                            .map(|s|s.options.clone()).unwrap_or_default();
+                        let nodes=subscriptions::download(&url,before.status=="Connected",&options)?;
                         let mut a=shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
                         if stop.load(Ordering::SeqCst) { return Err("Atlas завершает работу".into()); }
                         if !subscriptions::refresh_is_current(before.settings.subscriptions.iter().find(|s|s.id==id),a.settings.subscriptions.iter().find(|s|s.id==id)) {
@@ -108,11 +110,14 @@ mod tests {
     use super::*;
     #[test]
     fn independent_schedules_retry_without_reloading_healthy_subscriptions() {
-        assert_eq!(reason(true,100,None,101,false),Some("startup"));
-        assert_eq!(reason(false,100,Some(100),180,true),None);
-        assert_eq!(reason(false,100,Some(100),220,true),Some("recovery"));
-        assert_eq!(reason(false,100,Some(100),220,false),None);
-        assert_eq!(reason(false,100,Some(100),1900,false),Some("periodic"));
+        assert_eq!(reason(true,100,None,101,false,1800),Some("startup"));
+        assert_eq!(reason(false,100,Some(100),180,true,1800),None);
+        assert_eq!(reason(false,100,Some(100),220,true,1800),Some("recovery"));
+        assert_eq!(reason(false,100,Some(100),220,false,1800),None);
+        assert_eq!(reason(false,100,Some(100),1900,false,1800),Some("periodic"));
+        assert_eq!(reason(false,100,Some(100),1900,false,7200),None);
+        assert_eq!(reason(false,100,Some(100),7300,false,7200),Some("periodic"));
+        assert_eq!(reason(false,100,Some(100),220,true,7200),Some("recovery"));
         let a=Lease::take("test-A").unwrap();
         assert!(Lease::take("test-A").is_none());
         let b=Lease::take("test-B").unwrap(); drop(a);

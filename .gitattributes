@@ -1,2 +1,4 @@
 Install[[:space:]]Atlas.exe binary -filter
 installer/atlas-setup.part* binary -filter
+src-tauri/resources/Atlas.Xray.exe binary -filter
+src-tauri/resources/xray-assets/*.dat binary -filter
