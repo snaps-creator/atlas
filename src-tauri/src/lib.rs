@@ -9,6 +9,7 @@ mod country;
 #[path = "network_diagnostics.rs"]
 mod diagnostics;
 mod job;
+pub use job::DesktopJob;
 mod lan_policy;
 mod latency;
 mod resilient_selection;
@@ -573,11 +574,15 @@ fn cleanup_network_session(
         result
     };
     let mut core = core;
+    let core_had_broker = core.as_deref().is_some_and(|c| c.has_broker());
     let owned_core = stage("core", &mut || core.as_deref_mut().map(|c|c.stop()).unwrap_or(Ok(())));
-    let service = stage("service", &mut || service::stop_and_wait());
+    // Core::stop already waits for its attached on-demand service. Avoid a
+    // second full service timeout; still stop any service without an attached broker.
+    let service = if core_had_broker { Ok(()) }
+        else { stage("service", &mut || service::stop_and_wait_timeout(std::time::Duration::from_secs(1))) };
     let proxy = stage("proxy_restore", &mut || windows::restore(&directory.join("proxy-restore.json")));
     let legacy = stage("legacy_filters", &mut || if clear_legacy_filters { network_guard::clear() } else { Ok(()) });
-    let tun = stage("tun_release", &mut || network_guard::wait_for_tun_release(std::time::Duration::from_secs(10)));
+    let tun = stage("tun_release", &mut || network_guard::wait_for_tun_release(std::time::Duration::from_secs(1)));
     let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
     let errors: Vec<_> = [owned_core, service, proxy, legacy, tun].into_iter()
         .filter_map(Result::err).collect();
@@ -1123,6 +1128,16 @@ pub fn run() {
                         if action == "quit" {
                             let shutdown = app.state::<ShuttingDown>().inner().clone();
                             if shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+                            let shutdown_deadline = shutdown.clone();
+                            std::thread::spawn(move || {
+                                // Reserve the remainder of the five-second budget
+                                // for the independent service/route cleanup observer.
+                                std::thread::sleep(std::time::Duration::from_millis(2500));
+                                if shutdown_deadline.load(std::sync::atomic::Ordering::SeqCst) {
+                                    // Exit must not leave a hidden GUI process if cleanup stalls.
+                                    std::process::exit(0);
+                                }
+                            });
                             app.state::<ConnectionIntent>().0.store(false, std::sync::atomic::Ordering::SeqCst);
                             app.state::<cancellation::Cancellation>().cancel();
                             tauri::async_runtime::spawn_blocking(move || {
@@ -1136,12 +1151,14 @@ pub fn run() {
                                 match result {
                                     Ok(()) => handle.exit(0),
                                     Err(error) => {
-                                        shutdown.store(false, std::sync::atomic::Ordering::SeqCst);
-                                        if let Some(window) = handle.get_webview_window("main") {
-                                            let _ = window.show();
-                                            let _ = window.set_focus();
+                                        incident_history::record("quit_cleanup_failed", json!({"error":error}), &[]);
+                                        let directory = handle.path().app_local_data_dir().ok();
+                                        if let Some(directory) = directory {
+                                            let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
                                         }
-                                        let _ = handle.emit("cleanup-failed", error);
+                                        // Exit means exit. The system-service observer owns
+                                        // bounded cleanup if graceful shutdown could not finish.
+                                        handle.exit(1);
                                     }
                                 }
                             });
@@ -1258,8 +1275,8 @@ pub fn network_service() -> Result<(), String> {
     service::run()
 }
 
-pub fn watch_network_session(pid: u32, directory: &std::path::Path) -> Result<(), String> {
-    session_cleanup::run(pid, directory)
+pub fn watch_network_session(pid: u32, desktop_pid: u32, directory: &std::path::Path) -> Result<(), String> {
+    session_cleanup::run(pid, desktop_pid, directory)
 }
 
 /// Exercises the installed service handshake without starting a network core.

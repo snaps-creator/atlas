@@ -209,10 +209,31 @@ impl Prepared {
 impl Runtime {
     pub fn healthy(&mut self) -> bool {self.processes.iter_mut().all(|p|matches!(p.child.try_wait(),Ok(None)))}
     pub fn stop(&mut self) -> Result<(),String> {
-        for process in &mut self.processes {drop(process.job.take());let _=process.child.kill();}
         let mut errors=Vec::new();
+        // Release every Job Object up front so all owned Xray workers terminate
+        // together; one shared deadline prevents N workers multiplying Exit time.
         for process in &mut self.processes {
-            if let Err(error)=crate::process_stop::stop(&mut process.child,||{},Duration::from_secs(5)) {errors.push(error);}
+            drop(process.job.take());
+            if let Err(error)=process.child.kill() {
+                if !matches!(process.child.try_wait(),Ok(Some(_))) { errors.push(error.to_string()); }
+            }
+        }
+        let deadline=Instant::now()+Duration::from_secs(1);
+        loop {
+            let mut pending=false;
+            for process in &mut self.processes {
+                match process.child.try_wait() {
+                    Ok(Some(_))=>{},
+                    Ok(None)=>pending=true,
+                    Err(error)=>errors.push(error.to_string()),
+                }
+            }
+            if !pending { break; }
+            if Instant::now()>=deadline {
+                errors.push("истёк общий срок ожидания выхода процессов Xray".into());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         if errors.is_empty() {Ok(())} else {Err(format!("Не подтверждена остановка Xray: {}",errors.join("; ")))}
     }

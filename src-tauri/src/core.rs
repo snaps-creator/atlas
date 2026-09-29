@@ -25,6 +25,9 @@ pub struct Core {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl Core {
+    pub(crate) fn has_broker(&self) -> bool {
+        self.broker.is_some()
+    }
     pub fn new(binary: PathBuf, directory: PathBuf) -> Self {
         Self {
             continue_running: None,
@@ -134,10 +137,17 @@ impl Core {
             .arg(&path)
             .spawn()
             .map_err(|_| "Не удалось запустить Mihomo; проверьте наличие ядра")?;
+        let job = match crate::job::Job::attach(&c) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = crate::process_stop::stop(&mut c, || {}, Duration::from_secs(1));
+                return Err(error);
+            }
+        };
         let start = Instant::now();
         loop {
             if self.cancelled() {
-                crate::process_stop::stop(&mut c, || {}, Duration::from_secs(2))?;
+                crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(1))?;
                 return Err("Подключение отменено".into());
             }
             if let Some(status) = c.try_wait().map_err(|e| e.to_string())? {
@@ -147,7 +157,7 @@ impl Core {
                 return Err("Mihomo отклонил конфигурацию. Проверьте параметры серверов и DNS; предыдущая версия сохранена.".into());
             }
             if start.elapsed() > Duration::from_secs(20) {
-                crate::process_stop::stop(&mut c, || {}, Duration::from_secs(2))?;
+                crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(1))?;
                 return Err("Проверка конфигурации Mihomo превысила 20 секунд".into());
             }
             thread::sleep(Duration::from_millis(50));
@@ -460,24 +470,26 @@ impl Core {
     }
 
     fn stop_with_tun_observer(&mut self, tun_identity: impl Fn() -> Option<u64>) -> Result<(), String> {
-        if let Some(runtime)=self.xray.as_mut() {runtime.stop()?;}
+        // An Xray error must never skip termination of Mihomo or the service.
+        let xray_result = self.xray.as_mut().map(|runtime| runtime.stop()).unwrap_or(Ok(()));
         self.xray=None;
         let had_privileged_core = self.elevated && self.child.is_some();
         let had_broker = self.broker.is_some();
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
             self.broker = None;
         }
-        let mut result = Ok(());
+        let mut result = xray_result;
         if let Some(broker) = self.broker.take() {
-            result = broker.call("stop", Value::Null).map(|evidence| {
+            let broker_result = broker.call("stop", Value::Null).map(|evidence| {
                 crate::incident_history::record("service_shutdown_completed", evidence, &[]);
             });
+            result = result.and(broker_result);
             let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         }
         if had_broker {
             // Disconnect and Exit both require the on-demand service to be
             // STOPPED. A live controller must not outlast the desktop.
-            let stopped = crate::service::stop_and_wait();
+            let stopped = crate::service::stop_and_wait_timeout(Duration::from_secs(1));
             result = match (result, stopped) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(a), Ok(())) | (Ok(()), Err(a)) => Err(a),
@@ -485,28 +497,23 @@ impl Core {
             };
         }
         if self.elevated && self.child.is_some() {
-            // PATCH returns only after the core's synchronous TUN Close path.
-            // Do not interrupt driver/route cleanup with the ordinary read
-            // timeout. Keep the owner alive while Windows releases the adapter.
-            let deadline = Instant::now() + Duration::from_secs(20);
+            // Give the core a short chance to release TUN cleanly. A lost
+            // desktop skips controller I/O; the owning job remains the hard stop.
+            let deadline = Instant::now() + Duration::from_millis(500);
             let started = Instant::now();
             let initial_tun = tun_identity();
             let pid = self.child.as_ref().map(|c|c.id());
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_started",
                 "pid":pid,"tunLuid":initial_tun}));
-            // Explicit exit ends tracked streams before closing the network
-            // stack. Do not wait for their remote peers' normal I/O timeouts.
-            let drained = self.api("DELETE", "/connections", None);
-            self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_connections_closed",
-                "elapsedMs":started.elapsed().as_millis(),"error":drained.err()}));
-            let closed = self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}})));
+            let closed = if self.cancelled() { Ok(Value::Null) }
+                else { self.api("PATCH", "/configs", Some(json!({"tun":{"enable":false}}))) };
             let close_ms = started.elapsed().as_millis();
-            while tun_identity().is_some() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
+            while !self.cancelled() && tun_identity().is_some() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
             }
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_cleanup",
                 "pid":pid,"initialTunLuid":initial_tun,"remainingTunLuid":tun_identity(),
-                "closeMs":close_ms,"elapsedMs":started.elapsed().as_millis(),
+                "closeMs":close_ms,"elapsedMs":started.elapsed().as_millis(),"ownerCancelled":self.cancelled(),
                 "closeError":closed.err(),"tunRemainingBeforeTermination":tun_identity().is_some()}));
         }
         if let Some(mut c) = self.child.take() {
@@ -514,7 +521,7 @@ impl Core {
             // Windows may finish pending socket I/O after accepting termination.
             // This is a maximum wait on the process handle, not a fixed delay;
             // a normally exited process returns immediately.
-            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(5)) {
+            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(1)) {
                 self.child = Some(c);
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 return Err(error);
@@ -525,7 +532,7 @@ impl Core {
         self.job = None;
         let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         if had_privileged_core {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(1);
             while tun_identity().is_some() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(50));
             }
@@ -543,7 +550,7 @@ impl Drop for Core {
         // The service observes IPC loss and releases its dynamic WFP session.
         if let Some(mut child) = self.child.take() {
             let job = self.job.take();
-            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(5)) {
+            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(1)) {
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 eprintln!("{error}");
             }
@@ -556,7 +563,7 @@ impl Drop for Core {
 fn controller_timeout(method: &str, path: &str, body: Option<&Value>) -> Duration {
     Duration::from_secs(if method == "PATCH" && path == "/configs"
         && body.is_some_and(|value| value["tun"]["enable"] == false) {
-        15
+        1
     } else if path.contains("/delay?") { 12 } else { 3 })
 }
 
@@ -600,13 +607,17 @@ mod integration_tests {
     }
     #[test]
     fn privileged_stop_closes_tun_before_terminating_owned_process() {
-        check_privileged_stop(Duration::from_secs(4));
+        check_privileged_stop(Duration::from_millis(700), true);
     }
     #[test]
     fn healthy_shutdown_does_not_wait_for_grace_period_deadlines() {
-        check_privileged_stop(Duration::ZERO);
+        check_privileged_stop(Duration::ZERO, true);
     }
-    fn check_privileged_stop(close_delay: Duration) {
+    #[test]
+    fn stuck_tun_does_not_hold_shutdown_for_the_old_twenty_second_grace_period() {
+        check_privileged_stop(Duration::ZERO, false);
+    }
+    fn check_privileged_stop(close_delay: Duration, release_tun: bool) {
         use std::io::{Read, Write};
         use std::os::windows::io::AsRawHandle;
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -635,15 +646,6 @@ mod integration_tests {
         let worker = thread::spawn(move || {
             let (mut socket, _) = api.accept().unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let mut request = [0;4096];
-            let size = socket.read(&mut request).unwrap();
-            assert!(request[..size].starts_with(b"DELETE /connections "));
-            socket.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
-            drop(socket);
-            let (mut socket, _) = api.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
             let mut request = Vec::new();
             let mut part = [0; 1024];
             while !request.ends_with(b"}}") {
@@ -654,8 +656,8 @@ mod integration_tests {
             }
             assert!(request.starts_with(b"PATCH /configs "));
             assert!(String::from_utf8_lossy(&request).contains("\"tun\":{\"enable\":false}"));
-            // Exceed the former three-second API timeout: the owner must stay
-            // alive throughout a slow Close, including deferred adapter release.
+            // Keep Close inside its one-second bound and verify the owner stays
+            // alive until the synchronous TUN release reply arrives.
             thread::sleep(close_delay);
             assert_eq!(
                 unsafe {
@@ -663,29 +665,33 @@ mod integration_tests {
                 },
                 windows_sys::Win32::Foundation::WAIT_TIMEOUT
             );
+            if release_tun {
+                worker_released.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             socket
                 .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
                 .unwrap();
-            thread::sleep(Duration::from_millis(250));
-            assert_eq!(unsafe {
-                windows_sys::Win32::System::Threading::WaitForSingleObject(handle as _, 0)
-            }, windows_sys::Win32::Foundation::WAIT_TIMEOUT);
-            worker_released.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         // This fixture has a mock API and no TUN. Do not observe the user's
         // unrelated live Atlas adapter when testing owned-process stop order.
         let started = Instant::now();
-        core.stop_with_tun_observer(|| {
+        let stopped = core.stop_with_tun_observer(|| {
             (!released.load(std::sync::atomic::Ordering::SeqCst)).then_some(1)
-        }).unwrap();
-        if close_delay.is_zero() { assert!(started.elapsed()<Duration::from_secs(2)); }
+        });
+        if release_tun {
+            stopped.unwrap();
+        } else {
+            assert!(stopped.unwrap_err().contains("Atlas-TUN всё ещё активен"));
+            assert!(started.elapsed() < Duration::from_secs(4), "shutdown took {:?}", started.elapsed());
+        }
+        if release_tun && close_delay.is_zero() { assert!(started.elapsed()<Duration::from_secs(2)); }
         worker.join().unwrap();
         assert!(core.child.is_none());
         assert!(!core.running());
     }
     #[test]
     fn shutdown_timeout_does_not_slow_status_or_other_config_requests() {
-        assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":false}}))), Duration::from_secs(15));
+        assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":false}}))), Duration::from_secs(1));
         assert_eq!(controller_timeout("GET", "/configs", None), Duration::from_secs(3));
         assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":true}}))), Duration::from_secs(3));
     }
