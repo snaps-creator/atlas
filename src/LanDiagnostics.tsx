@@ -180,12 +180,12 @@ export function LanDiagnostics() {
           className="lan-unlock-form"
           onSubmit={(e) => {
             e.preventDefault();
-              if (password === "00000001") {
-                setPassword("");
-                setError("");
-                setTigerEggOpen(true);
-                return;
-              }
+            if (password === "00000001") {
+              setPassword("");
+              setError("");
+              setTigerEggOpen(true);
+              return;
+            }
             void run(async () => {
               const v = await request<{ token: string }>("lan_unlock", {
                 password,
@@ -337,8 +337,10 @@ export function LanDiagnostics() {
       <div className="lan-peers">
         {discovered.map((p) => (
           <article className="lan-peer" key={p.id}>
-            <strong>{p.name}</strong>
-            <span>На связи · {p.address}</span>
+            <div className="lan-peer-meta">
+              <strong>{p.name}</strong>
+              <span>На связи · {p.address}</span>
+            </div>
             <button
               disabled={busy}
               onClick={() =>
@@ -509,7 +511,7 @@ function TigerEgg({ open, onClose }: { open: boolean; onClose: () => void }) {
         <button className="tiger-egg-close" type="button" onClick={onClose} aria-label="Закрыть">
           ×
         </button>
-        <h2 id="tiger-egg-title">Ха!, попалась!</h2>
+        <h2 id="tiger-egg-title">Ха, попалась!</h2>
         <img src="/lan-tiger.jpg" alt="Любопытный тигр" />
         <button className="tiger-egg-okay" type="button" onClick={onClose}>
           Ого!

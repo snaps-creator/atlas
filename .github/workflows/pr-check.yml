@@ -11,9 +11,9 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/t
-      # Integration tests spawn real cores. Bound contention on Windows runners
-      # so unrelated tests do not consume a probe core's startup deadline.
-      RUST_TEST_THREADS: 4
+      # Integration tests spawn real Mihomo/Xray processes. Serialize them so
+      # unrelated tests cannot starve a core's controller startup on Windows.
+      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v6
 

@@ -18,7 +18,9 @@ jobs:
     env:
       ATLAS_BUILD_ID: ${{ github.sha }}
       CARGO_TARGET_DIR: ${{ github.workspace }}/t
-      RUST_TEST_THREADS: 4
+      # Integration tests spawn multiple real Mihomo/Xray processes. Serial
+      # execution avoids controller startup timeouts on busy Windows runners.
+      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v6
 

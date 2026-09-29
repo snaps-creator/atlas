@@ -337,7 +337,9 @@ function App() {
         }
       });
       setUpdateStatus("installing");
-      if (data?.running || data?.guardActive) await request("disconnect");
+      // Frontend status can lag behind a crashed/restarting core or service.
+      // Always run backend cleanup and wait for it before the updater replaces files.
+      await request("disconnect");
       await diagnosticEvent("updater", "install_started", availableUpdate.version);
       await availableUpdate.install({ restartAfterInstall: true });
     } catch (reason) {
@@ -585,7 +587,7 @@ function App() {
         <main>
           {page === "Updates" && (
             <>
-              <div className="page-heading"><h1>Обновления</h1></div>
+              <div className="page-heading updates-page-heading"><h1>Обновления</h1></div>
               <section className="settings-section update-settings">
                 <h2>Текущая версия</h2>
                 <p>{versionLabel || "Версия недоступна"}{appVersion ? ` · ${appVersion}` : ""}</p>
