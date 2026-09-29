@@ -337,7 +337,9 @@ function App() {
         }
       });
       setUpdateStatus("installing");
-      if (data?.running || data?.guardActive) await request("disconnect");
+      // Frontend status can lag behind a crashed/restarting core or service.
+      // Always run backend cleanup and wait for it before the updater replaces files.
+      await request("disconnect");
       await diagnosticEvent("updater", "install_started", availableUpdate.version);
       await availableUpdate.install({ restartAfterInstall: true });
     } catch (reason) {
