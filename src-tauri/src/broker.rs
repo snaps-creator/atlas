@@ -228,7 +228,7 @@ impl Broker {
                 Duration::from_secs(if matches!(op, "start" | "apply") { 240 }
                     else if op == "select" { 180 }
                     // Outlive graceful core/TUN teardown and final filter/DNS cleanup.
-                    else if op == "stop" { 60 }
+                    else if op == "stop" { 4 }
                     else if op == "status" { 2 } else { 15 }),
                 running,
             )
@@ -251,7 +251,7 @@ impl Broker {
         }
     }
 }
-fn verify_process_image(pid: u32, expected: &std::path::Path) -> Result<(), String> {
+pub(crate) fn verify_process_image(pid: u32, expected: &std::path::Path) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return Err("Процесс сетевой службы недоступен".into());
@@ -440,6 +440,7 @@ struct Controller {
 }
 struct NetworkSession {
     core: Core,
+    desktop_pid: u32,
     session_id: Option<uuid::Uuid>,
     network_epoch: u64,
     configured: bool,
@@ -493,7 +494,7 @@ impl HealthState {
         recovery: &mut crate::resilient_selection::Recovery,
         observer: &mut Option<std::process::Child>,
         queries: &mut crate::query_jobs::QueryJobs,
-        session_id: &mut Option<uuid::Uuid>, network_epoch: &mut u64) {
+        session_id: &mut Option<uuid::Uuid>, network_epoch: &mut u64, desktop_pid: u32) {
         let now = Instant::now();
         if *configured && self.last_recovery_scan.elapsed() >= Duration::from_millis(500) {
             self.last_recovery_scan = now;
@@ -552,7 +553,7 @@ impl HealthState {
             }
             self.attempts.push_back(now);
             if observer.as_mut().is_none_or(|child| !matches!(child.try_wait(), Ok(None))) {
-                match crate::session_cleanup::start_observer(&core.directory) {
+                match crate::session_cleanup::start_observer(&core.directory, desktop_pid) {
                     Ok(child) => *observer = Some(child),
                     Err(_) => {
                         self.retry_at = Some(now + Duration::from_secs(30));
@@ -597,6 +598,7 @@ impl Controller {
         Ok(Self {
             session: NetworkSession {
                 core: Core::privileged(directory.join("Atlas.Core.exe"), directory),
+                desktop_pid: 0,
                 session_id: None,
                 network_epoch: 0,
                 configured: false,
@@ -612,7 +614,7 @@ impl Controller {
         let session = &mut self.session;
         self.scheduler.health.tick(&mut session.core, &mut session.configured, &mut session.guard,
             &mut session.active_settings, &mut self.selection, &mut session.cleanup_observer,
-            &mut self.scheduler.queries, &mut session.session_id, &mut session.network_epoch);
+            &mut self.scheduler.queries, &mut session.session_id, &mut session.network_epoch, session.desktop_pid);
     }
 }
 fn confirm_route(client: &crate::core::ApiClient, settings: &Settings, controls: &[&str]) -> Result<Option<String>, String> {
@@ -680,12 +682,16 @@ fn abandon_session(core: &mut Core, guard: &mut Option<network_guard::Guard>,
     errors.extend([paused, stopped, dns].into_iter().filter_map(Result::err));
     Err(errors.join("; "))
 }
-fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
-    let Controller { session: NetworkSession { core, session_id, network_epoch, configured, cleanup_observer, guard, active_settings },
+fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -> Result<(), String> {
+    let Controller { session: NetworkSession { core, desktop_pid, session_id, network_epoch, configured, cleanup_observer, guard, active_settings },
         scheduler: Scheduler { health, queries }, selection: recovery } = state;
     let session_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let _watch = PipeWatch::start(&pipe, session_running.clone())?;
+    *desktop_pid = desktop_owner_pid;
     core.continue_running = Some(session_running.clone());
+    // Watch the desktop before validation or any other potentially blocking
+    // request, including cancellation while a connection is still starting.
+    *cleanup_observer = Some(crate::session_cleanup::start_observer(&core.directory, *desktop_pid)?);
     send(&mut pipe, &json!({"ready":true}))?;
     let mut explicit_stop = false;
     loop {
@@ -695,7 +701,7 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
             break;
         }
         health.tick(core, configured, guard, active_settings, recovery, cleanup_observer,
-            queries, session_id, network_epoch);
+            queries, session_id, network_epoch, *desktop_pid);
         if active_settings.is_none() && !*configured
             && (guard.is_some() || health.attempts.len() >= 5) {
             break;
@@ -808,7 +814,7 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 *network_epoch = network_epoch.wrapping_add(1);
                 *session_id = Some(uuid::Uuid::new_v4());
                 if cleanup_observer.is_none() {
-                    match crate::session_cleanup::start_observer(&core.directory) {
+                    match crate::session_cleanup::start_observer(&core.directory, *desktop_pid) {
                         Ok(observer) => *cleanup_observer = Some(observer),
                         Err(error) => {
                             *session_id = None;
@@ -978,11 +984,12 @@ fn run_channel(mut pipe: File, state: &mut Controller) -> Result<(), String> {
                 *configured = false;
                 *active_settings = None;
                 explicit_stop = true;
-                // Attempt every cleanup even if core termination failed. Never
-                // acknowledge Stop before releasing filters and cached fake IPs.
+                // Attempt every cleanup even if core termination failed.
+                // DNS is flushed by the observer after the service exits.
                 let filters = network_guard::clear();
-                let dns = crate::session_cleanup::flush_dns();
-                let errors: Vec<_> = [paused, stopped, tun_routes, filters, dns].into_iter()
+                // DNS cleanup runs in the service-exit observer so the desktop
+                // stop reply never waits on the Windows DNS client RPC.
+                let errors: Vec<_> = [paused, stopped, tun_routes, filters].into_iter()
                     .filter_map(Result::err).collect();
                 if !errors.is_empty() { return Err(errors.join("; ")); }
                 let shutdown = core.client().logs().unwrap_or_default().into_iter()
@@ -1095,20 +1102,20 @@ pub fn serve_service() -> Result<(), String> {
                 break;
             }
             let file = File::from_raw_handle(handle);
-            channel_result = run_channel(file, &mut state);
+            channel_result = run_channel(file, &mut state, client_pid);
         }
         break;
     }
+    let paused = state.session.guard.as_ref()
+        .map(|guard| guard.pause(&state.session.core.binary)).unwrap_or(Ok(()));
     let core_result = state.session.core.stop();
-    let dns_result = if state.session.cleanup_observer.is_some() {
-        crate::session_cleanup::flush_dns()
-    } else { Ok(()) };
+    // The independent observer flushes DNS after this service process exits.
     let directory = state.session.core.directory.clone();
     drop(state);
     if directory.parent() == std::env::var_os("ProgramData").map(PathBuf::from).as_deref() {
         let _ = std::fs::remove_dir_all(&directory);
     }
-    let errors: Vec<_> = [channel_result, core_result, dns_result].into_iter()
+    let errors: Vec<_> = [channel_result, paused, core_result].into_iter()
         .filter_map(Result::err).collect();
     if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
 }

@@ -311,6 +311,10 @@ pub fn is_running() -> bool {
 }
 
 pub fn stop_and_wait() -> Result<(), String> {
+    stop_and_wait_timeout(std::time::Duration::from_secs(60))
+}
+
+pub fn stop_and_wait_timeout(timeout: std::time::Duration) -> Result<(), String> {
     use windows_sys::Win32::System::Services::{
         QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
     };
@@ -327,7 +331,7 @@ pub fn stop_and_wait() -> Result<(), String> {
         let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut status);
         // SCM stop can arrive while the owned core is still releasing TUN.
         // Its deadline must outlive that cleanup, just like the IPC Stop call.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + timeout;
         let outcome = loop {
             let mut process: SERVICE_STATUS_PROCESS = std::mem::zeroed();
             let mut needed = 0;
@@ -337,7 +341,7 @@ pub fn stop_and_wait() -> Result<(), String> {
             }
             if process.dwCurrentState == SERVICE_STOPPED { break Ok(()); }
             if std::time::Instant::now() >= deadline {
-                break Err("Служба Atlas не остановилась за 60 секунд; защита сети сохранена".into());
+                break Err(format!("Служба Atlas не остановилась за {} мс; защита сети сохранена", timeout.as_millis()));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
