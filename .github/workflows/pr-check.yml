@@ -63,7 +63,7 @@ jobs:
           }
 
       - name: Test backend
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance
 
       - name: Check production build
         run: npm run build

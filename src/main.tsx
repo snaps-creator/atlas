@@ -343,9 +343,9 @@ function App() {
         }
       });
       setUpdateStatus("installing");
-      // Frontend status can lag behind a crashed/restarting core or service.
-      // Always run backend cleanup and wait for it before the updater replaces files.
-      await request("disconnect");
+      // The signed installer's NEW native helper owns stop/cleanup/replacement.
+      // Calling the OLD app's disconnect here can permanently block its repair.
+      // Keep the working tunnel until the package is downloaded and verified.
       await diagnosticEvent("updater", "install_started", latest.version);
       await latest.install({ restartAfterInstall: true });
     } catch (reason) {

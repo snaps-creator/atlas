@@ -105,6 +105,24 @@ struct TunProbe {
     oper_status: Option<i32>,
     interface_type: Option<u32>,
     description: Option<String>,
+    verified_wintun: bool,
+}
+
+// The interface description is chosen by the application (Mihomo uses
+// "Meta Tunnel"). Verify the actual driver through the adapter's GUID instead.
+fn verified_wintun_driver(luid: &NET_LUID_LH) -> bool {
+    use winreg::{RegKey,enums::HKEY_LOCAL_MACHINE};
+    let mut guid: GUID=unsafe {std::mem::zeroed()};
+    if unsafe {ConvertInterfaceLuidToGuid(luid,&mut guid)}!=0 {return false;}
+    let id=format!("{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        guid.data1,guid.data2,guid.data3,guid.data4[0],guid.data4[1],guid.data4[2],guid.data4[3],guid.data4[4],guid.data4[5],guid.data4[6],guid.data4[7]);
+    let machine=RegKey::predef(HKEY_LOCAL_MACHINE);
+    let connection=format!(r"SYSTEM\CurrentControlSet\Control\Network\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\{id}\Connection");
+    let Some(instance)=machine.open_subkey(connection).ok().and_then(|key|key.get_value::<String,_>("PnpInstanceID").ok()) else {return false;};
+    if !instance.eq_ignore_ascii_case(&format!(r"SWD\Wintun\{id}")) {return false;}
+    machine.open_subkey(format!(r"SYSTEM\CurrentControlSet\Enum\{instance}")).ok()
+        .and_then(|key|key.get_value::<String,_>("Service").ok())
+        .is_some_and(|service|service.eq_ignore_ascii_case("wintun"))
 }
 
 fn tun_probe() -> TunProbe {
@@ -126,6 +144,7 @@ fn tun_probe() -> TunProbe {
             interface_type: (status == 0).then_some(row.Type),
             description: (status == 0).then(|| String::from_utf16_lossy(&row.Description)
                 .trim_matches('\0').to_owned()),
+            verified_wintun: status==0 && verified_wintun_driver(&tun),
         }
     }
 }
@@ -140,10 +159,9 @@ fn present_tun(alias: Option<u64>, query_code: Option<u32>) -> Option<u64> {
 }
 
 fn reusable_wintun(probe: &TunProbe) -> bool {
-    let description = probe.description.as_deref().unwrap_or_default();
     probe.query_code == Some(0)
         && probe.interface_type == Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL)
-        && description.to_ascii_lowercase().contains("wintun")
+        && probe.verified_wintun
         && probe.oper_status.is_some_and(|status| status == IfOperStatusDown
             || status == IfOperStatusLowerLayerDown || status == IfOperStatusNotPresent)
 }
@@ -166,6 +184,7 @@ pub(crate) fn tun_diagnostic() -> serde_json::Value {
         "operStatus": probe.oper_status,
         "interfaceType": probe.interface_type,
         "description": probe.description,
+        "verifiedWintunDriver": probe.verified_wintun,
         "reusableWintun": reusable_wintun(&probe),
         "activeLuid": active_tun(&probe),
         "meaning": "A verified, down Wintun adapter may persist after its process exits and can be reused",
@@ -524,7 +543,7 @@ mod tests {
         let mut probe = super::TunProbe { alias_luid: Some(42), query_code: Some(0),
             oper_status: Some(super::IfOperStatusDown),
             interface_type: Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL),
-            description: Some("Wintun Userspace Tunnel".into()) };
+            description: Some("Meta Tunnel".into()), verified_wintun: true };
         assert!(super::reusable_wintun(&probe));
         assert_eq!(super::active_tun(&probe), None);
         probe.oper_status = Some(windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp);
@@ -532,8 +551,11 @@ mod tests {
         assert_eq!(super::active_tun(&probe), Some(42));
         probe.oper_status = Some(super::IfOperStatusDown);
         probe.description = Some("Third-party virtual adapter".into());
+        probe.verified_wintun=false;
         assert_eq!(super::active_tun(&probe), Some(42));
         probe.description = Some("Wintun Userspace Tunnel".into());
+        assert_eq!(super::active_tun(&probe), Some(42),"A display name is not proof of driver identity");
+        probe.verified_wintun=true;
         probe.query_code = Some(87);
         assert_eq!(super::active_tun(&probe), Some(42));
     }

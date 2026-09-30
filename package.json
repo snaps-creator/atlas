@@ -1,6 +1,6 @@
 {
   "name": "atlas-vpn",
-  "version": "2.2.4-alpha.1",
+  "version": "2.2.5-alpha.1",
   "private": true,
   "type": "module",
   "scripts": {
