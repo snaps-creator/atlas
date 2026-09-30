@@ -1,0 +1,42 @@
+name: Verify connected upgrade
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  connected-upgrade:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Reconstruct the exact installer shipped in the PR
+        shell: pwsh
+        run: |
+          node scripts/verify-offline-installer.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Offline payload verification failed' }
+          $manifest = Get-Content installer/manifest.json -Raw | ConvertFrom-Json
+          $candidate = Join-Path $env:RUNNER_TEMP 'Atlas-candidate.exe'
+          $output = [IO.File]::Create($candidate)
+          try {
+            foreach ($part in 1..$manifest.parts) {
+              $inputFile = [IO.File]::OpenRead((Join-Path $pwd "installer/atlas-setup.part$part"))
+              try { $inputFile.CopyTo($output) } finally { $inputFile.Dispose() }
+            }
+          } finally { $output.Dispose() }
+          if ((Get-FileHash $candidate -Algorithm SHA256).Hash -ne $manifest.sha256) { throw 'Reconstructed installer differs' }
+          Copy-Item installer/atlas-setup.exe.sig "$candidate.sig"
+          ./scripts/test-connected-upgrade.ps1 -Installer $candidate
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: connected-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+          retention-days: 7

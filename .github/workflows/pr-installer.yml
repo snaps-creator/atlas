@@ -65,11 +65,6 @@ jobs:
       - name: Package real installer and signature
         shell: pwsh
         run: ./scripts/package-installer.ps1
-      - name: Upgrade 2.2.3 while a real tunnel is active
-        shell: pwsh
-        run: |
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          ./scripts/test-connected-upgrade.ps1 -Installer "t/release/bundle/nsis/Atlas_${version}_x64-setup.exe"
       - uses: actions/upload-artifact@v7
         with:
           name: Atlas-Windows-x64-PR-${{ github.event.pull_request.number }}

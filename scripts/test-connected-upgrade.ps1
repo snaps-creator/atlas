@@ -10,6 +10,15 @@ $candidate = (Resolve-Path -LiteralPath $Installer).Path
 $fixture = Join-Path $env:RUNNER_TEMP ('atlas-connected-upgrade-' + [guid]::NewGuid().ToString('N'))
 $installRoot = Join-Path $fixture 'installed'
 New-Item -ItemType Directory -Path $fixture | Out-Null
+# WFP is a normal Windows prerequisite. Hosted CI images may stop BFE;
+# explicitly prepare it only on this guarded, disposable test machine.
+Get-Service BFE | Select-Object Name,Status,StartType | Format-Table
+if ((Get-Service BFE).Status -ne 'Running') { Set-Service BFE -StartupType Manual; Start-Service BFE }
+$sevenZip = (Get-Command 7z.exe -ErrorAction Stop).Source
+$candidateFiles = Join-Path $fixture 'candidate'
+& $sevenZip x $candidate "-o$candidateFiles" -y | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Candidate extraction failed' }
+$maintenance = Join-Path $candidateFiles 'AtlasMaintenance.exe'
 function Install-Checked([string]$path) {
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
@@ -22,7 +31,14 @@ Invoke-WebRequest ($base + $previousName) -OutFile $previous
 Invoke-WebRequest ($base + $previousName + '.sig') -OutFile "$previous.sig"
 node (Join-Path $PSScriptRoot 'verify-installer.cjs') $previous
 if ($LASTEXITCODE -ne 0) { throw 'Old release signature does not match Atlas trust' }
-Install-Checked $previous
+# Seed the actual signed old binaries and register their real service. The
+# regression concerns upgrading an EXISTING old installation, not whether its
+# obsolete cleanup hook can provision a fresh Windows Server CI image.
+& $sevenZip x $previous "-o$installRoot" -y | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Old release extraction failed' }
+Copy-Item (Join-Path $installRoot 'Atlas.exe') (Join-Path $installRoot 'Atlas.Service.exe')
+$register = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--install-service' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'register.log') -RedirectStandardError (Join-Path $fixture 'register.err')
+if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old service registration failed: $(Get-Content (Join-Path $fixture 'register.err') -Raw)" }
 $core = $null
 $desktop = $null
 try {
@@ -98,6 +114,6 @@ rules:
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
     }
     # The guard above established that this disposable job created the service.
-    & (Join-Path $repo 't/release/AtlasMaintenance.exe') --prepare-install $installRoot
+    & $maintenance --prepare-install $installRoot
     sc.exe delete AtlasNetworkService | Out-Null
 }
