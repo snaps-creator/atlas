@@ -22,7 +22,15 @@ $maintenance = Join-Path $candidateFiles 'AtlasMaintenance.exe'
 function Install-Checked([string]$path) {
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
-    if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+    if ($process.ExitCode -ne 0) {
+        Write-Output "Failed installer: $path; expected installation: $installRoot"
+        Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'" | Select-Object Name,State,PathName | Format-List
+        Get-Item (Join-Path $installRoot 'Atlas.exe') | ForEach-Object { $_.VersionInfo | Select-Object FileName,FileVersion,ProductVersion | Format-List }
+        & $maintenance --inspect
+        & $maintenance --prepare-install $installRoot 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')
+        Write-Output "Independent recovery exit: $LASTEXITCODE"
+        throw "Installer failed: $($process.ExitCode)"
+    }
 }
 $previousName = 'Atlas_2.2.3-alpha.47.1_x64-setup.exe'
 $previous = Join-Path $fixture $previousName
