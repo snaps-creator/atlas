@@ -1,6 +1,6 @@
 [package]
 name = "atlas-vpn"
-version = "2.2.3-alpha.1"
+version = "2.2.4-alpha.1"
 edition = "2021"
 
 [lib]

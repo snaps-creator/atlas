@@ -17,6 +17,8 @@ pub struct Core {
     pub child: Option<Child>,
     job: Option<crate::job::Job>,
     xray: Option<crate::xray_runtime::Runtime>,
+    draining_xray: Vec<crate::xray_runtime::Runtime>,
+    last_drain_check: Option<Instant>,
     broker: Option<std::sync::Arc<crate::broker::Broker>>,
     elevated: bool,
     secret: String,
@@ -36,6 +38,8 @@ impl Core {
             child: None,
             job: None,
             xray: None,
+            draining_xray: Vec::new(),
+            last_drain_check: None,
             broker: None,
             elevated: false,
             secret: format!(
@@ -184,6 +188,7 @@ impl Core {
         self.broker.as_ref()?.call("status", Value::Null).ok()
     }
     pub fn running(&mut self) -> bool {
+        self.reap_draining_xray();
         if self.xray.as_mut().is_some_and(|runtime|!runtime.healthy()) {return false;}
         if let Some(broker) = &self.broker {
             if !broker.alive() {
@@ -393,19 +398,36 @@ impl Core {
                 "Не дождались готовности TUN: ядро завершилось или истекло время ожидания. Подключение отменено.".into()
             })
     }
+    fn reap_draining_xray(&mut self) {
+        if self.draining_xray.is_empty() || self.last_drain_check.is_some_and(|t|t.elapsed()<Duration::from_secs(2)) {return;}
+        self.last_drain_check=Some(Instant::now());
+        let before=self.draining_xray.len();
+        self.draining_xray.retain(|runtime| runtime.has_live_connections().unwrap_or(true));
+        if before!=self.draining_xray.len() {
+            self.client().event(json!({"at":crate::model::now(),"kind":"xray_streams_drained","released":before-self.draining_xray.len(),"remaining":self.draining_xray.len()}));
+        }
+    }
     pub fn apply(&mut self, s: &Settings) -> Result<(), String> {
         if let Some(broker) = &self.broker {
             crate::broker::validate_settings(s)?;
             broker.call_cancellable("apply", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())?;
             return Ok(());
         }
-        let prepared=crate::xray_runtime::Prepared::new(s,&self.binary,&self.directory)?.cancellable(self.continue_running.clone());
-        prepared.validate()?;
-        let path=self.validate_mapped(&prepared.settings)?;
+        self.reap_draining_xray();
+        let mapped=self.xray.as_ref().and_then(|runtime|runtime.mapped_settings(s));
+        // Bound worker accumulation without terminating anybody's live stream.
+        if mapped.is_none() && self.draining_xray.len()>=8 {
+            return Err("Обновление сетевой конфигурации отложено: предыдущие соединения ещё используются; текущий VPN продолжает работать".into());
+        }
+        let prepared=if mapped.is_none() {
+            let prepared=crate::xray_runtime::Prepared::new(s,&self.binary,&self.directory)?.cancellable(self.continue_running.clone());
+            prepared.validate()?; Some(prepared)
+        } else {None};
+        let path=self.validate_mapped(mapped.as_ref().unwrap_or_else(||&prepared.as_ref().unwrap().settings))?;
         if !self.running() {
             return Ok(());
         }
-        let next_xray=prepared.start_logged(self.logs.clone())?;
+        let next_xray=prepared.map(|p|p.start_logged(self.logs.clone())).transpose()?;
         let old = self.directory.join("last-working.yaml");
         let previous = std::fs::read(&old).map_err(|e| format!("Не удалось сохранить конфигурацию для отката: {e}"))?;
         let selected = self.api("GET", "/proxies/ATLAS", None)?["now"]
@@ -451,7 +473,12 @@ impl Core {
             }
             return Err(e);
         }
-        self.xray=Some(next_xray);
+        if let Some(next_xray)=next_xray {
+            if let Some(previous)=self.xray.replace(next_xray) {self.draining_xray.push(previous);}
+            // Leave a grace interval for in-flight SOCKS accepts around reload.
+            self.last_drain_check=Some(Instant::now());
+            self.client().event(json!({"at":crate::model::now(),"kind":"xray_transport_replaced","existingStreamsPreserved":true,"drainingWorkers":self.draining_xray.len()}));
+        }
         Ok(())
     }
     pub fn select(&self, name: &str) -> Result<(), String> {
@@ -471,8 +498,14 @@ impl Core {
 
     fn stop_with_tun_observer(&mut self, tun_identity: impl Fn() -> Option<u64>) -> Result<(), String> {
         // An Xray error must never skip termination of Mihomo or the service.
-        let xray_result = self.xray.as_mut().map(|runtime| runtime.stop()).unwrap_or(Ok(()));
+        for runtime in self.xray.iter_mut().chain(self.draining_xray.iter_mut()) {runtime.signal_stop();}
+        let mut xray_errors=Vec::new();
+        for runtime in self.xray.iter_mut().chain(self.draining_xray.iter_mut()) {
+            if let Err(error)=runtime.stop() {xray_errors.push(error);}
+        }
+        let xray_result=if xray_errors.is_empty() {Ok(())} else {Err(xray_errors.join("; "))};
         self.xray=None;
+        self.draining_xray.clear();
         let had_privileged_core = self.elevated && self.child.is_some();
         let had_broker = self.broker.is_some();
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
@@ -571,6 +604,102 @@ fn controller_timeout(method: &str, path: &str, body: Option<&Value>) -> Duratio
 mod integration_tests {
     use super::*;
     use crate::model::{Route, Rule, RuleGroup, Subscription};
+    #[test]
+    fn persistent_xray_stream_survives_configuration_replacement() {
+        check_persistent_xray_stream(true);
+    }
+    #[test]
+    fn stopping_core_terminates_current_and_draining_xray_streams() {
+        check_persistent_xray_stream(false);
+    }
+    fn check_persistent_xray_stream(drain_before_stop: bool) {
+        use std::io::{Read, Write};
+        let directory = std::env::temp_dir().join(format!("atlas-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
+        let mut core = Core::new(binary, directory.clone());
+        core.use_ephemeral_ports().unwrap();
+        let mut settings = Settings::default();
+        settings.mode = "system".into();
+        settings.selected = "fixture".into();
+        settings.routing_mode = crate::model::RoutingMode::Global;
+        settings.subscriptions.push(Subscription { options: Default::default(), id: "fixture".into(), name: "fixture".into(), masked_url: String::new(), updated_at: 0, error: None,
+            servers: vec![json!({"name":"fixture","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}})] });
+        let mut alternative=settings.subscriptions[0].servers[0].clone();
+        alternative["name"]=json!("alternative");
+        settings.subscriptions[0].servers.push(alternative);
+        core.start(&settings).unwrap();
+        let target = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let deadline=Instant::now()+Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match target.accept() {
+                    Ok(stream)=>break stream,
+                    Err(error) if error.kind()==std::io::ErrorKind::WouldBlock && Instant::now()<deadline=>thread::sleep(Duration::from_millis(10)),
+                    _=>return,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+            let mut bytes = [0; 4];
+            while stream.read_exact(&mut bytes).is_ok() {
+                if stream.write_all(&bytes).is_err() { break; }
+            }
+        });
+        let mut held_stream=None;
+        let result = (|| -> Result<(), String> {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", core.ports[0])).map_err(|e| e.to_string())?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(stream, "CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n").map_err(|e| e.to_string())?;
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0]; stream.read_exact(&mut byte).map_err(|e| e.to_string())?; header.push(byte[0]);
+                if header.len() > 4096 { return Err("Oversized CONNECT reply".into()); }
+            }
+            if !String::from_utf8_lossy(&header).contains("200") { return Err("CONNECT rejected".into()); }
+            for step in 0..3 {
+                if step == 1 {
+                    core.select("alternative")?; core.apply(&settings)?;
+                    if !core.draining_xray.is_empty() {return Err("Unchanged Xray configuration restarted workers".into());}
+                }
+                if step == 2 {
+                    settings.subscriptions[0].servers.push(json!({"name":"added","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}}));
+                    core.apply(&settings)?;
+                    if core.draining_xray.len()!=1 || !core.draining_xray[0].has_live_connections()? {
+                        return Err("Existing stream ownership was not preserved".into());
+                    }
+                    core.last_drain_check=None;
+                    core.reap_draining_xray();
+                    if core.draining_xray.len()!=1 {return Err("Live worker was reaped".into());}
+                }
+                stream.write_all(b"live").map_err(|e| format!("step {step} write: {e}"))?;
+                let mut reply = [0; 4]; stream.read_exact(&mut reply).map_err(|e| format!("step {step} read: {e}"))?;
+                if &reply != b"live" { return Err("Corrupted stream".into()); }
+            }
+            if drain_before_stop {
+                drop(stream);
+                let deadline=Instant::now()+Duration::from_secs(5);
+                while !core.draining_xray.is_empty() && Instant::now()<deadline {
+                    core.last_drain_check=None; core.reap_draining_xray();
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if !core.draining_xray.is_empty() {return Err("Idle retired worker was not released".into());}
+            } else {
+                held_stream=Some(stream);
+            }
+            Ok(())
+        })();
+        let stopped = core.stop();
+        let clean=core.draining_xray.is_empty() && core.xray.is_none() && !core.running();
+        drop(held_stream);
+        worker.join().unwrap();
+        drop(core); std::fs::remove_dir_all(directory).unwrap();
+        stopped.unwrap();
+        assert!(clean,"Exit must release both current and retired workers");
+        result.unwrap();
+    }
     #[test]
     fn real_xray_bridge_survives_selection_reload_and_stops_with_core() {
         use std::io::{Read,Write};

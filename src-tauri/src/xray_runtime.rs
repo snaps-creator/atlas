@@ -8,6 +8,8 @@ use std::os::windows::process::CommandExt;
 struct Worker { path: PathBuf, ports: Vec<u16> }
 pub struct Prepared {
     pub settings: Settings,
+    original: Settings,
+    interface: Option<String>,
     binary: PathBuf,
     directory: PathBuf,
     workers: Vec<Worker>,
@@ -56,7 +58,7 @@ fn default_interface() -> Result<String,String> {
 }
 impl Prepared {
     pub fn new(settings: &Settings, mihomo: &Path, directory: &Path) -> Result<Self,String> {
-        let mut prepared=Self {settings:settings.clone(),binary:mihomo.with_file_name("Atlas.Xray.exe"),
+        let mut prepared=Self {settings:settings.clone(),original:settings.clone(),interface:None,binary:mihomo.with_file_name("Atlas.Xray.exe"),
             directory:directory.join(format!("xray-{}",uuid::Uuid::new_v4())),workers:vec![],reservations:vec![],secrets:vec![],cancellation:None};
         crate::support_report::collect_secrets(&serde_json::to_value(settings).map_err(|_|"Xray: настройки недоступны")?,&mut prepared.secrets);
         let count=settings.servers().iter().filter(|n|n["type"]=="xray").count();
@@ -64,6 +66,7 @@ impl Prepared {
         if count>512 {return Err("Не более 512 Xray-серверов в одной сессии".into());}
         if !prepared.binary.is_file() {return Err("В установке Atlas отсутствует Atlas.Xray.exe".into());}
         let interface=if settings.mode=="tun" {Some(default_interface()?)} else {None};
+        prepared.interface=interface.clone();
         std::fs::create_dir_all(&prepared.directory).map_err(|_|"Не удалось создать каталог Xray")?;
         let mut simple_inbounds=Vec::new(); let mut simple_outbounds=Vec::new(); let mut simple_rules=Vec::new();
         let mut simple_ports=Vec::new(); let mut profiles=Vec::new(); let mut index=0;
@@ -207,6 +210,53 @@ impl Prepared {
     }
 }
 impl Runtime {
+    /// Rules, selection and UI changes must not replace authenticated SOCKS
+    /// endpoints or terminate the streams already carried by this worker.
+    pub fn mapped_settings(&self, settings: &Settings) -> Option<Settings> {
+        let original=&self.prepared.original;
+        if settings.servers()!=original.servers() || settings.mode!=original.mode
+            || settings.dns.ipv6!=original.dns.ipv6 {return None;}
+        if settings.mode=="tun" && default_interface().ok()!=self.prepared.interface {return None;}
+        let mapped=self.prepared.settings.servers();
+        let mut result=settings.clone();
+        for node in result.subscriptions.iter_mut().flat_map(|s|&mut s.servers) {
+            if node["type"]=="xray" {
+                *node=mapped.iter().find(|m|m["name"]==node["name"])?.clone();
+            }
+        }
+        Some(result)
+    }
+    /// A retired worker owns existing TCP streams (also SOCKS UDP control
+    /// channels). Read the OS table, never infer inactivity from ping results.
+    /// Unknown table state means keep the worker, not drop live connections.
+    pub fn has_live_connections(&self) -> Result<bool,String> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable,MIB_TCPTABLE_OWNER_PID,MIB_TCPROW_OWNER_PID,TCP_TABLE_OWNER_PID_ALL};
+        let mut size=0u32;
+        unsafe { GetExtendedTcpTable(std::ptr::null_mut(),&mut size,0,2,TCP_TABLE_OWNER_PID_ALL,0); }
+        for _ in 0..3 {
+            if size<4 {return Err("TCP table size unavailable".into());}
+            let mut buffer=vec![0u32;(size as usize).div_ceil(4)];
+            let status=unsafe {GetExtendedTcpTable(buffer.as_mut_ptr().cast(),&mut size,0,2,TCP_TABLE_OWNER_PID_ALL,0)};
+            if status==122 {continue;}
+            if status!=0 {return Err(format!("TCP table unavailable: {status}"));}
+            let table=buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+            let count=unsafe {(*table).dwNumEntries as usize};
+            let offset=std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID,table);
+            if count>(buffer.len()*4-offset)/std::mem::size_of::<MIB_TCPROW_OWNER_PID>() {return Err("Invalid TCP table length".into());}
+            let rows=unsafe {std::slice::from_raw_parts(std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>(),count)};
+            return Ok(rows.iter().any(|row| {
+                let port=u16::from_be(row.dwLocalPort as u16);
+                // CLOSED, LISTEN, TIME_WAIT and DELETE_TCB carry no live stream.
+                !matches!(row.dwState,1|2|11|12)
+                    && self.processes.iter().any(|p|p.child.id()==row.dwOwningPid)
+                    && self.prepared.workers.iter().any(|w|w.ports.contains(&port))
+            }));
+        }
+        Err("TCP table changed during capture".into())
+    }
+    pub fn signal_stop(&mut self) {
+        for process in &mut self.processes {drop(process.job.take());}
+    }
     pub fn healthy(&mut self) -> bool {self.processes.iter_mut().all(|p|matches!(p.child.try_wait(),Ok(None)))}
     pub fn stop(&mut self) -> Result<(),String> {
         let mut errors=Vec::new();
