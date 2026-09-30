@@ -54,7 +54,7 @@ jobs:
         run: npm test
 
       - name: Test backend
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance
 
       - name: Check whether the version is already released
         id: release-version
