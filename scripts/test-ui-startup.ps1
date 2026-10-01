@@ -2,14 +2,21 @@ param([Parameter(Mandatory=$true)][string]$Executable)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path $exe -Parent
-$report = Join-Path $env:TEMP ('atlas-ui-acceptance-' + [guid]::NewGuid().ToString('N') + '.json')
+$evidence = Join-Path $env:TEMP ('atlas-ui-acceptance-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $evidence | Out-Null
+$report = Join-Path $evidence 'report.json'
 $previousMode = $env:ATLAS_UI_PROCESS_SMOKE
 $previousReport = $env:ATLAS_UI_SMOKE_REPORT
 try {
     $env:ATLAS_UI_PROCESS_SMOKE = '1'
     $env:ATLAS_UI_SMOKE_REPORT = $report
-    $process = Start-Process -FilePath $exe -WorkingDirectory $directory -WindowStyle Hidden -PassThru
+    $process = Start-Process -FilePath $exe -WorkingDirectory $directory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $evidence 'stdout.log') -RedirectStandardError (Join-Path $evidence 'stderr.log')
     if (-not $process.WaitForExit(25000)) {
+        Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe } |
+            Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json |
+            Set-Content (Join-Path $evidence 'processes.json')
+        if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
+        Get-Content (Join-Path $evidence 'stderr.log') -Tail 40
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         throw 'Atlas UI did not finish isolated startup acceptance within 25 seconds'
     }
@@ -28,5 +35,5 @@ try {
 } finally {
     $env:ATLAS_UI_PROCESS_SMOKE = $previousMode
     $env:ATLAS_UI_SMOKE_REPORT = $previousReport
-    Remove-Item -LiteralPath $report -ErrorAction SilentlyContinue
+    # Keep the render acknowledgement and logs for CI failure artifacts.
 }

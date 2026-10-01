@@ -4,7 +4,11 @@ on:
 permissions:
   contents: read
 jobs:
+  build-installer:
+    uses: ./.github/workflows/pr-installer.yml
+    secrets: inherit
   connected-upgrade:
+    needs: build-installer
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -15,23 +19,18 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - name: Reconstruct the exact installer shipped in the PR
+      - uses: actions/download-artifact@v4
+        with:
+          name: Atlas-Windows-x64-PR-${{ github.event.pull_request.number }}
+          path: candidate-installer
+      - name: Verify upgrade using the installer built from this commit
         shell: pwsh
         run: |
-          node scripts/verify-offline-installer.cjs
-          if ($LASTEXITCODE -ne 0) { throw 'Offline payload verification failed' }
-          $manifest = Get-Content installer/manifest.json -Raw | ConvertFrom-Json
-          $candidate = Join-Path $env:RUNNER_TEMP 'Atlas-candidate.exe'
-          $output = [IO.File]::Create($candidate)
-          try {
-            foreach ($part in 1..$manifest.parts) {
-              $inputFile = [IO.File]::OpenRead((Join-Path $pwd "installer/atlas-setup.part$part"))
-              try { $inputFile.CopyTo($output) } finally { $inputFile.Dispose() }
-            }
-          } finally { $output.Dispose() }
-          if ((Get-FileHash $candidate -Algorithm SHA256).Hash -ne $manifest.sha256) { throw 'Reconstructed installer differs' }
-          Copy-Item installer/atlas-setup.exe.sig "$candidate.sig"
-          ./scripts/test-connected-upgrade.ps1 -Installer $candidate
+          $candidates = @(Get-ChildItem candidate-installer -Filter '*Setup.exe' -File)
+          if ($candidates.Count -ne 1) { throw 'Expected exactly one freshly built installer' }
+          node scripts/verify-installer.cjs $candidates[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed' }
+          ./scripts/test-connected-upgrade.ps1 -Installer $candidates[0].FullName
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -39,4 +38,5 @@ jobs:
           path: |
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
           retention-days: 7
