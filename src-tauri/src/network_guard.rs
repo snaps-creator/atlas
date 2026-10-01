@@ -270,32 +270,62 @@ pub fn default_route_signature() -> Option<String> {
     }
 }
 
-/// A competing full-tunnel must be disconnected by its owner before Atlas connects.
-/// Reading routes has no side effects; never delete another client's routes/filters.
-pub fn check_competing_routes() -> Result<(), String> {
+fn competing_capture_route(prefix_length: u8, loopback: bool, atlas: bool, interface_type: Option<u32>) -> bool {
+    if loopback || atlas { return false; }
+    // A number of Clash/Mihomo clients install one virtual 0/0 route rather
+    // than the traditional pair of /1 routes. A physical 0/0 is the normal
+    // uplink and must remain allowed; a foreign virtual 0/0 captures the same
+    // traffic as Atlas and makes the two TUN engines race for Windows traffic.
+    prefix_length == 1 || (prefix_length == 0
+        && interface_type == Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL))
+}
+
+fn competing_capture_routes() -> Result<Vec<(u64,u8,Option<u32>)>, String> {
     use windows_sys::Win32::{
         NetworkManagement::IpHelper::{FreeMibTable, GetIpForwardTable2},
         Networking::WinSock::AF_UNSPEC,
     };
+    unsafe {
+        let mut table = ptr::null_mut();
+        checked(GetIpForwardTable2(AF_UNSPEC, &mut table), "проверка маршрутов перед подключением")?;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let atlas_luid = tun_probe().alias_luid;
+        let mut conflicts = Vec::new();
+        for route in rows {
+            let mut interface: MIB_IF_ROW2 = std::mem::zeroed();
+            interface.InterfaceLuid = route.InterfaceLuid;
+            let interface_type = (GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut interface) == 0)
+                .then_some(interface.Type);
+            if competing_capture_route(route.DestinationPrefix.PrefixLength, route.Loopback != 0,
+                Some(route.InterfaceLuid.Value) == atlas_luid, interface_type) {
+                conflicts.push((route.InterfaceLuid.Value, route.DestinationPrefix.PrefixLength, interface_type));
+            }
+        }
+        FreeMibTable(table.cast());
+        conflicts.sort_unstable();
+        conflicts.dedup();
+        Ok(conflicts)
+    }
+}
+
+pub(crate) fn competing_route_diagnostic() -> serde_json::Value {
+    match competing_capture_routes() {
+        Ok(routes) => serde_json::json!({"detected":!routes.is_empty(),"routes":routes.into_iter().map(|(luid,prefix,kind)|
+            serde_json::json!({"interfaceLuid":luid,"prefixLength":prefix,"interfaceType":kind})).collect::<Vec<_>>(),
+            "meaning":"A foreign virtual default route belongs to another full-tunnel VPN and conflicts with Atlas TUN"}),
+        Err(error) => serde_json::json!({"detected":null,"error":error}),
+    }
+}
+
+/// A competing full-tunnel must be disconnected by its owner before Atlas connects.
+/// Reading routes has no side effects; never delete another client's routes/filters.
+pub fn check_competing_routes() -> Result<(), String> {
     clear_routes_for_reusable_tun()?;
     if tun_identity().is_some() {
         return Err("Интерфейс Atlas-TUN активен или его тип нельзя подтвердить; запуск остановлен без изменения адаптера".into());
     }
-    unsafe {
-        let mut table = ptr::null_mut();
-        checked(
-            GetIpForwardTable2(AF_UNSPEC, &mut table),
-            "проверка маршрутов перед подключением",
-        )?;
-        let rows =
-            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
-        let atlas_luid = tun_probe().alias_luid;
-        let conflict = rows.iter().any(|row| row.DestinationPrefix.PrefixLength == 1
-            && row.Loopback == 0 && Some(row.InterfaceLuid.Value) != atlas_luid);
-        FreeMibTable(table.cast());
-        if conflict {
-            return Err("Обнаружен активный маршрут другого VPN. Отключите его перед подключением Atlas. Сетевые настройки не изменены.".into());
-        }
+    if !competing_capture_routes()?.is_empty() {
+        return Err("Обнаружен активный туннель другого VPN. Отключите его перед подключением Atlas. Сетевые настройки не изменены.".into());
     }
     Ok(())
 }
@@ -525,6 +555,15 @@ fn dhcp_conditions(local: u16, remote: u16) -> [FWPM_FILTER_CONDITION0; 3] {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn competing_vpn_detection_includes_virtual_default_routes() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{IF_TYPE_ETHERNET_CSMACD, IF_TYPE_PROP_VIRTUAL};
+        assert!(super::competing_capture_route(1,false,false,Some(IF_TYPE_ETHERNET_CSMACD)));
+        assert!(super::competing_capture_route(0,false,false,Some(IF_TYPE_PROP_VIRTUAL)));
+        assert!(!super::competing_capture_route(0,false,false,Some(IF_TYPE_ETHERNET_CSMACD)));
+        assert!(!super::competing_capture_route(0,false,true,Some(IF_TYPE_PROP_VIRTUAL)));
+        assert!(!super::competing_capture_route(24,false,false,Some(IF_TYPE_PROP_VIRTUAL)));
+    }
     #[test]
     fn cleanup_never_reports_success_with_a_remaining_tun() {
         assert!(super::wait_for_tun_release_with(std::time::Duration::ZERO,||Some(42)).is_err());

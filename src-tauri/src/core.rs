@@ -517,7 +517,6 @@ impl Core {
                 crate::incident_history::record("service_shutdown_completed", evidence, &[]);
             });
             result = result.and(broker_result);
-            let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         }
         if had_broker {
             // Disconnect and Exit both require the on-demand service to be
@@ -563,7 +562,6 @@ impl Core {
         }
         self.started = None;
         self.job = None;
-        let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         if had_privileged_core {
             let deadline = Instant::now() + Duration::from_secs(1);
             while tun_identity().is_some() && Instant::now() < deadline {
@@ -574,6 +572,12 @@ impl Core {
                 return Err("Ядро остановлено, но Atlas-TUN всё ещё активен; восстановление сети не подтверждено".into());
             }
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_released"}));
+        }
+        // The marker is ownership evidence for recovery after an interrupted
+        // shutdown. Removing it before the service and TUN are confirmed gone
+        // makes the next Atlas instance treat its own adapter as foreign.
+        if result.is_ok() {
+            let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
         }
         result
     }
@@ -750,9 +754,13 @@ mod integration_tests {
         use std::io::{Read, Write};
         use std::os::windows::io::AsRawHandle;
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let directory=std::env::temp_dir().join(format!("atlas-stop-order-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker=directory.join("tun-guard.active");
+        std::fs::write(&marker,b"owned session").unwrap();
         let mut core = Core::privileged(
             PathBuf::from("unused.exe"),
-            std::env::temp_dir().join(format!("atlas-stop-order-{}", uuid::Uuid::new_v4())),
+            directory.clone(),
         );
         core.ports[1] = api.local_addr().unwrap().port();
         let child = Command::new("powershell.exe")
@@ -809,14 +817,18 @@ mod integration_tests {
         });
         if release_tun {
             stopped.unwrap();
+            assert!(!marker.exists(),"confirmed shutdown must clear the ownership marker");
         } else {
             assert!(stopped.unwrap_err().contains("Atlas-TUN всё ещё активен"));
+            assert!(marker.exists(),"failed shutdown must retain ownership evidence for recovery");
             assert!(started.elapsed() < Duration::from_secs(4), "shutdown took {:?}", started.elapsed());
         }
         if release_tun && close_delay.is_zero() { assert!(started.elapsed()<Duration::from_secs(2)); }
         worker.join().unwrap();
         assert!(core.child.is_none());
         assert!(!core.running());
+        drop(core);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn shutdown_timeout_does_not_slow_status_or_other_config_requests() {

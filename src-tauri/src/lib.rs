@@ -694,6 +694,7 @@ async fn request_inner(
                     "selected":a.settings.selected,"autoTestIntervalSeconds":a.settings.auto_test_interval_seconds,
                     "activeCheckIntervalSeconds":10,"autoSearchPingMs":a.settings.auto_search_ping_ms,
                     "error":a.error,"logs":a.logs,"tunInterface":tun_interface,
+                    "competingVpn":network_guard::competing_route_diagnostic(),
                     "connectionConfiguration":support_report::configuration_evidence(&a.settings),
                     "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});
                 (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
@@ -983,12 +984,17 @@ pub fn run() {
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             // A previous UI may have crashed while its on-demand service was
-            // still alive. Finish that Atlas-owned session before opening UI.
-            if service::is_running() {
-                service::stop_and_wait().map_err(std::io::Error::other)?;
-            }
-            windows::restore(&dir.join("proxy-restore.json")).map_err(std::io::Error::other)?;
-            let _ = std::fs::remove_file(dir.join("tun-guard.active"));
+            // still alive. Finish that Atlas-owned session before enabling a
+            // new connection. A cleanup error must not abort Tauri setup and
+            // leave a blank window; publish it as recoverable application state.
+            let startup_cleanup = (|| -> Result<(),String> {
+                if service::is_running() { service::stop_and_wait()?; }
+                windows::restore(&dir.join("proxy-restore.json"))?;
+                network_guard::wait_for_tun_release(std::time::Duration::from_secs(3))?;
+                network_guard::clear_routes_for_reusable_tun()?;
+                let _ = std::fs::remove_file(dir.join("tun-guard.active"));
+                Ok(())
+            })();
             let store =
                 storage::Store::open(&dir.join("atlas.db")).map_err(std::io::Error::other)?;
             let mut settings = store.load().map_err(std::io::Error::other)?;
@@ -1008,7 +1014,7 @@ pub fn run() {
             let core = core::Core::new(binary, dir.clone());
             // A stale service or marker is crash residue, never permission to
             // resume VPN traffic. Only the explicit user preference can start it.
-            let auto = settings.startup.auto_connect;
+            let auto = settings.startup.auto_connect && startup_cleanup.is_ok();
             let delay = settings.startup.delay_seconds.min(300);
             if settings.startup.start_in_tray {
                 if let Some(w) = app.get_webview_window("main") {
@@ -1025,6 +1031,10 @@ pub fn run() {
             app.manage(diagnostic_access.clone());
             let cancellation = cancellation::Cancellation::default();
             app.manage(cancellation.clone());
+            let startup_error = startup_cleanup.err().map(|error| format!("Предыдущая сессия Atlas не завершила очистку сети: {error}"));
+            if let Some(error)=&startup_error {
+                incident_history::record("startup_cleanup_failed",json!({"error":error,"tun":network_guard::tun_diagnostic()}),&[]);
+            }
             let shared = Arc::new(Mutex::new(App {
                 revision: 0,
                 published,
@@ -1034,8 +1044,8 @@ pub fn run() {
                 settings,
                 store,
                 core,
-                status: "Disconnected".into(),
-                error: None,
+                status: if startup_error.is_some() { "CleanupError" } else { "Disconnected" }.into(),
+                error: startup_error,
                 control_error: None,
                 logs: vec![],
                 reconnect: intent.clone(),
@@ -1131,9 +1141,14 @@ pub fn run() {
                             if shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
                             let shutdown_deadline = shutdown.clone();
                             std::thread::spawn(move || {
-                                // Reserve the remainder of the five-second budget
-                                // for the independent service/route cleanup observer.
-                                std::thread::sleep(std::time::Duration::from_millis(2500));
+                                // Keep a final hard ceiling for the independent
+                                // service/route cleanup observer.
+                                // Normal shutdown is still immediate. This is only
+                                // the hard ceiling: allow the bounded core, service
+                                // and TUN stages to finish instead of killing the UI
+                                // halfway through tun_release and leaving Atlas-TUN
+                                // behind for the next launch.
+                                std::thread::sleep(std::time::Duration::from_millis(6000));
                                 if shutdown_deadline.load(std::sync::atomic::Ordering::SeqCst) {
                                     // Exit must not leave a hidden GUI process if cleanup stalls.
                                     std::process::exit(0);
