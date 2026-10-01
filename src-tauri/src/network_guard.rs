@@ -117,12 +117,23 @@ fn verified_wintun_driver(luid: &NET_LUID_LH) -> bool {
     let id=format!("{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
         guid.data1,guid.data2,guid.data3,guid.data4[0],guid.data4[1],guid.data4[2],guid.data4[3],guid.data4[4],guid.data4[5],guid.data4[6],guid.data4[7]);
     let machine=RegKey::predef(HKEY_LOCAL_MACHINE);
-    let connection=format!(r"SYSTEM\CurrentControlSet\Control\Network\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\{id}\Connection");
-    let Some(instance)=machine.open_subkey(connection).ok().and_then(|key|key.get_value::<String,_>("PnpInstanceID").ok()) else {return false;};
-    if !instance.eq_ignore_ascii_case(&format!(r"SWD\Wintun\{id}")) {return false;}
-    machine.open_subkey(format!(r"SYSTEM\CurrentControlSet\Enum\{instance}")).ok()
-        .and_then(|key|key.get_value::<String,_>("Service").ok())
-        .is_some_and(|service|service.eq_ignore_ascii_case("wintun"))
+    // PnP device instance IDs are not network-interface GUIDs. In particular,
+    // assuming SWD\Wintun\{NetCfgInstanceId} misclassifies an already DOWN
+    // adapter as active. Resolve the driver's authoritative network class key,
+    // as Wintun itself does, instead of reconstructing a PnP instance path.
+    let Ok(class)=machine.open_subkey(r"SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}") else {return false;};
+    let verified=class.enum_keys().filter_map(Result::ok).any(|name| {
+        let Ok(key)=class.open_subkey(name) else {return false;};
+        let instance=key.get_value::<String,_>("NetCfgInstanceId").unwrap_or_default();
+        let component=key.get_value::<String,_>("ComponentId").unwrap_or_default();
+        wintun_class_matches(&id,&instance,&component)
+    });
+    verified
+}
+
+fn wintun_class_matches(expected: &str, instance: &str, component: &str) -> bool {
+    !expected.is_empty() && expected.eq_ignore_ascii_case(instance)
+        && component.eq_ignore_ascii_case("wintun")
 }
 
 fn tun_probe() -> TunProbe {
@@ -555,6 +566,15 @@ fn dhcp_conditions(local: u16, remote: u16) -> [FWPM_FILTER_CONDITION0; 3] {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_identity_uses_network_guid_not_pnp_instance_shape() {
+        let id="{01234567-89ab-cdef-0123-456789abcdef}";
+        assert!(super::wintun_class_matches(id,&id.to_uppercase(),"Wintun"));
+        assert!(!super::wintun_class_matches(id,id,"tap0901"));
+        assert!(!super::wintun_class_matches(id,"{different-adapter}","wintun"));
+        assert!(!super::wintun_class_matches(id,"","wintun"));
+        assert!(!super::wintun_class_matches(id,id,""));
+    }
     #[test]
     fn competing_vpn_detection_includes_virtual_default_routes() {
         use windows_sys::Win32::NetworkManagement::IpHelper::{IF_TYPE_ETHERNET_CSMACD, IF_TYPE_PROP_VIRTUAL};

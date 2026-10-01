@@ -6,7 +6,7 @@ pub fn with_provider_fragment(line: &str, options: &crate::subscription_options:
     let parameters=&options.parameters;
     let enabled=|key: &str|parameters.get(key).is_some_and(|v|v=="1"||v.eq_ignore_ascii_case("true"));
     let mut url=url::Url::parse(line).map_err(|_|"Некорректный URI")?;
-    if enabled("fragmentation-enable") && !url.query_pairs().any(|(key,_)|key=="fragment") {
+    if enabled("fragmentation-enable") && !url.query_pairs().any(|(key,_)|key=="fragment" || key=="fragmentPackets" || key=="fragmentLength" || key=="fragmentInterval") {
         let get=|key: &str,default: &str|parameters.get(key).map(String::as_str).unwrap_or(default).to_owned();
         let mut value=format!("{},{},{}",get("fragmentation-length","50-100"),get("fragmentation-interval","10-20"),get("fragmentation-packets","tlshello"));
         if let Some(max)=parameters.get("fragmentation-maxsplit") {value.push(',');value.push_str(max);}
@@ -57,7 +57,7 @@ fn range(raw: &str, zero: bool) -> Result<String,String> {
 pub fn fragment(raw: &str) -> Result<Value,String> {
     let p: Vec<_> = raw.split(',').collect();
     if !(3..=4).contains(&p.len()) { return Err("fragment: нужны length,interval,packets[,maxSplit]".into()); }
-    let packets=if p[2]=="tlshello" {p[2].to_owned()} else {range(p[2],false)?};
+    let packets=match p[2] {"tlshello"=>"tlshello".to_owned(),"all"=>String::new(),value=>range(value,false)?};
     let mut v=json!({"length":range(p[0],false)?,"interval":range(p[1],true)?,"packets":packets});
     if p.len()==4 {v["maxSplit"]=json!(range(p[3],false)?);}
     Ok(v)
@@ -83,8 +83,19 @@ pub fn noises(raw: &str) -> Result<Value,String> {
 /// Return None for links which should keep using their existing Mihomo adapter.
 pub fn uri(line: &str) -> Result<Option<Value>,String> {
     let u=url::Url::parse(line).map_err(|_|"Некорректный URI")?;
-    let q: HashMap<String,String>=u.query_pairs().into_owned().collect();
-    if u.scheme()!="vless" && !(u.scheme()=="trojan" && (q.contains_key("fragment") || q.contains_key("noises") || q.contains_key("atlas-xray"))) {return Ok(None);}
+    let mut q: HashMap<String,String>=u.query_pairs().into_owned().collect();
+    // INCY share links use three separate fields rather than Happ's tuple.
+    // Normalize before adapter selection so Trojan cannot silently lose them.
+    if !q.contains_key("fragment") && ["fragmentPackets","fragmentLength","fragmentInterval"].iter().any(|key|q.contains_key(*key)) {
+        let value=format!("{},{},{}",q.get("fragmentLength").map(String::as_str).unwrap_or("50-100"),
+            q.get("fragmentInterval").map(String::as_str).unwrap_or("10-20"),
+            q.get("fragmentPackets").map(String::as_str).unwrap_or("tlshello"));
+        fragment(&value)?;
+        q.insert("fragment".into(),value);
+    }
+    let needs_xray=["fragment","noises","atlas-xray","fm","pcs","vcn","ech","peer"].iter().any(|key|q.contains_key(*key))
+        || q.get("type").is_some_and(|v|["xhttp","splithttp","httpupgrade","kcp"].contains(&v.as_str()));
+    if u.scheme()!="vless" && !(u.scheme()=="trojan" && needs_xray) {return Ok(None);}
     let host=u.host_str().ok_or("В URI отсутствует сервер")?;
     let port=u.port().ok_or("В URI отсутствует порт")?;
     let decode=|s: &str|url::form_urlencoded::parse(format!("v={}",s.replace('+',"%2B")).as_bytes()).next().map(|(_,v)|v.into_owned()).unwrap_or_default();
@@ -130,16 +141,27 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
     match security.as_str() {
         "none"=>{},
         "tls"|"reality"=>{
-            let mut tls=json!({"serverName":get("sni",host),"fingerprint":get("fp","chrome")});
+            let mut tls=json!({"serverName":get("sni",q.get("peer").map(String::as_str).unwrap_or(host)),"fingerprint":get("fp","chrome")});
+            if security=="tls" {
+                for (query,field) in [("pcs","pinnedPeerCertSha256"),("vcn","verifyPeerCertByName"),("ech","echConfigList")] {
+                    if let Some(value)=q.get(query) {tls[field]=json!(value);}
+                }
+            }
             if let Some(alpn)=q.get("alpn") {tls["alpn"]=json!(alpn.split(',').collect::<Vec<_>>());}
             if security=="reality" {
                 tls["publicKey"]=json!(q.get("pbk").ok_or("Reality: отсутствует public key")?);
                 tls["shortId"]=json!(get("sid","")); tls["spiderX"]=json!(get("spx",""));
+                if let Some(value)=q.get("pqv") {tls["mldsa65Verify"]=json!(value);}
             }
             if security=="tls" && q.get("allowInsecure").is_some_and(|v|v=="1"||v=="true") {tls["allowInsecure"]=json!(true);}
             stream[if security=="tls" {"tlsSettings"} else {"realitySettings"}]=tls;
         }
         _=>return Err("Xray: неизвестный security".into()),
+    }
+    if let Some(raw)=q.get("fm") {
+        let mask: Value=serde_json::from_str(raw).map_err(|_|"Xray fm: некорректный JSON")?;
+        if !mask.is_object() {return Err("Xray fm должен быть объектом".into());}
+        stream["finalmask"]=mask;
     }
     let credentials=decode(u.username());
     let settings=if u.scheme()=="vless" {
@@ -208,9 +230,46 @@ pub fn controlled_profile(profile: &Value, inbound: Value) -> Result<Value,Strin
     for outbound in profile["outbounds"].as_array_mut().ok_or("Xray: отсутствуют outbounds")? {
         if outbound["protocol"]=="wireguard" {outbound["settings"]["noKernelTun"]=json!(true);}
     }
+    prepare_observatory_dns(&mut profile)?;
     profile["inbounds"]=json!([inbound]);
     profile["log"]=json!({"loglevel":"warning"});
     Ok(profile)
+}
+
+/// Bootstrap observatory without waiting for the balancer it is measuring.
+/// Only literal DNS endpoints and their DNS ports bypass the balancer; application
+/// traffic to the same address must continue to obey the provider's rules.
+fn prepare_observatory_dns(profile: &mut Value) -> Result<(),String> {
+    if profile.get("observatory").is_none() && profile.get("burstObservatory").is_none() {return Ok(());}
+    if profile.get("stats").is_none() {profile["stats"]=json!({});}
+    if !profile["routing"]["balancers"].as_array().is_some_and(|v|!v.is_empty()) {return Ok(());}
+    let mut endpoints=std::collections::BTreeSet::new();
+    if let Some(servers)=profile["dns"]["servers"].as_array() {
+        for server in servers {
+            let Some(address)=server.as_str().or_else(||server["address"].as_str()) else {continue;};
+            if let Ok(ip)=address.parse::<std::net::IpAddr>() {
+                let port=server.get("port").and_then(Value::as_u64).unwrap_or(53);
+                if port==0 || port>65535 {return Err("Xray DNS: некорректный порт".into());}
+                endpoints.insert((ip.to_string(),port,"tcp,udp"));
+            } else if let Ok(url)=url::Url::parse(address) {
+                // +local resolvers already bypass Xray routing.
+                if url.scheme()!="https" && url.scheme()!="tcp" {continue;}
+                let ip=match url.host() {Some(url::Host::Ipv4(ip))=>ip.to_string(),Some(url::Host::Ipv6(ip))=>ip.to_string(),_=>continue};
+                endpoints.insert((ip,url.port().unwrap_or(if url.scheme()=="https" {443} else {53}) as u64,"tcp"));
+            }
+        }
+    }
+    if endpoints.is_empty() {return Ok(());}
+    let outbounds=profile["outbounds"].as_array_mut().ok_or("Xray: отсутствуют outbounds")?;
+    let mut tag="atlas-dns-bootstrap".to_owned();
+    while outbounds.iter().any(|o|o["tag"].as_str()==Some(&tag)) {tag.push('_');}
+    outbounds.push(json!({"tag":tag,"protocol":"freedom","settings":{"domainStrategy":"AsIs"}}));
+    if profile["routing"].get("rules").is_none() {profile["routing"]["rules"]=json!([]);}
+    let rules=profile["routing"]["rules"].as_array_mut().ok_or("Xray routing.rules должен быть массивом")?;
+    for (ip,port,network) in endpoints.into_iter().rev() {
+        rules.insert(0,json!({"type":"field","ip":[ip],"port":port.to_string(),"network":network,"outboundTag":tag}));
+    }
+    Ok(())
 }
 
 pub fn import_json(text: &str) -> Result<Option<Vec<Value>>,String> {
@@ -232,6 +291,42 @@ pub fn import_json(text: &str) -> Result<Option<Vec<Value>>,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incy_security_and_fragment_fields_survive_import() {
+        let link="trojan://secret@example.com:443?peer=tls.example&fragmentPackets=all&fragmentLength=10-30&fragmentInterval=0-1&pcs=pin&vcn=tls.example&ech=config&fm=%7B%22tcp%22%3A%5B%5D%7D";
+        let (_,options)=crate::subscription_options::extract("#fragmentation-enable: 1",&Default::default(),&Default::default(),"https://example.com/sub").unwrap();
+        let normalized=with_provider_fragment(link,&options).unwrap();
+        let node=uri(&normalized).unwrap().unwrap();
+        let stream=&node["xray"]["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["tlsSettings"]["serverName"],"tls.example");
+        assert_eq!(stream["tlsSettings"]["pinnedPeerCertSha256"],"pin");
+        assert_eq!(stream["tlsSettings"]["verifyPeerCertByName"],"tls.example");
+        assert_eq!(stream["tlsSettings"]["echConfigList"],"config");
+        assert_eq!(stream["finalmask"],json!({"tcp":[]}));
+        assert_eq!(node["xray"]["outbounds"][1]["settings"]["fragment"],json!({"packets":"","length":"10-30","interval":"0-1"}));
+        assert!(uri("vless://id@example.com:443?fm=[]").is_err());
+        assert!(uri("trojan://secret@example.com:443?fragmentLength=30-10").is_err());
+        let reality=uri("vless://id@example.com:443?security=reality&pbk=key&pqv=verify").unwrap().unwrap();
+        assert_eq!(reality["xray"]["outbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Verify"],"verify");
+    }
+    #[test]
+    fn observatory_dns_bootstrap_is_narrow_and_preserves_provider_rules() {
+        let original=json!({"outbounds":[{"tag":"atlas-dns-bootstrap","protocol":"blackhole"}],
+            "dns":{"servers":["1.1.1.1",{"address":"https://[2606:4700:4700::1111]/dns-query"},"https+local://8.8.8.8/dns-query"]},
+            "observatory":{"subjectSelector":["proxy"]},
+            "routing":{"balancers":[{"tag":"balance","selector":["proxy"]}],"rules":[{"type":"field","network":"tcp,udp","balancerTag":"balance"}]}});
+        let result=controlled_profile(&original,json!({"tag":"atlas"})).unwrap();
+        assert!(result["stats"].is_object());
+        let rules=result["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(),3);
+        assert_eq!(rules[0]["port"],"53");
+        assert_eq!(rules[1]["port"],"443");
+        assert_eq!(rules[0]["outboundTag"],"atlas-dns-bootstrap_");
+        assert_eq!(rules[2],original["routing"]["rules"][0]);
+        assert_eq!(result["routing"]["balancers"],original["routing"]["balancers"]);
+        let mut no_balancer=original.clone();no_balancer["routing"]["balancers"]=json!([]);
+        assert_eq!(controlled_profile(&no_balancer,json!({"tag":"atlas"})).unwrap()["routing"],no_balancer["routing"]);
+    }
     #[test]
     fn fragmentation_is_attached_to_the_transport_dialer() {
         let n=uri("vless://00000000-0000-0000-0000-000000000001@a.example:443?security=tls&type=xhttp&fragment=10-20,0-1,tlshello,100&noises=rand,10-20,0-1,ipv4#A").unwrap().unwrap();
@@ -281,6 +376,31 @@ mod tests {
             let result=std::process::Command::new(&binary).creation_flags(0x08000000).args(["run","-test","-config"]).arg(&path).output().unwrap();
             let _=std::fs::remove_file(path);
             assert!(result.status.success(),"{transport}: {} {}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+        }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn pinned_xray_accepts_incy_fragments_and_observatory_bootstrap() {
+        use std::os::windows::process::CommandExt;
+        let binary=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Xray.exe");
+        let inbound=json!({"tag":"atlas","listen":"127.0.0.1","port":19001,"protocol":"socks","settings":{}});
+        let mut profiles=Vec::new();
+        for packets in ["all","tlshello","1-3"] {
+            let link=format!("trojan://secret@example.com:443?peer=tls.example&fragmentPackets={packets}&fragmentLength=10-30&fragmentInterval=0-1&vcn=tls.example&fm=%7B%22tcp%22%3A%5B%5D%7D");
+            profiles.push(uri(&link).unwrap().unwrap()["xray"].clone());
+        }
+        profiles.push(json!({"outbounds":[{"tag":"proxy","protocol":"freedom"}],
+            "dns":{"servers":["1.1.1.1", "https://[2606:4700:4700::1111]/dns-query"]},
+            "observatory":{"subjectSelector":["proxy"],"probeURL":"https://example.com","probeInterval":"30s"},
+            "routing":{"balancers":[{"tag":"balance","selector":["proxy"],"strategy":{"type":"leastPing"}}],
+                "rules":[{"type":"field","network":"tcp,udp","balancerTag":"balance"}]}}));
+        for profile in profiles {
+            let config=controlled_profile(&profile,inbound.clone()).unwrap();
+            let path=std::env::temp_dir().join(format!("atlas-incy-test-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&path,serde_json::to_vec(&config).unwrap()).unwrap();
+            let result=std::process::Command::new(&binary).creation_flags(0x08000000).args(["run","-test","-config"]).arg(&path).output().unwrap();
+            let _=std::fs::remove_file(path);
+            assert!(result.status.success(),"{} {}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
         }
     }
     #[test]

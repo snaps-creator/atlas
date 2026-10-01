@@ -106,8 +106,18 @@ rules:
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($adapter.Status -ne 'Up') { throw 'New core failed to reconnect after the upgrade' }
+    $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $inspection.verifiedWintunDriver) { throw 'Live Wintun driver identity was not verified' }
     $core.Kill()
     $core.WaitForExit(5000) | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0) { throw 'Post-exit adapter inspection failed' }
+        if ($null -eq $inspection.activeLuid) { break }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if ($null -ne $inspection.activeLuid) { throw 'Exited core left an active or misclassified Wintun adapter' }
     Write-Output 'PASS: new core can reopen Atlas-TUN after the upgrade.'
     $desktop = [Diagnostics.Process]::Start($start)
     Start-Sleep -Milliseconds 300
