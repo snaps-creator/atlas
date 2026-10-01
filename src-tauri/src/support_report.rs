@@ -407,7 +407,7 @@ pub(crate) fn save(
         return Ok(false);
     };
     let started = crate::model::now();
-    let history = crate::incident_history::snapshot();
+    let history = crate::incident_history::snapshot_for_report();
     let deadline = Instant::now() + Duration::from_secs(85);
     let (tx, rx) = mpsc::channel();
     let os_tx = tx.clone();
