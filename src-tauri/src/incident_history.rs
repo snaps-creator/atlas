@@ -39,6 +39,50 @@ pub fn snapshot() -> Value {
         "meaning":"Compact periodic state plus deduplicated logs; explicit coverage, not packet capture",
         "entries":h.entries})).unwrap_or_else(|_| json!({"error":"History lock poisoned"}))
 }
+
+fn report_entry(value: &Value) -> Value {
+    if value["kind"] != "automatic_incident" { return value.clone(); }
+    let evidence = value["evidence"].as_str().unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(evidence).unwrap_or(Value::Null);
+    // A fresh incident snapshot is collected below the history section of every
+    // exported report. Keeping eight older multi-megabyte Windows/proxy dumps made
+    // the text file look frozen and obscured the timeline. The adjacent
+    // incident_summary entries already retain failures and active probe results;
+    // keep only identity/timing/error fields here so previous incidents remain
+    // correlatable without repeating their complete inventories.
+    json!({
+        "at": value["at"],
+        "kind": value["kind"],
+        "evidence": {
+            "revision": parsed["revision"],
+            "before": {
+                "startedAt": parsed["before"]["startedAt"],
+                "completedAt": parsed["before"]["completedAt"],
+                "logs": parsed["before"]["logs"]["evidence"]
+            },
+            "after": {
+                "startedAt": parsed["after"]["startedAt"],
+                "completedAt": parsed["after"]["completedAt"],
+                "logs": parsed["after"]["logs"]["evidence"]
+            },
+            "activeErrors": parsed["active"].get("errors").cloned().unwrap_or(Value::Null),
+            "originalBytes": evidence.len(),
+            "fullEvidence": "Current export contains a fresh full incident snapshot; prior details are retained by the neighboring incident_summary entry"
+        }
+    })
+}
+
+pub fn snapshot_for_report() -> Value {
+    history().lock().map(|h| {
+        let entries: Vec<_> = h.entries.iter().map(report_entry).collect();
+        json!({"maxEntries":MAX_ENTRIES,"maxBytes":MAX_BYTES,
+            "retainedBytes":h.bytes,"exportedBytes":entries.iter().map(|v|v.to_string().len()).sum::<usize>(),
+            "droppedEntries":h.dropped,
+            "firstAt":h.entries.front().and_then(|v|v.get("at")),"lastAt":h.entries.back().and_then(|v|v.get("at")),
+            "meaning":"Compact periodic state and prior incident summaries; the current incident has full evidence below",
+            "entries":entries})
+    }).unwrap_or_else(|_| json!({"error":"History lock poisoned"}))
+}
 pub fn load(path: &Path) {
     if std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_BYTES as u64 + 65536) {
         if let Ok(data) = std::fs::read_to_string(path) {
@@ -91,5 +135,16 @@ mod tests {
         assert_eq!(h.entries.front().unwrap()["i"], 10);
         for _ in 0..20 { h.push(json!({"data":"x".repeat(MAX_BYTES / 8)})); }
         assert!(h.bytes <= MAX_BYTES);
+    }
+    #[test]
+    fn report_compacts_full_automatic_incident_but_keeps_identity() {
+        let entry=json!({"at":7,"kind":"automatic_incident","evidence":json!({
+            "revision":42,"before":{"startedAt":1,"completedAt":2,"logs":{"evidence":["dial failed"]},"windows":"x".repeat(512*1024)},
+            "active":{"errors":["timeout"]},"after":{"startedAt":3,"completedAt":4,"logs":{"evidence":[]}}
+        }).to_string()});
+        let compact=report_entry(&entry);
+        assert_eq!(compact["evidence"]["revision"],42);
+        assert_eq!(compact["evidence"]["before"]["logs"][0],"dial failed");
+        assert!(compact.to_string().len()<4096);
     }
 }
