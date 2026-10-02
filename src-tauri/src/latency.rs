@@ -308,11 +308,18 @@ mod tests {
             masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})]});
         let binary=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
-        let result=with_offline_core(settings,binary,std::env::temp_dir(),|client| {
+        let parent=std::env::temp_dir().join(format!("atlas-probe-recovery-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let marker=parent.join("tun-guard.active");
+        std::fs::write(&marker,b"existing protected session").unwrap();
+        let result=with_offline_core(settings,binary,parent.clone(),|client| {
             assert_eq!(client.api("GET","/configs",None)?["tun"]["enable"],false);
             Ok(display_probe(&client,"fixture",&endpoint,3000))
         }).unwrap();
         worker.join().unwrap();
         assert_eq!(result.status,"ok","{result:?}");
+        assert_eq!(std::fs::read(&marker).unwrap(),b"existing protected session");
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(),1);
+        std::fs::remove_dir_all(parent).unwrap();
     }
 }

@@ -508,6 +508,11 @@ impl Core {
         self.draining_xray.clear();
         let had_privileged_core = self.elevated && self.child.is_some();
         let had_broker = self.broker.is_some();
+        if had_privileged_core || had_broker {
+            // Capture the verified GUID/LUID before Windows withdraws driver
+            // metadata during teardown. This does not classify an UP TUN as free.
+            let _ = tun_identity();
+        }
         if self.broker.as_ref().is_some_and(|b| !b.alive()) {
             self.broker = None;
         }

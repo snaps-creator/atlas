@@ -111,7 +111,7 @@ struct TunProbe {
 // The interface description is chosen by the application (Mihomo uses
 // "Meta Tunnel"). Verify the actual driver through the adapter's GUID instead.
 fn verified_wintun_driver(luid: &NET_LUID_LH) -> bool {
-    use winreg::{RegKey,enums::HKEY_LOCAL_MACHINE};
+    use winreg::{RegKey,enums::{HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE}};
     let mut guid: GUID=unsafe {std::mem::zeroed()};
     if unsafe {ConvertInterfaceLuidToGuid(luid,&mut guid)}!=0 {return false;}
     let id=format!("{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
@@ -121,19 +121,57 @@ fn verified_wintun_driver(luid: &NET_LUID_LH) -> bool {
     // assuming SWD\Wintun\{NetCfgInstanceId} misclassifies an already DOWN
     // adapter as active. Resolve the driver's authoritative network class key,
     // as Wintun itself does, instead of reconstructing a PnP instance path.
-    let Ok(class)=machine.open_subkey(r"SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}") else {return false;};
-    let verified=class.enum_keys().filter_map(Result::ok).any(|name| {
-        let Ok(key)=class.open_subkey(name) else {return false;};
-        let instance=key.get_value::<String,_>("NetCfgInstanceId").unwrap_or_default();
-        let component=key.get_value::<String,_>("ComponentId").unwrap_or_default();
-        wintun_class_matches(&id,&instance,&component)
+    let observed = machine.open_subkey_with_flags(
+        r"SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}",
+        KEY_ENUMERATE_SUB_KEYS).ok().and_then(|class| {
+        class.enum_keys().filter_map(Result::ok).find_map(|name| {
+            // Querying values does not require enumeration/notification access
+            // to each device key (KEY_READ requests those additional rights).
+            let key=class.open_subkey_with_flags(name, KEY_QUERY_VALUE).ok()?;
+            let instance=key.get_value::<String,_>("NetCfgInstanceId").ok()?;
+            if !id.eq_ignore_ascii_case(&instance) { return None; }
+            let component=key.get_value::<String,_>("ComponentId").ok()?;
+            Some(wintun_class_matches(&id,&instance,&component))
+        })
+    }).or_else(|| {
+        // Resolve the PnP instance from Windows' GUID mapping, not by guessing
+        // its path. This also works when enumerating class keys is restricted.
+        let connection=machine.open_subkey_with_flags(format!(
+            r"SYSTEM\CurrentControlSet\Control\Network\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\{id}\Connection"),
+            KEY_QUERY_VALUE).ok()?;
+        let instance=connection.get_value::<String,_>("PnpInstanceID").ok()?;
+        if instance.is_empty() { return None; }
+        let device=machine.open_subkey_with_flags(format!(r"SYSTEM\CurrentControlSet\Enum\{instance}"),KEY_QUERY_VALUE).ok()?;
+        Some(wintun_device_matches(&device.get_value::<String,_>("ClassGUID").ok()?,
+            &device.get_value::<String,_>("Service").ok()?,
+            &device.get_value::<Vec<String>,_>("HardwareID").ok()?))
     });
-    verified
+    // Windows can withdraw the device's registry key before its down interface
+    // row disappears. Retain positive driver evidence for THIS exact instance,
+    // never for an alias alone. A conflicting driver revokes that evidence.
+    static IDENTITY: Mutex<Option<(u64,u128)>> = Mutex::new(None);
+    let identity=(unsafe {luid.Value},guid_value(guid));
+    let mut cached=IDENTITY.lock().unwrap_or_else(|e|e.into_inner());
+    verified_driver_identity(&mut cached,identity,observed)
+}
+
+fn verified_driver_identity(cached: &mut Option<(u64,u128)>, identity: (u64,u128), observed: Option<bool>) -> bool {
+    match observed {
+        Some(true) => { *cached=Some(identity); true },
+        Some(false) => { *cached=None; false },
+        None => *cached==Some(identity),
+    }
 }
 
 fn wintun_class_matches(expected: &str, instance: &str, component: &str) -> bool {
     !expected.is_empty() && expected.eq_ignore_ascii_case(instance)
         && component.eq_ignore_ascii_case("wintun")
+}
+
+fn wintun_device_matches(class: &str, service: &str, hardware: &[String]) -> bool {
+    class.eq_ignore_ascii_case("{4D36E972-E325-11CE-BFC1-08002BE10318}")
+        && service.eq_ignore_ascii_case("wintun")
+        && hardware.iter().any(|id|id.eq_ignore_ascii_case("wintun"))
 }
 
 fn tun_probe() -> TunProbe {
@@ -567,6 +605,17 @@ fn dhcp_conditions(local: u16, remote: u16) -> [FWPM_FILTER_CONDITION0; 3] {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn withdrawn_registry_key_preserves_only_the_verified_interface_instance() {
+        let mut cached=None;
+        assert!(!super::verified_driver_identity(&mut cached,(42,7),None));
+        assert!(super::verified_driver_identity(&mut cached,(42,7),Some(true)));
+        assert!(super::verified_driver_identity(&mut cached,(42,7),None));
+        assert!(!super::verified_driver_identity(&mut cached,(42,8),None));
+        assert!(!super::verified_driver_identity(&mut cached,(43,7),None));
+        assert!(!super::verified_driver_identity(&mut cached,(42,7),Some(false)));
+        assert!(!super::verified_driver_identity(&mut cached,(42,7),None));
+    }
+    #[test]
     fn driver_identity_uses_network_guid_not_pnp_instance_shape() {
         let id="{01234567-89ab-cdef-0123-456789abcdef}";
         assert!(super::wintun_class_matches(id,&id.to_uppercase(),"Wintun"));
@@ -574,6 +623,11 @@ mod tests {
         assert!(!super::wintun_class_matches(id,"{different-adapter}","wintun"));
         assert!(!super::wintun_class_matches(id,"","wintun"));
         assert!(!super::wintun_class_matches(id,id,""));
+        let net_class="{4d36e972-e325-11ce-bfc1-08002be10318}";
+        assert!(super::wintun_device_matches(net_class,"Wintun",&["Wintun".into()]));
+        assert!(!super::wintun_device_matches(net_class,"tap0901",&["Wintun".into()]));
+        assert!(!super::wintun_device_matches(net_class,"Wintun",&["Meta Tunnel".into()]));
+        assert!(!super::wintun_device_matches("unknown","Wintun",&["Wintun".into()]));
     }
     #[test]
     fn competing_vpn_detection_includes_virtual_default_routes() {
