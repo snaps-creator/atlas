@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 pub const DISPLAY_URL: &str = "http://cp.cloudflare.com/generate_204";
 pub const DISPLAY_TIMEOUT_MS: u64 = 10000;
+const DISCOVERY_TIMEOUT_MS: u64 = 1500;
+const DISPLAY_WORKERS: usize = 6;
 /// Opaque identity of actual node parameters, independent of UI preferences,
 /// selected route and subscription refresh timestamps. Never expose credentials.
 pub fn node_identity(node: &Value) -> String {
@@ -73,7 +75,53 @@ pub(crate) fn display_batch_at(client: ApiClient, names: &[String], endpoint: &s
 
 fn display_batch_stream(client: ApiClient, names: &[String], endpoint: &str, timeout: u64,
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
-    Ok(run_display_batch(names, &|name| serde_json::to_value(display_probe(&client, name, endpoint, timeout)).unwrap(), progress))
+    let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
+    let names = discovery_order(names, &proxies, endpoint);
+    Ok(discover_batch(&names, timeout, &|name, deadline|
+        display_probe(&client, name, endpoint, deadline), progress))
+}
+
+fn discovery_order(names: &[String], proxies: &Value, endpoint: &str) -> Vec<String> {
+    // Sample across the whole list: subscription tails must not sit behind
+    // dozens of silently dropped connections, even on the first-ever check.
+    let width = names.len().div_ceil(DISPLAY_WORKERS).max(1);
+    let mut ordered = Vec::with_capacity(names.len());
+    for offset in 0..width {
+        for lane in 0..DISPLAY_WORKERS {
+            if let Some(name) = names.get(lane * width + offset) { ordered.push(name.clone()); }
+        }
+    }
+    let mut selected = "ATLAS";
+    for _ in 0..8 {
+        let Some(next) = proxies["proxies"][selected]["now"].as_str() else { break; };
+        if next == selected { break; }
+        selected = next;
+    }
+    ordered.sort_by_key(|name| if name == selected { 0 } else if
+        proxies["proxies"][name]["extra"][endpoint]["alive"] == true { 1 } else { 2 });
+    ordered
+}
+
+fn discover_batch(names: &[String], timeout: u64,
+    probe: &(dyn Fn(&str, u64) -> TestResult + Sync),
+    progress: &(dyn Fn(&str, &Value) + Sync)) -> Value {
+    let quick = timeout.min(DISCOVERY_TIMEOUT_MS);
+    let mut results = run_display_batch(names, &|name|
+        serde_json::to_value(probe(name, quick)).unwrap(), &|name, value| {
+        // An early timeout is only a scheduling hint, never a final verdict.
+        if value["status"] != "unreachable" || quick == timeout { progress(name, value); }
+    });
+    if quick < timeout {
+        let retry: Vec<_> = names.iter().filter(|name|
+            results[*name]["status"] == "unreachable").cloned().collect();
+        let completed = run_display_batch(&retry, &|name| {
+            let mut result = probe(name, timeout);
+            result.attempts = 2;
+            serde_json::to_value(result).unwrap()
+        }, progress);
+        results.as_object_mut().unwrap().extend(completed.as_object().unwrap().clone());
+    }
+    results
 }
 
 fn run_display_batch(names: &[String], probe: &(dyn Fn(&str) -> Value + Sync),
@@ -82,8 +130,8 @@ fn run_display_batch(names: &[String], probe: &(dyn Fn(&str) -> Value + Sync),
     let results = std::sync::Mutex::new(serde_json::Map::new());
     std::thread::scope(|scope| {
         // Keep spare controller capacity for active-node health and failover.
-        // The UI deadline is sized for six parallel network timeouts.
-        for worker in 0..names.len().min(6) {
+        // Short discovery runs first; full retries retain the same safe limit.
+        for worker in 0..names.len().min(DISPLAY_WORKERS) {
             let (next, results) = (&next, &results);
             scope.spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(worker as u64 * 20));
@@ -204,6 +252,80 @@ pub(crate) fn encode_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::Subscription;
+    #[test]
+    fn discovery_samples_subscription_tails_and_prioritizes_known_working_nodes() {
+        let names: Vec<_> = (0..174).map(|i|format!("node-{i}")).collect();
+        let cold = discovery_order(&names, &Value::Null, DISPLAY_URL);
+        assert_eq!(&cold[..6], &["node-0", "node-29", "node-58", "node-87", "node-116", "node-145"]);
+        let mut sorted = cold.clone(); sorted.sort();
+        let mut expected = names.clone(); expected.sort(); assert_eq!(sorted, expected);
+        let proxies = json!({"proxies":{
+            "ATLAS":{"now":"AUTO"}, "AUTO":{"now":"node-173"},
+            "node-172":{"extra":{DISPLAY_URL:{"alive":true}}}
+        }});
+        let warm = discovery_order(&names, &proxies, DISPLAY_URL);
+        assert_eq!(&warm[..2], &["node-173", "node-172"]);
+        assert!(discovery_order(&[], &Value::Null, DISPLAY_URL).is_empty());
+    }
+    #[test]
+    fn full_timeouts_cannot_hold_up_discovery_and_slow_nodes_get_a_full_retry() {
+        use std::sync::{Mutex,atomic::{AtomicUsize,Ordering}};
+        let names: Vec<_> = (0..18).map(|i|i.to_string()).collect();
+        let discovered = AtomicUsize::new(0);
+        let published = Mutex::new(Vec::new());
+        let result = discover_batch(&names, DISPLAY_TIMEOUT_MS, &|name, timeout| {
+            if timeout == DISCOVERY_TIMEOUT_MS { discovered.fetch_add(1,Ordering::SeqCst); }
+            else {
+                assert_eq!(discovered.load(Ordering::SeqCst), names.len());
+                assert!(published.lock().unwrap().iter().any(|(n,_)|n=="17"));
+                assert_eq!(timeout, DISPLAY_TIMEOUT_MS);
+            }
+            if name == "17" || (name == "16" && timeout == DISPLAY_TIMEOUT_MS) {
+                TestResult { status:"ok".into(),delay:Some(80),attempts:1,error:None }
+            } else if name == "15" {
+                TestResult { status:"error".into(),delay:None,attempts:1,error:Some("local IPC".into()) }
+            } else {
+                TestResult { status:"unreachable".into(),delay:None,attempts:1,error:Some("Mihomo API: HTTP 504".into()) }
+            }
+        }, &|name,value|published.lock().unwrap().push((name.to_owned(),value.clone())));
+        let published = published.into_inner().unwrap();
+        assert_eq!(published.len(), names.len());
+        assert_eq!(result["17"]["attempts"],1);
+        assert_eq!(result["16"]["status"],"ok");
+        assert_eq!(result["16"]["attempts"],2);
+        assert_eq!(result["0"]["status"],"unreachable");
+        assert_eq!(result["0"]["attempts"],2);
+        assert_eq!(result["15"]["status"],"error");
+        assert_eq!(result["15"]["attempts"],1);
+        assert!(published.iter().all(|(_,v)|v["status"]!="unreachable" || v["attempts"]==2));
+    }
+    #[test]
+    fn reachable_subscription_tail_is_published_before_blocked_prefix_finishes() {
+        use std::{sync::{Arc,mpsc,atomic::{AtomicBool,Ordering}},time::Duration};
+        let released=Arc::new(AtomicBool::new(false));
+        let worker_release=released.clone();
+        let (tx,rx)=mpsc::channel();
+        let worker=std::thread::spawn(move || {
+            let names:Vec<_>=(0..174).map(|i|i.to_string()).collect();
+            let names=discovery_order(&names,&Value::Null,DISPLAY_URL);
+            discover_batch(&names,DISPLAY_TIMEOUT_MS,&|name,_| {
+                if name!="58" {
+                    let deadline=std::time::Instant::now()+Duration::from_secs(5);
+                    while !worker_release.load(Ordering::SeqCst) && std::time::Instant::now()<deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                TestResult {status:"ok".into(),delay:Some(56),attempts:1,error:None}
+            }, &|name,_| {let _=tx.send(name.to_owned());})
+        });
+        let first=rx.recv_timeout(Duration::from_secs(2));
+        let still_waiting=!worker.is_finished();
+        released.store(true,Ordering::SeqCst);
+        let results=worker.join().unwrap();
+        assert_eq!(first.unwrap(),"58");
+        assert!(still_waiting);
+        assert_eq!(results.as_object().unwrap().len(),174);
+    }
     #[test]
     fn failed_node_recovers_on_next_probe_without_subscription_refresh() {
         use std::{io::{Read,Write}, net::TcpListener, thread, time::Duration};
