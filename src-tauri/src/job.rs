@@ -34,38 +34,55 @@ impl Job {
 }
 
 const DESKTOP_JOB_ENV: &str = "ATLAS_DESKTOP_JOB";
-const JOB_ASSIGN_QUERY_ACCESS: u32 = 0x0005; // JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY
-/// Only CEF helpers join this job. Installers and restarted GUI instances must
-/// survive the old desktop, so the desktop itself is deliberately not a member.
+/// Chromium utility processes can reject nested job assignment (access denied).
+/// An owned Windows mutex instead reports owner death, including crashes, to
+/// helpers without changing Chromium's job/security settings. Installers never
+/// subscribe. Create and drop this owner on the same desktop thread.
 pub struct DesktopJob {
-    _job: Job,
+    owner: isize,
 }
 impl DesktopJob {
     pub fn new() -> Result<Self, String> {
         let name = format!("Local\\Atlas-UI-{}", uuid::Uuid::new_v4());
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        let job = Job::create(wide.as_ptr())?;
+        let owner = unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 1, wide.as_ptr()) };
+        if owner.is_null() { return Err(format!("Не удалось создать наблюдателя интерфейса: {}", std::io::Error::last_os_error())); }
         std::env::set_var(DESKTOP_JOB_ENV, name);
-        Ok(Self { _job: job })
+        Ok(Self { owner: owner as isize })
     }
     /// Called before CEF initializes in each renderer/GPU/utility process.
-    /// The helper retains no job handle: only the GUI owns its lifetime.
+    /// SYNCHRONIZE access is sufficient; no process/job mutation is needed.
     pub fn join() -> Result<(), String> {
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use windows_sys::Win32::System::Threading::{OpenMutexW,WaitForSingleObject,ExitProcess};
         let name = std::env::var(DESKTOP_JOB_ENV).map_err(|_| "Нет владельца процесса интерфейса Atlas")?;
         let suffix = name.strip_prefix("Local\\Atlas-UI-").ok_or("Некорректный владелец интерфейса Atlas")?;
         uuid::Uuid::parse_str(suffix).map_err(|_| "Некорректный идентификатор интерфейса Atlas")?;
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         unsafe {
-            let handle = OpenJobObjectW(JOB_ASSIGN_QUERY_ACCESS, 0, wide.as_ptr());
-            if handle.is_null() { return Err("Основной процесс Atlas уже завершён".into()); }
-            let mut member = 0;
-            let inherited = IsProcessInJob(GetCurrentProcess(), handle, &mut member) != 0 && member != 0;
-            let assigned = inherited || AssignProcessToJobObject(handle, GetCurrentProcess()) != 0;
-            CloseHandle(handle);
-            if !assigned { return Err("Не удалось связать процесс интерфейса с Atlas".into()); }
+            let handle = OpenMutexW(0x00100000, 0, wide.as_ptr()); // SYNCHRONIZE
+            if handle.is_null() { return Err(format!("Основной процесс Atlas уже завершён: {}", std::io::Error::last_os_error())); }
+            let raw = handle as isize;
+            if let Err(error) = std::thread::Builder::new().name("atlas-desktop-lifetime".into()).spawn(move || {
+                let result = WaitForSingleObject(raw as _, u32::MAX);
+                // Both a normal owner release and an abandoned mutex mean
+                // the desktop is gone. ExitProcess also releases ownership,
+                // waking the next helper; no polling or PID reuse is involved.
+                if result == 0 || result == 0x80 { ExitProcess(0); }
+                ExitProcess(1);
+            }) {
+                CloseHandle(handle);
+                return Err(format!("Не удалось запустить наблюдателя интерфейса: {error}"));
+            }
         }
         Ok(())
+    }
+}
+impl Drop for DesktopJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.owner as _);
+            CloseHandle(self.owner as _);
+        }
     }
 }
 impl Drop for Job {
@@ -105,6 +122,14 @@ mod tests {
                 .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 20"])
                 .creation_flags(0x08000000).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
             std::fs::write(directory.join("installer-pid"), installer.id().to_string()).unwrap();
+            if mode == "release" {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !directory.join("release-owner").exists() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                drop(_job);
+            }
             std::thread::sleep(Duration::from_secs(20));
             let _ = child.kill();
             let _ = child.wait();
@@ -113,6 +138,13 @@ mod tests {
     }
     #[test]
     fn killing_desktop_kills_joined_helpers_but_not_an_installer() {
+        check_desktop_lifetime(false);
+    }
+    #[test]
+    fn normal_desktop_release_stops_helpers_but_not_an_installer() {
+        check_desktop_lifetime(true);
+    }
+    fn check_desktop_lifetime(release: bool) {
         use std::os::windows::io::{FromRawHandle, OwnedHandle};
         use windows_sys::Win32::{Storage::FileSystem::SYNCHRONIZE,
             System::Threading::{OpenProcess, WaitForSingleObject}, Foundation::WAIT_OBJECT_0};
@@ -120,7 +152,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let mut owner = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "job::tests::desktop_process_fixture"])
-            .env("ATLAS_JOB_TEST_MODE", "owner").env("ATLAS_JOB_TEST_DIR", &directory)
+            .env("ATLAS_JOB_TEST_MODE", if release { "release" } else { "owner" }).env("ATLAS_JOB_TEST_DIR", &directory)
             .creation_flags(0x08000000).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !(directory.join("ready").exists() && directory.join("pid").exists() && directory.join("installer-pid").exists()) {
@@ -138,10 +170,11 @@ mod tests {
         let installer_raw = unsafe { OpenProcess(SYNCHRONIZE | windows_sys::Win32::System::Threading::PROCESS_TERMINATE, 0, installer_pid) };
         assert!(!installer_raw.is_null());
         let installer = unsafe { OwnedHandle::from_raw_handle(installer_raw) };
-        owner.kill().unwrap();
-        owner.wait().unwrap();
+        if release { std::fs::write(directory.join("release-owner"), b"release").unwrap(); }
+        else { owner.kill().unwrap(); owner.wait().unwrap(); }
         let helper_exited = unsafe { WaitForSingleObject(helper.as_raw_handle(), 1000) };
         let installer_survived = unsafe { WaitForSingleObject(installer.as_raw_handle(), 0) } == windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        if release { owner.kill().unwrap(); owner.wait().unwrap(); }
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(installer.as_raw_handle(), 0);
             WaitForSingleObject(installer.as_raw_handle(), 1000);

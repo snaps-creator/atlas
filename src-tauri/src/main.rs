@@ -1,6 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#[tauri_runtime_cef::cef_entry_point]
 fn main() {
+    // The stock CEF entry macro dispatches helpers before the application body.
+    // Subscribe to desktop lifetime FIRST so renderer/GPU/utility processes cannot
+    // outlive their owner, including on crash or std::process::exit.
+    if std::env::args().any(|arg| arg.starts_with("--type=")) {
+        if let Err(error) = atlas::DesktopJob::join() {
+            eprintln!("{error}");
+            if let Some(path) = std::env::var_os("ATLAS_UI_SMOKE_REPORT") {
+                let _ = std::fs::write(format!("{}.helper-error", std::path::Path::new(&path).display()), &error);
+            }
+            std::process::exit(1);
+        }
+        tauri_runtime_cef::run_cef_helper_process();
+        return;
+    }
+    // Only helpers subscribe: an updater launched by the desktop must survive it.
+    // Windows abandons the owned mutex even on abrupt exit.
+    let _desktop_job = match atlas::DesktopJob::new() {
+        Ok(job) => job,
+        Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+    };
+    run_application();
+}
+
+fn run_application() {
     // A short, side-effect-free UI launch for process-name acceptance. It
     // deliberately bypasses Atlas setup, stored preferences, service and VPN.
     if std::env::var_os("ATLAS_UI_PROCESS_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1")) {

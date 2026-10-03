@@ -2,7 +2,8 @@ param([Parameter(Mandatory=$true)][string]$Executable)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path $exe -Parent
-$evidence = Join-Path $env:TEMP ('atlas-ui-acceptance-' + [guid]::NewGuid().ToString('N'))
+$evidenceRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$evidence = Join-Path $evidenceRoot ('atlas-ui-acceptance-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $evidence | Out-Null
 $report = Join-Path $evidence 'report.json'
 $previousMode = $env:ATLAS_UI_PROCESS_SMOKE
@@ -29,7 +30,12 @@ try {
         if ($remaining.Count -eq 0) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
-    if ($remaining.Count -ne 0) { throw 'Isolated Atlas UI left helper processes behind' }
+    if ($remaining.Count -ne 0) {
+        $remaining | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine |
+            ConvertTo-Json | Set-Content (Join-Path $evidence 'processes.json')
+        Write-Output "UI process evidence: $evidence"
+        throw 'Isolated Atlas UI left helper processes behind'
+    }
     $result | ConvertTo-Json -Compress
     Write-Output 'PASS: packaged React interface rendered, IPC responded, all isolated UI processes exited; no VPN/service setup executed.'
 } finally {
