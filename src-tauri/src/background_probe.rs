@@ -3,11 +3,11 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 #[derive(Default)]
-pub struct Probe {
-    pending: Option<Receiver<bool>>,
+pub struct Probe<T = bool> {
+    pending: Option<Receiver<T>>,
 }
-impl Probe {
-    pub fn start(&mut self, check: impl FnOnce() -> bool + Send + 'static) -> bool {
+impl<T: Default + Send + 'static> Probe<T> {
+    pub fn start(&mut self, check: impl FnOnce() -> T + Send + 'static) -> bool {
         if self.pending.is_some() {
             return false;
         }
@@ -20,11 +20,11 @@ impl Probe {
         self.pending = Some(rx);
         true
     }
-    pub fn poll(&mut self) -> Option<bool> {
+    pub fn poll(&mut self) -> Option<T> {
         let result = match self.pending.as_ref()?.try_recv() {
             Ok(value) => Some(value),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(false),
+            Err(TryRecvError::Disconnected) => Some(T::default()),
         };
         if result.is_some() { self.pending = None; }
         result

@@ -16,6 +16,7 @@ mod latency;
 mod resilient_selection;
 mod model;
 mod network_guard;
+mod network_change;
 mod portable;
 mod published_state;
 mod process_stop;

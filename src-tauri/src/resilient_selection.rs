@@ -44,6 +44,7 @@ struct Scheduled {
 #[derive(Default)]
 pub(crate) struct Recovery {
     generation: u64,
+    route_revision: u64,
     last_line: Option<String>,
     blocked: HashMap<String,Quarantine>,
     network_epoch: Option<String>,
@@ -64,6 +65,11 @@ pub(crate) struct Recovery {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Recovery {
+    pub(crate) fn path_epoch(&self) -> (u64,u64) { (self.generation,self.route_revision) }
+    pub(crate) fn network_changed(&mut self) {
+        self.blocked.clear();
+        self.invalidate();
+    }
     #[cfg(test)]
     pub(crate) fn propose_for_test(&mut self, value: Value) {
         let (tx,rx)=mpsc::channel();tx.send(value).unwrap();
@@ -172,6 +178,7 @@ impl Recovery {
         self.improvement = Some((name.to_owned(),count));
         if count < 2 || self.current_since.is_none_or(|since|since.elapsed() < Duration::from_secs(60)) { return; }
         let group = settings.selected.as_str();
+        self.route_revision=self.route_revision.wrapping_add(1);
         if client.api("PUT",&format!("/proxies/{group}"),Some(json!({"name":name}))).is_ok()
             && client.api("GET",&format!("/proxies/{group}"),None).is_ok_and(|v|v["now"] == name) {
             self.observed_current = Some(name.to_owned());
@@ -297,6 +304,7 @@ impl Recovery {
                     let selected = report["candidate"].as_str().filter(|name| settings.servers().iter().any(|n|
                         n["name"] == *name && !self.blocked.contains_key(&node_key(n))));
                     let group = settings.selected.as_str();
+                    if selected.is_some() { self.route_revision=self.route_revision.wrapping_add(1); }
                     let result = selected.map(|name|client.api("PUT",&format!("/proxies/{group}"),Some(json!({"name":name}))).and_then(|_| {
                         let state=client.api("GET","/proxies",None)?;
                         if state["proxies"][group]["now"] != name { return Err("Ядро не подтвердило выбранную альтернативу".into()); }

@@ -484,12 +484,17 @@ struct HealthState {
     tun_identity: Option<u64>,
     retry_at: Option<Instant>,
     attempts: std::collections::VecDeque<Instant>,
+    uplink: crate::network_change::Monitor,
+    path_due: bool,
+    path_retry_at: Option<Instant>,
+    path_probe: Option<(u64, (u64,u64), crate::background_probe::Probe<Option<bool>>)>,
 }
 impl Default for HealthState {
     fn default() -> Self {
         Self { last_recovery_scan: Instant::now(), last_health: Instant::now(), failures: 0,
             probe: Default::default(), tun_identity: network_guard::tun_identity(),
-            retry_at: None, attempts: Default::default() }
+            retry_at: None, attempts: Default::default(), uplink: Default::default(),
+            path_due: false, path_retry_at: None, path_probe: None }
     }
 }
 impl HealthState {
@@ -499,6 +504,9 @@ impl HealthState {
         self.tun_identity = network_guard::tun_identity();
         self.last_health = Instant::now();
         self.retry_at = None;
+        self.path_due = false;
+        self.path_retry_at = None;
+        self.path_probe = None;
     }
     fn tick(&mut self, core: &mut Core, configured: &mut bool,
         guard: &mut Option<network_guard::Guard>, settings: &mut Option<Settings>,
@@ -507,6 +515,18 @@ impl HealthState {
         queries: &mut crate::query_jobs::QueryJobs,
         session_id: &mut Option<uuid::Uuid>, network_epoch: &mut u64, desktop_pid: u32) {
         let now = Instant::now();
+        if settings.is_some() && self.uplink.tick() {
+            *network_epoch = network_epoch.wrapping_add(1);
+            queries.invalidate();
+            recovery.network_changed();
+            self.path_due = true;
+            self.path_retry_at = None;
+            // Retry exhaustion on the office uplink says nothing about home.
+            self.attempts.clear();
+            if !*configured && self.retry_at.is_some() { self.retry_at=Some(now+Duration::from_secs(2)); }
+            core.client().event(json!({"at":crate::model::now(),"kind":"uplink_changed",
+                "networkEpoch":*network_epoch,"action":"validate selected path before recovery"}));
+        }
         if *configured && self.last_recovery_scan.elapsed() >= Duration::from_millis(500) {
             self.last_recovery_scan = now;
             if let Some(s) = settings { recovery.tick(core.client(), s); }
@@ -530,6 +550,36 @@ impl HealthState {
                 }
                 self.last_health = now;
             }
+            if let Some((epoch, route_epoch, probe)) = &mut self.path_probe {
+                if let Some(healthy) = probe.poll() {
+                    let current=*epoch==*network_epoch && *route_epoch==recovery.path_epoch();
+                    self.path_probe=None;
+                    if !current { self.path_due=true; }
+                    if current {
+                        core.client().event(json!({"at":crate::model::now(),"kind":"uplink_path_checked","healthy":healthy}));
+                        if healthy==Some(false) { self.failures=3; }
+                        if healthy.is_none() {
+                            self.path_due=true;
+                            self.path_retry_at=Some(now+Duration::from_secs(5));
+                        }
+                    }
+                }
+            }
+            if self.path_due && self.path_probe.is_none() && self.path_retry_at.is_none_or(|at|now>=at) {
+                if let Some(s)=settings.as_ref() {
+                    // Direct mode must not depend on the selected VPN node.
+                    // Its local core/TUN health is still checked above.
+                    if s.routing_mode==crate::model::RoutingMode::Direct {
+                        self.path_due=false;
+                    } else {
+                        let client=core.client(); let selected=s.selected.clone();
+                        let mut probe=crate::background_probe::Probe::default();
+                        if probe.start(move || selected_path_responds(&client,&selected)) {
+                            self.path_probe=Some((*network_epoch,recovery.path_epoch(),probe)); self.path_due=false;
+                        }
+                    }
+                }
+            }
             if self.failures >= 3 {
                 *network_epoch = network_epoch.wrapping_add(1);
                 queries.invalidate();
@@ -548,6 +598,9 @@ impl HealthState {
                     *session_id = None;
                 }
                 self.probe = Default::default();
+                self.path_probe = None;
+                self.path_due = false;
+                self.path_retry_at = None;
             }
         }
         if !*configured && settings.is_some() && self.retry_at.is_some_and(|t| now >= t) {
@@ -628,6 +681,33 @@ impl Controller {
             &mut self.scheduler.queries, &mut session.session_id, &mut session.network_epoch, session.desktop_pid);
     }
 }
+// Read-only: a healthy connection survives Wi-Fi roaming and DNS renewal.
+// A failed path enters the existing protected, bounded recovery state machine.
+fn selected_path_responds(client: &crate::core::ApiClient, selected: &str) -> Option<bool> {
+    let name=if matches!(selected,"AUTO"|"FAILOVER") {
+        match client.api("GET",&format!("/proxies/{selected}"),None) {
+            Ok(value) => value["now"].as_str()?.to_owned(),
+            Err(_)=>return None,
+        }
+    } else { selected.to_owned() };
+    path_verdict(crate::latency::ENDPOINTS.iter().map(|endpoint|
+        crate::latency::verified_probe(client,&name,endpoint)))
+}
+
+fn path_verdict(results: impl IntoIterator<Item=Result<Value,String>>) -> Option<bool> {
+    let mut failures=0;
+    let mut uncertain=false;
+    for result in results {
+        match result {
+            Ok(_) => return Some(true),
+            Err(error) if matches!(error.as_str(),"Mihomo API: HTTP 503"|"Mihomo API: HTTP 504")
+                || error.contains("Контрольный URL не подтвердил") => failures+=1,
+            Err(_) => uncertain=true,
+        }
+    }
+    if failures>=2 && !uncertain { Some(false) } else { None }
+}
+
 fn confirm_route(client: &crate::core::ApiClient, settings: &Settings, controls: &[&str]) -> Result<Option<String>, String> {
     let proxies = client.api("GET", "/proxies", None)?;
     let name = if matches!(settings.selected.as_str(), "AUTO" | "FAILOVER") {
@@ -1136,6 +1216,55 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn uplink_probe_checks_the_auto_selected_node_without_mutating_it() {
+        use std::{io::{Read,Write},net::TcpListener};
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client=crate::core::ApiClient::loopback_fixture(listener.local_addr().unwrap().port());
+        let worker=thread::spawn(move || {
+            let mut delays=0;
+            for _ in 0..4 {
+                let deadline=Instant::now()+Duration::from_secs(5);
+                let mut stream=loop {
+                    match listener.accept() {
+                        Ok((stream,_))=>break stream,
+                        Err(error) if error.kind()==std::io::ErrorKind::WouldBlock && Instant::now()<deadline=>thread::sleep(Duration::from_millis(5)),
+                        Err(error)=>panic!("uplink fixture accept: {error}"),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request=Vec::new(); let mut buffer=[0u8;1024];
+                while !request.windows(4).any(|w|w==b"\r\n\r\n") {
+                    let n=stream.read(&mut buffer).unwrap(); assert!(n>0); request.extend_from_slice(&buffer[..n]);
+                }
+                let request=String::from_utf8_lossy(&request);
+                assert!(request.starts_with("GET "),"path validation must not change selection");
+                let (status,body)=if request.starts_with("GET /proxies/AUTO ") { (200,json!({"now":"fixture"})) }
+                    else if request.starts_with("GET /proxies/fixture/delay?") {
+                        delays+=1;
+                        if delays==1 { (504,json!({"message":"timeout"})) } else { (200,json!({"delay":30})) }
+                    } else {
+                        assert!(request.starts_with("GET /proxies "));
+                        (200,json!({"proxies":{"fixture":{"extra":{crate::latency::SECONDARY_URL:{"alive":true}}}}}))
+                    };
+                let body=body.to_string();
+                write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        assert_eq!(selected_path_responds(&client,"AUTO"),Some(true));
+        worker.join().unwrap();
+    }
+    #[test]
+    fn uplink_check_requires_two_remote_failures_and_preserves_a_working_control() {
+        let timeout=||Err("Mihomo API: HTTP 504".to_owned());
+        assert_eq!(path_verdict([timeout(),timeout()]),Some(false));
+        assert_eq!(path_verdict([timeout(),Ok(json!({"delay":30}))]),Some(true));
+        assert_eq!(path_verdict([Ok(json!({"delay":30})),timeout()]),Some(true));
+        assert_eq!(path_verdict([timeout(),Err("Сетевая служба занята. Повторите операцию.".into())]),None);
+        assert_eq!(path_verdict([Err("Mihomo API: HTTP 401".into()),timeout()]),None);
+        assert_eq!(path_verdict([timeout()]),None);
+    }
     #[test]
     fn observer_startup_error_reaches_desktop_before_pipe_closes() {
         let (mut server, mut client) = pipe_pair();
