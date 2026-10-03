@@ -459,7 +459,7 @@ function App() {
       // One native batch reads app state once. Per-card invocations used to
       // race the app mutex and falsely label the entire pool as failed.
       const response = await boundedBatch(request<{identities:Record<string,string>;results:Record<string,Latency>}>("latency_batch", {batchId}),
-        15000 + Math.ceil(names.length / 6) * 12000);
+        15000 + Math.ceil(names.length / 6) * 15000);
       setLatencies(previous => ({...previous, ...Object.fromEntries(names.filter(name =>
         response.identities[name] !== undefined && response.identities[name] === identitiesRef.current[name]).map(name =>
         [name, {...(response.results[name] ?? {status:"error",delay:null,attempts:0,
