@@ -30,6 +30,8 @@ function Install-Checked([string]$path) {
             Get-Content -LiteralPath $nativeLog -Tail 30
         }
         Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'" | Select-Object Name,State,PathName | Format-List
+        Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('Atlas.exe','Atlas.Service.exe','Atlas.Core.exe','Atlas.Xray.exe') } |
+            Select-Object ProcessId,ParentProcessId,Name,ExecutablePath | Format-List
         Get-Item (Join-Path $installRoot 'Atlas.exe') | ForEach-Object { $_.VersionInfo | Select-Object FileName,FileVersion,ProductVersion | Format-List }
         & $maintenance --inspect
         & $maintenance --prepare-install $installRoot 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')

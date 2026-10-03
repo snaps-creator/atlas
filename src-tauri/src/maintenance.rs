@@ -30,14 +30,18 @@ fn image(handle: HANDLE) -> Result<PathBuf, String> {
     Ok(PathBuf::from(String::from_utf16_lossy(&value[..len as usize])))
 }
 fn running_image(handle: HANDLE) -> Result<Option<PathBuf>, String> {
-    image_while_running(|| unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }, || image(handle))
+    image_while_running(|| unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }, || image(handle),
+        || unsafe { WaitForSingleObject(handle, 1000) == WAIT_OBJECT_0 })
 }
-fn image_while_running(exited: impl Fn() -> bool, query: impl FnOnce() -> Result<PathBuf,String>) -> Result<Option<PathBuf>,String> {
+fn image_while_running(exited: impl Fn() -> bool, query: impl FnOnce() -> Result<PathBuf,String>,
+    wait_exit: impl FnOnce() -> bool) -> Result<Option<PathBuf>,String> {
     if exited() { return Ok(None); }
     match query() {
         Ok(path) => Ok(Some(path)),
-        Err(_) if exited() => Ok(None),
-        Err(error) => Err(error),
+        // During asynchronous termination the image may already be unavailable
+        // before the process handle is signalled. Confirm exit on THIS handle;
+        // an unreadable live process still blocks installation.
+        Err(error) => if wait_exit() { Ok(None) } else { Err(error) },
     }
 }
 
@@ -62,7 +66,7 @@ fn stop_owned(root: &Path, desktop: bool) -> Result<(), String> {
                 if unsafe {GetLastError()} != 87 {return Err(error("Open Atlas candidate"));}
             } else {
                 let _handle = Handle(raw);
-                if running_image(raw)?.is_some_and(|path| owned_image(root, &path, desktop)) {
+                if running_image(raw).map_err(|e|format!("{e}; PID={}, inspect, desktop={desktop}",entry.th32ProcessID))?.is_some_and(|path| owned_image(root, &path, desktop)) {
                     let target=unsafe {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,0,entry.th32ProcessID)};
                     if target.is_null() {
                         if unsafe {WaitForSingleObject(raw,0)} != WAIT_OBJECT_0 {return Err(error("Open owned Atlas process for shutdown"));}
@@ -70,7 +74,7 @@ fn stop_owned(root: &Path, desktop: bool) -> Result<(), String> {
                         let target=Handle(target);
                         // Keep the original handle alive while opening the termination
                         // handle; verify again before granting this target to shutdown.
-                        if running_image(target.0)?.is_some_and(|path| owned_image(root,&path,desktop)) {handles.push(target);}
+                        if running_image(target.0).map_err(|e|format!("{e}; PID={}, verify shutdown, desktop={desktop}",entry.th32ProcessID))?.is_some_and(|path| owned_image(root,&path,desktop)) {handles.push(target);}
                     }
                 }
             }
@@ -181,12 +185,26 @@ mod tests {
     fn exit_during_image_query_is_not_an_ownership_failure() {
         let exited=std::cell::Cell::new(false);
         let result=image_while_running(||exited.get(), || {
-            exited.set(true); Err("process exited during QueryFullProcessImageName".into())
-        });
+            Err("process image disappeared before exit was signalled".into())
+        }, || { exited.set(true); true });
         assert_eq!(result,Ok(None));
-        assert_eq!(image_while_running(||false,||Err("access denied on live process".into())),
+        assert!(exited.get());
+        assert_eq!(image_while_running(||false,||Err("access denied on live process".into()),||false),
             Err("access denied on live process".into()));
-        assert_eq!(image_while_running(||true,||panic!("must not query a dead process")),Ok(None));
+        assert_eq!(image_while_running(||true,||panic!("must not query a dead process"),||panic!("already exited")),Ok(None));
+    }
+    #[test]
+    fn image_query_survives_real_concurrent_termination() {
+        use std::{os::windows::{io::AsRawHandle,process::CommandExt},process::{Command,Stdio}};
+        for _ in 0..30 {
+            let mut child=Command::new("cmd.exe").args(["/d","/q","/k"])
+                .creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let handle=child.as_raw_handle();
+            assert_ne!(unsafe { TerminateProcess(handle,0) },0);
+            let result=running_image(handle);
+            child.wait().unwrap();
+            assert!(result.is_ok(),"{result:?}");
+        }
     }
     #[test]
     fn ownership_requires_exact_installation_and_role() {
