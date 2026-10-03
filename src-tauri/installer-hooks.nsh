@@ -27,6 +27,11 @@ FunctionEnd
   nsExec::ExecToStack '"$PLUGINSDIR\AtlasMaintenance.exe" --prepare-install "$INSTDIR"'
   Pop $0
   Pop $1
+  ; Silent installs cannot show the helper's stderr. Preserve the original
+  ; result before any later recovery attempt changes the state.
+  FileOpen $2 "$TEMP\atlas-install-recovery.log" a
+  FileWrite $2 "prepare-install: $INSTDIR$\r$\nexit: $0$\r$\n$1$\r$\n"
+  FileClose $2
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "Не удалось завершить сетевую сессию Atlas. Файлы не заменены.$\r$\n$1" /SD IDOK
     Abort

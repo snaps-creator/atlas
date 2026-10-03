@@ -4,6 +4,33 @@ on:
 permissions:
   contents: read
 jobs:
+  offline-connected-upgrade:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Verify upgrade using the checked-in signed offline installer
+        shell: pwsh
+        run: |
+          $candidate = Join-Path $env:RUNNER_TEMP 'Atlas-offline-candidate.exe'
+          node scripts/verify-offline-installer.cjs $candidate
+          if ($LASTEXITCODE -ne 0) { throw 'Offline signature/hash verification failed' }
+          ./scripts/test-connected-upgrade.ps1 -Installer $candidate
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: offline-connected-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
+          retention-days: 7
   build-installer:
     uses: ./.github/workflows/pr-installer.yml
     secrets: inherit
