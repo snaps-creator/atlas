@@ -24,6 +24,11 @@ function Install-Checked([string]$path) {
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
     if ($process.ExitCode -ne 0) {
         Write-Output "Failed installer: $path; expected installation: $installRoot"
+        $nativeLog = Join-Path $env:TEMP 'atlas-install-recovery.log'
+        if (Test-Path -LiteralPath $nativeLog) {
+            Copy-Item -LiteralPath $nativeLog -Destination (Join-Path $fixture 'installer-original-failure.log')
+            Get-Content -LiteralPath $nativeLog -Tail 30
+        }
         Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'" | Select-Object Name,State,PathName | Format-List
         Get-Item (Join-Path $installRoot 'Atlas.exe') | ForEach-Object { $_.VersionInfo | Select-Object FileName,FileVersion,ProductVersion | Format-List }
         & $maintenance --inspect

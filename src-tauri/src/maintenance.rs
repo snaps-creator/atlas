@@ -29,6 +29,17 @@ fn image(handle: HANDLE) -> Result<PathBuf, String> {
     if unsafe {QueryFullProcessImageNameW(handle, 0, value.as_mut_ptr(), &mut len)} == 0 {return Err(error("Process image"));}
     Ok(PathBuf::from(String::from_utf16_lossy(&value[..len as usize])))
 }
+fn running_image(handle: HANDLE) -> Result<Option<PathBuf>, String> {
+    image_while_running(|| unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }, || image(handle))
+}
+fn image_while_running(exited: impl Fn() -> bool, query: impl FnOnce() -> Result<PathBuf,String>) -> Result<Option<PathBuf>,String> {
+    if exited() { return Ok(None); }
+    match query() {
+        Ok(path) => Ok(Some(path)),
+        Err(_) if exited() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 /// Hold the verified process handle through termination/wait: PID reuse cannot
 /// redirect termination to another process. A matching name alone is NEVER enough.
@@ -50,8 +61,8 @@ fn stop_owned(root: &Path, desktop: bool) -> Result<(), String> {
                 // A raced exit is harmless; access denied is not proof of cleanup.
                 if unsafe {GetLastError()} != 87 {return Err(error("Open Atlas candidate"));}
             } else {
-                let handle = Handle(raw);
-                if unsafe {WaitForSingleObject(raw, 0)} != WAIT_OBJECT_0 && owned_image(root, &image(raw)?, desktop) {
+                let _handle = Handle(raw);
+                if running_image(raw)?.is_some_and(|path| owned_image(root, &path, desktop)) {
                     let target=unsafe {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,0,entry.th32ProcessID)};
                     if target.is_null() {
                         if unsafe {WaitForSingleObject(raw,0)} != WAIT_OBJECT_0 {return Err(error("Open owned Atlas process for shutdown"));}
@@ -59,7 +70,7 @@ fn stop_owned(root: &Path, desktop: bool) -> Result<(), String> {
                         let target=Handle(target);
                         // Keep the original handle alive while opening the termination
                         // handle; verify again before granting this target to shutdown.
-                        if owned_image(root,&image(target.0)?,desktop) {handles.push(target);}
+                        if running_image(target.0)?.is_some_and(|path| owned_image(root,&path,desktop)) {handles.push(target);}
                     }
                 }
             }
@@ -166,6 +177,17 @@ pub fn prepare(directory: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exit_during_image_query_is_not_an_ownership_failure() {
+        let exited=std::cell::Cell::new(false);
+        let result=image_while_running(||exited.get(), || {
+            exited.set(true); Err("process exited during QueryFullProcessImageName".into())
+        });
+        assert_eq!(result,Ok(None));
+        assert_eq!(image_while_running(||false,||Err("access denied on live process".into())),
+            Err("access denied on live process".into()));
+        assert_eq!(image_while_running(||true,||panic!("must not query a dead process")),Ok(None));
+    }
     #[test]
     fn ownership_requires_exact_installation_and_role() {
         let root=Path::new(r"C:\Program Files\Atlas");
