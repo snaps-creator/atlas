@@ -215,8 +215,12 @@ impl App {
         self.status = "Connecting".into();
         self.revision = self.revision.wrapping_add(1);
         self.error = None;
+        // Reattaching to an existing service must not tear down its session
+        // merely to prioritize a settings write.
+        let preemptible = !self.core.service_reachable() && !service::is_running();
+        let (token, _connecting) = self.cancellation.connecting(preemptible);
+        self.core.continue_running = Some(token);
         self.snapshot();
-        self.core.continue_running = Some(self.cancellation.begin());
         if !self.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
             self.status = "Disconnected".into();
             self.core.continue_running = None;
@@ -225,6 +229,7 @@ impl App {
         self.settings.mode = "tun".into();
         let result = windows::restore(&self.core.directory.join("proxy-restore.json"))
             .and_then(|_| self.core.start(&self.settings));
+        if result.is_ok() { _connecting.complete(); } else { drop(_connecting); }
         match result {
             Ok(()) => {
                 if !self.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
@@ -281,6 +286,9 @@ impl App {
                 let directory = self.core.directory.clone();
                 let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
                 let cleanup_failed = cleanup.is_err();
+                let yielded = !cleanup_failed && self.cancellation.settings_pending()
+                    && self.reconnect.load(std::sync::atomic::Ordering::SeqCst)
+                    && matches!(e.as_str(), "Подключение отменено" | "Запуск Xray отменён");
                 self.core.continue_running = None;
                 let error = match cleanup {
                     Ok(()) => e,
@@ -289,6 +297,11 @@ impl App {
                 self.status = if cleanup_failed { "CleanupError" }
                     else if self.reconnect.load(std::sync::atomic::Ordering::SeqCst) { "Error" }
                     else { "Disconnected" }.into();
+                if yielded {
+                    self.error = None;
+                    self.log("INFO", "Подключение продолжится после сохранения настроек");
+                    return Ok(());
+                }
                 self.error = Some(error.clone());
                 self.log("ERROR", &error);
                 Err(error)
@@ -857,9 +870,9 @@ async fn request_inner(
                 // read instead of falsely marking every node as a probe error.
                 let a = reads.get()?;
                 let connected = a.status == "Connected";
-                if !connected && a.directory.join("tun-guard.active").exists() {
-                    return Err("Atlas в защищённой паузе; автономная проверка недоступна".into());
-                }
+                // A recovery marker does not prohibit isolated URL probes.
+                // The probe uses the same WFP-allowed Core/Xray executables,
+                // random loopback ports, and never changes the TUN or guard.
                 (a.settings.clone(), connected.then(|| a.client.clone()),
                     a.binary.clone(), a.directory.clone(),
                     a.settings.servers().iter().filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(),
@@ -891,9 +904,6 @@ async fn request_inner(
                     return Err("Сервер отсутствует в подписках".into());
                 }
                 let connected = a.status == "Connected";
-                if !connected && a.directory.join("tun-guard.active").exists() {
-                    return Err("Atlas в защищённой паузе; автономная проверка недоступна".into());
-                }
                 (a.settings.clone(), connected.then(|| a.client.clone()),
                     a.binary.clone(), a.directory.clone())
             };
@@ -940,7 +950,14 @@ async fn request_inner(
             Ok(a.snapshot())
         }).await.map_err(|e|e.to_string())?;
     }
+    let settings_change = if action == "save" {
+        // Reject malformed requests before yielding a connection attempt.
+        serde_json::from_value::<Settings>(payload.clone().unwrap_or(Value::Null))
+            .map_err(|_| "Некорректные настройки")?;
+        Some(app.state::<cancellation::Cancellation>().settings_change())
+    } else { None };
     tauri::async_runtime::spawn_blocking(move || {
+        let _settings_change = settings_change;
         let queued=std::time::Instant::now();
         // Only mutations are serialized. Readers use ReadState and never wait
         // for this lock; queued mutations do not fail just because another runs.
@@ -988,6 +1005,7 @@ pub fn run() {
             // new connection. A cleanup error must not abort Tauri setup and
             // leave a blank window; publish it as recoverable application state.
             let startup_cleanup = (|| -> Result<(),String> {
+                let _ = network_guard::tun_identity();
                 if service::is_running() { service::stop_and_wait()?; }
                 windows::restore(&dir.join("proxy-restore.json"))?;
                 network_guard::wait_for_tun_release(std::time::Duration::from_secs(3))?;
@@ -1227,7 +1245,7 @@ pub fn run() {
                             }
                         }
                     });
-                    if refresh_done.load(std::sync::atomic::Ordering::SeqCst) && startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                    if !a.cancellation.settings_pending() && refresh_done.load(std::sync::atomic::Ordering::SeqCst) && startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
                         startup_at = None;
                         if intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Disconnected" {
                             let _ = a.connect();
@@ -1259,12 +1277,14 @@ pub fn run() {
                         reconnect_retry.reset();
                     }
                     let wants_connection = intent.load(std::sync::atomic::Ordering::SeqCst);
-                    if reconnect_retry.due(std::time::Instant::now(), wants_connection, a.status == "Error") {
+                    if !a.cancellation.settings_pending()
+                        && reconnect_retry.due(std::time::Instant::now(), wants_connection, a.status == "Error") {
                         a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
                         match a.connect() {
                             Ok(()) => reconnect_retry.reset(),
                             Err(error) => {
-                                reconnect_retry.failed(std::time::Instant::now());
+                                if a.cancellation.settings_pending() { reconnect_retry.reset(); }
+                                else { reconnect_retry.failed(std::time::Instant::now()); }
                                 a.log("WARN", &format!("Повторное подключение не удалось; следующая попытка будет позже: {error}"));
                             }
                         }

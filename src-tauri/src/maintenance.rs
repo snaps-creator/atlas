@@ -130,6 +130,7 @@ pub fn prepare(directory: &Path) -> Result<(), String> {
     let root = directory.canonicalize().map_err(|e|e.to_string())?;
     let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
     let service = service(&root)?; // Validate ownership BEFORE changing anything.
+    let _ = crate::network_guard::tun_identity(); // Keep exact driver evidence across teardown.
     stop_owned(&root, true)?; // Quiesce reconnect/start jobs before stopping service.
     let graceful = service.as_ref().map(stop_service).transpose();
     stop_owned(&root, false)?;
