@@ -57,9 +57,14 @@ windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win
             });
         }
         for (name,path) in [("copied-helper",env!("ATLAS_PROTOCOL_PROBE_COPY")),("system",r"C:\Windows\System32\whoami.exe")] {
+            std::fs::write(env!("ATLAS_PROTOCOL_PROBE_REPORT"),serde_json::to_vec(&results).unwrap()).unwrap();
             let result=std::process::Command::new(path).arg("--protocol").creation_flags(0x08000000)
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-            results.push(match result {Ok(status)=>serde_json::json!({"target":name,"exit":status.code()}),Err(e)=>serde_json::json!({"target":name,"spawnError":e.raw_os_error()})});
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+            results.push(match result {Ok(mut child)=>{
+                let wait=unsafe{WaitForSingleObject(child.as_raw_handle(),3000)};
+                if wait!=WAIT_OBJECT_0 {let _=child.kill();let _=child.wait();}
+                serde_json::json!({"target":name,"started":true,"wait":wait})
+            },Err(e)=>serde_json::json!({"target":name,"spawnError":e.raw_os_error()})});
         }
         std::fs::write(env!("ATLAS_PROTOCOL_PROBE_REPORT"),serde_json::to_vec(&results).unwrap()).unwrap();
     }
