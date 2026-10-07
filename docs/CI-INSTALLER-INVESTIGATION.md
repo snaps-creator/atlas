@@ -76,3 +76,8 @@ The clean installer uses application source c38dc31; the subsequent correction c
 ## PR handling
 
 The user initially required isolation; no PR changes were made during reproduction. The later explicit instruction authorizes applying these verified CI fixes directly to PR #57. No merge, release publication or host installation is performed.
+## Archival UI check on e9e7bdf
+
+Job 112897483284 failed in the historical offline-upgrade scenario, whose immutable signed payload is 2.3.1-alpha.1, not the freshly built 2.4.2. Its artifact contains a successful render acknowledgement (12 buttons) and only the parent Atlas process remaining at the 25-second deadline; stderr records a CEF browser-info timeout. The assertion conflated successful render/IPC with final CEF process teardown.
+
+The check retains its 25-second startup deadline. Only an already valid render/IPC acknowledgement permits a separate bounded 25-second normal-shutdown wait. A forced termination is still failure, helper processes must all exit, and a nonzero process exit is now explicitly rejected. The same signed archival bytes passed three isolated local runs; the fresh 2.4.2 payload also passed. The CI-only delayed exit was not reproduced locally, so the new remote run remains the confirmation for that runner-specific timing.
