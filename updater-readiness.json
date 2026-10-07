@@ -1,33 +1,30 @@
 {
-  "schema": 1,
+  "schema": 2,
   "version": "2.4.2",
-  "phase0": {
-    "P0-A": "PARTIAL_CLEAN_NATIVE_BUILD_PASS_FULL_RUNNER_FAILED_THEN_TESTS_FIXED",
-    "P0-B": "PASS",
-    "P0-C": "BLOCKED_NO_SIGNED_CI_ARTIFACT_FOR_CURRENT_SOURCE",
-    "P0-D": "INCOMPLETE_VERIFICATION_SCRIPTS_AND_TEST_FIXTURE_CHANGED_AFTER_BUILD_START"
-  },
-  "buildProvenance": "CAPTURED_NOT_FULLY_REPRODUCIBLE",
-  "packageVerification": "PASS",
-  "signatureVerification": "POSITIVE_NEGATIVE_TEST_KEYS_PASS_PRODUCTION_POSITIVE_BLOCKED",
-  "transactionSafety": "DURABLE_TRANSACTION_TESTS_PASS_INSTALLED_2_4_2_COMMITTED",
-  "rollback": "ORCHESTRATION_AND_SQLITE_PASS_WINDOWS_INTEGRATION_INCOMPLETE",
-  "crashRecovery": "PROCESS_FAULT_TESTS_PASS_LAUNCHER_RECOVERY_ADDED_PHYSICAL_REBOOT_PENDING",
-  "networkRecovery": "INSTALLED_DISCONNECT_RECONNECT_PASS_PHYSICAL_REBOOT_PENDING",
-  "integrationTests": "INSTALLED_UPGRADE_PASS_FINAL_SOURCE_CI_PENDING",
-  "unsafeLegacyInstall": "DISABLED_UI_AND_NSIS",
-  "releaseReady": false,
+  "requiredChecks": [
+    "frontend",
+    "verificationContracts",
+    "backend",
+    "restrictedProcess",
+    "cleanSignedBuild",
+    "packageAndSignatures",
+    "connectedUpgrade",
+    "installedRecovery",
+    "publicationPreparation"
+  ],
+  "acceptedRisks": [
+    {
+      "id": "PHYSICAL_REBOOT_RECOVERY",
+      "status": "NOT_TESTED",
+      "accepted": true,
+      "description": "A physical Windows reboot/power loss during update has not been tested. Process termination, durable journal recovery and installed recovery are required automated checks.",
+      "authorization": "User explicitly accepted this as a documented risk on 2026-10-08."
+    }
+  ],
   "evidence": {
     "report": "docs/RELEASE-2.4.2.md",
-    "sourceTests": "temp/updater-final-regression.log",
-    "js": "temp/updater-js-tests.log",
-    "currentBuild": "temp/update-build/p0-20261007-133314",
-    "frontend": "temp/updater-frontend-tests.log"
+    "previousSignedAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37690808789",
+    "mainBuildAndAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37695482741"
   },
-  "blockers": [
-    "SIGNED_CI_ARTIFACT_FOR_FINAL_SOURCE_PENDING",
-    "FINAL_SOURCE_CLEAN_BUILD_AND_SYSTEM_ACCEPTANCE_PENDING",
-    "PHYSICAL_REBOOT_RECOVERY_NOT_OBSERVED"
-  ],
-  "diagnosticArtifact": null
+  "notes": "This is publication policy, not a cached test result. Every required check must run for the candidate in CI; successful preflight alone does not mean release-ready."
 }

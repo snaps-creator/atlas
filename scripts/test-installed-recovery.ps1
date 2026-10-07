@@ -1,0 +1,43 @@
+param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance)
+$ErrorActionPreference = 'Stop'
+if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Installed recovery requires a disposable GitHub Windows runner' }
+$root = (Resolve-Path -LiteralPath $InstallRoot).Path
+$allowed = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+if (-not $root.StartsWith($allowed,[StringComparison]::OrdinalIgnoreCase)) { throw 'Recovery fixture must remain under RUNNER_TEMP' }
+$journalPath = Join-Path $root 'current.json'
+$journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+if ($journal.stage -ne 'Committed' -or $journal.previous.absent) { throw 'Recovery needs a committed upgrade with a retained previous version' }
+$previous = $journal.previous.id
+$previousRoot = Join-Path $root ('versions/' + $previous)
+$candidateRoot = Join-Path $root ('versions/' + $journal.candidate.id)
+$service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
+if ($service.PathName -ne ('"' + (Join-Path $candidateRoot 'Atlas.Service.exe') + '" --network-service')) { throw 'Refusing recovery of a service outside this candidate fixture' }
+& $Maintenance --prepare-install $candidateRoot
+if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
+# Inject a persisted interrupted-activation state into this disposable fixture.
+# This exercises the real signed recovery helper and SCM adapter. It does not
+# pretend to kill the kernel, reboot Windows or reproduce physical power loss.
+$journal.stage = 'HealthPending'
+$journal.health_state = 'unconfirmed'
+$journal.sequence += 1
+$pending = Join-Path $root 'recovery-fixture.json'
+$journal | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $pending -Encoding utf8NoBOM
+[IO.File]::Replace($pending,$journalPath,$null)
+foreach ($attempt in 1..2) {
+    $process = Start-Process -FilePath (Join-Path $root 'AtlasUpdater.exe') -ArgumentList '--recover' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root "recovery-$attempt.log") -RedirectStandardError (Join-Path $root "recovery-$attempt.err")
+    $null = $process.Handle
+    if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'Installed recovery timed out' }
+    $process.WaitForExit()
+    if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+        Get-Content -LiteralPath (Join-Path $root "recovery-$attempt.err")
+        throw "Installed recovery failed: $($process.ExitCode)"
+    }
+    $restored = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+    if ($restored.stage -ne 'RolledBack' -or $restored.active.id -ne $previous -or $restored.network_state -ne 'restored' -or $restored.migration_state -ne 'restored') { throw 'Recovery did not durably restore the previous version and state' }
+    $service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
+    if ($service.PathName -ne ('"' + (Join-Path $previousRoot 'Atlas.Service.exe') + '" --network-service') -or $service.State -ne 'Running') { throw 'Recovery did not restore the running previous service' }
+    $inspection = & $Maintenance --inspect | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Recovery left an unverified network baseline' }
+    if (-not (Test-Path -LiteralPath (Join-Path $previousRoot 'Atlas.exe')) -or -not (Test-Path -LiteralPath (Join-Path $candidateRoot 'Atlas.exe'))) { throw 'Recovery lost a retained version' }
+}
+Write-Output 'PASS: real installed recovery from persisted HealthPending restores previous service, data/network state and retained versions; repeated recovery succeeds. Physical reboot not tested.'
