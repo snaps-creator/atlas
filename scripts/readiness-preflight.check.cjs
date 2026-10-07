@@ -63,3 +63,30 @@ test('both pipelines run publication preparation after installed acceptance on t
   const acceptance=fs.readFileSync('scripts/test-connected-upgrade.ps1','utf8');
   assert(acceptance.includes('test-installed-recovery.ps1'));
 });
+
+test('real PowerShell fixture replacement preserves the journal backup and supports repeated setup', {skip:process.platform!=='win32'}, t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'atlas-recovery-fixture-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const source=path.resolve('scripts/test-installed-recovery.ps1').replaceAll("'","''");
+  const script=`$ErrorActionPreference = 'Stop'
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile('${source}',[ref]$tokens,[ref]$errors)
+if ($errors.Count) { throw 'Fixture script does not parse' }
+$function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-InterruptedRecoveryFixture'},$true)
+if (-not $function) { throw 'Missing fixture writer' }
+. ([scriptblock]::Create($function.Extent.Text))
+foreach ($sequence in @(1,10)) {
+    $journal=[pscustomobject]@{stage='Committed';health_state='verified';sequence=$sequence;payload=@{hash='unchanged'}}
+    $journal | ConvertTo-Json -Depth 5 | Set-Content current.json -Encoding utf8NoBOM
+    Write-InterruptedRecoveryFixture -Root $PWD.Path -Journal $journal
+    $active=Get-Content current.json -Raw | ConvertFrom-Json
+    $backup=Get-Content recovery-before.json -Raw | ConvertFrom-Json
+    if ($active.stage -ne 'HealthPending' -or $active.sequence -ne ($sequence+1) -or $active.payload.hash -ne 'unchanged') { throw 'Incorrect injected journal' }
+    if ($backup.stage -ne 'Committed' -or $backup.sequence -ne $sequence) { throw 'Original journal backup lost' }
+    if (Test-Path recovery-fixture.json) { throw 'Replacement left the staging file' }
+}
+`;
+  fs.writeFileSync(path.join(root,'check.ps1'),script);
+  const result=spawnSync('pwsh',['-NoProfile','-File','check.ps1'],{cwd:root,encoding:'utf8'});
+  assert.ifError(result.error);assert.equal(result.status,0,result.stdout+'\n'+result.stderr);
+});

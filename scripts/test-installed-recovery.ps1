@@ -1,5 +1,15 @@
 param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance)
 $ErrorActionPreference = 'Stop'
+function Write-InterruptedRecoveryFixture([string]$Root, $Journal) {
+    $Journal.stage = 'HealthPending'
+    $Journal.health_state = 'unconfirmed'
+    $Journal.sequence += 1
+    $pending = Join-Path $Root 'recovery-fixture.json'
+    $Journal | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $pending -Encoding utf8NoBOM
+    # PowerShell binds $null to an empty string for this .NET string parameter.
+    # Preserve an explicit backup instead of passing an invalid empty path.
+    [IO.File]::Replace($pending,(Join-Path $Root 'current.json'),(Join-Path $Root 'recovery-before.json'))
+}
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Installed recovery requires a disposable GitHub Windows runner' }
 $root = (Resolve-Path -LiteralPath $InstallRoot).Path
 $allowed = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
@@ -17,12 +27,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # Inject a persisted interrupted-activation state into this disposable fixture.
 # This exercises the real signed recovery helper and SCM adapter. It does not
 # pretend to kill the kernel, reboot Windows or reproduce physical power loss.
-$journal.stage = 'HealthPending'
-$journal.health_state = 'unconfirmed'
-$journal.sequence += 1
-$pending = Join-Path $root 'recovery-fixture.json'
-$journal | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $pending -Encoding utf8NoBOM
-[IO.File]::Replace($pending,$journalPath,$null)
+Write-InterruptedRecoveryFixture -Root $root -Journal $journal
 foreach ($attempt in 1..2) {
     $process = Start-Process -FilePath (Join-Path $root 'AtlasUpdater.exe') -ArgumentList '--recover' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root "recovery-$attempt.log") -RedirectStandardError (Join-Path $root "recovery-$attempt.err")
     $null = $process.Handle
