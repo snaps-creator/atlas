@@ -48,6 +48,28 @@ fn session(handle:HANDLE)->Result<u32,String>{
     let buffer=token_info(handle,TokenSessionId)?;Ok(unsafe{*buffer.as_ptr().cast::<u32>()})
 }
 fn desktop_safe(handle:HANDLE)->Result<bool,String>{Ok(!admin_enabled(handle)? && integrity(handle)?<=SECURITY_MANDATORY_MEDIUM_RID as u32)}
+// CreateRestrictedToken retains the elevated token's default DACL. That DACL
+// can give full access only to Administrators (now deny-only) and SYSTEM.
+// Objects created by the desktop must instead be usable by its actual user;
+// otherwise console children fail during initialization with 0xc0000142.
+fn set_desktop_default_dacl(handle:HANDLE)->Result<(),String>{unsafe{
+    let text:Vec<u16>=format!("D:(A;;GA;;;SY)(A;;GA;;;{})",sid(handle)?)
+        .encode_utf16().chain(Some(0)).collect();
+    let mut descriptor=ptr::null_mut();
+    if Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(),1,&mut descriptor,ptr::null_mut())==0 {
+        return Err(failure("Cannot create desktop object permissions"));
+    }
+    let mut acl=ptr::null_mut();let mut present=0;let mut defaulted=0;
+    let result=if GetSecurityDescriptorDacl(descriptor,&mut present,&mut acl,&mut defaulted)==0 || present==0 || acl.is_null() {
+        Err(failure("Cannot inspect desktop object permissions"))
+    }else{
+        let value=TOKEN_DEFAULT_DACL{DefaultDacl:acl};
+        if SetTokenInformation(handle,TokenDefaultDacl,(&value as *const TOKEN_DEFAULT_DACL).cast(),std::mem::size_of_val(&value) as u32)==0 {
+            Err(failure("Cannot assign desktop object permissions"))
+        }else{Ok(())}
+    };
+    LocalFree(descriptor);result
+}}
 fn restricted_desktop(current:HANDLE)->Result<OwnedHandle,String>{unsafe{
     // TokenElevationTypeDefault means "no linked token", not "non-admin".
     // Keep the user's SID/session while removing administrative groups and all
@@ -71,6 +93,7 @@ fn restricted_desktop(current:HANDLE)->Result<OwnedHandle,String>{unsafe{
     if !desktop_safe(restricted.as_raw_handle())? || sid(current)?!=sid(restricted.as_raw_handle())? || session(current)?!=session(restricted.as_raw_handle())? {
         return Err("Restricted desktop token failed identity or privilege validation".into());
     }
+    set_desktop_default_dacl(restricted.as_raw_handle())?;
     Ok(restricted)
 }}
 fn sid(handle:HANDLE)->Result<String,String>{unsafe{
@@ -239,21 +262,84 @@ fn launch_with_token(executable:&Path,directory:&Path,args:&[&str],linked:HANDLE
             assert_eq!((privilege.Luid.LowPart,privilege.Luid.HighPart),(traversal.LowPart,traversal.HighPart));
         }
     }
+    #[test] fn restricted_default_dacl_grants_its_user_full_access() {
+        let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
+        let info=token_info(reduced.as_raw_handle(),TokenDefaultDacl).unwrap();
+        let user=token_info(reduced.as_raw_handle(),TokenUser).unwrap();
+        unsafe {
+            let acl=(*info.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl;
+            assert!(!acl.is_null());assert_ne!(IsValidAcl(acl),0);
+            let user_sid=(*user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            let mut grants_user=false;
+            for index in 0..u32::from((*acl).AceCount) {
+                let mut ace=ptr::null_mut();assert_ne!(GetAce(acl,index,&mut ace),0);
+                let ace=&*ace.cast::<ACCESS_ALLOWED_ACE>();
+                assert_eq!(ace.Header.AceType,0); // ACCESS_ALLOWED_ACE_TYPE
+                let target=(&ace.SidStart as *const u32).cast_mut().cast();
+                let is_user=EqualSid(target,user_sid)!=0;
+                assert!(is_user || IsWellKnownSid(target,WinLocalSystemSid)!=0);
+                assert_eq!(ace.Mask,GENERIC_ALL);
+                grants_user|=is_user;
+            }
+            assert!(grants_user,"Desktop objects must not rely on the disabled Administrators group");
+        }
+    }
+    #[test] #[ignore="Invoked only in a restricted grandchild"]
+    fn restricted_leaf_driver() {
+        assert!(desktop_safe(token().unwrap().as_raw_handle()).unwrap());
+    }
     #[test] #[ignore="Invoked in a real restricted child by restricted_process_runs_without_admin"]
     fn restricted_child_driver() {
+        // CreateProcessWithTokenW does not carry the parent's error mode.
+        #[link(name="kernel32")] extern "system" {fn SetErrorMode(mode:u32)->u32;}
+        unsafe{SetErrorMode(3);}
+        use std::os::windows::process::CommandExt;
         let current=token().unwrap();
         assert!(!admin_enabled(current.as_raw_handle()).unwrap());
         assert_eq!(integrity(current.as_raw_handle()).unwrap(),SECURITY_MANDATORY_MEDIUM_RID as u32);
+        let exe=std::env::current_exe().unwrap();let root=exe.parent().unwrap();
+        assert!(File::options().write(true).open(&exe).is_err(),"Installation must remain read/execute only");
+        // Exercise both PE subsystems from the protected installation. Checking
+        // only the GUI parent's token misses console initialization failures.
+        for name in ["gui.exe","console.exe"] {
+            let mut child=std::process::Command::new(root.join(name))
+                .args(["--exact","update_user::tests::restricted_leaf_driver","--ignored"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .spawn().unwrap_or_else(|e|panic!("Cannot start {name}: {e}"));
+            let status=unsafe{WaitForSingleObject(child.as_raw_handle(),10000)};
+            if status!=WAIT_OBJECT_0{let _=child.kill();let _=child.wait();panic!("{name} timed out");}
+            assert!(child.wait().unwrap().success(),"{name} failed initialization or token validation");
+        }
     }
     #[test] #[ignore="Requires an administrative caller; mandatory separate CI invocation"]
     fn restricted_process_runs_without_admin() {
-        let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
-        let executable=std::env::current_exe().unwrap();
-        let (child,_pipe)=launch_with_token(&executable,executable.parent().unwrap(),
-            &["--exact","update_user::tests::restricted_child_driver","--ignored"],reduced.as_raw_handle()).unwrap();
-        let status=unsafe{WaitForSingleObject(child.as_raw_handle(),15000)};
-        if status!=WAIT_OBJECT_0{child.terminate();panic!("Restricted child timed out");}
-        let mut exit=1;assert_ne!(unsafe{GetExitCodeProcess(child.as_raw_handle(),&mut exit)},0);
-        assert_eq!(exit,0,"Restricted child failed its real token assertions");
+        // Suppress Windows error dialogs in unattended failure-path tests.
+        #[link(name="kernel32")] extern "system" {fn SetErrorMode(mode:u32)->u32;}
+        struct Fixture(std::path::PathBuf,u32);
+        impl Drop for Fixture {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);unsafe{SetErrorMode(self.1);}}}
+        let current=token().unwrap();assert!(admin_enabled(current.as_raw_handle()).unwrap(),"Administrative test caller required");
+        let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root=std::env::temp_dir().join(format!("atlas-token-test-{}-{stamp}",std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let _fixture=Fixture(root.clone(),unsafe{SetErrorMode(3)});
+        crate::update_windows::protect_installation(&root).unwrap();
+        let mut bytes=std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let pe=u32::from_le_bytes(bytes[60..64].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[pe..pe+4],b"PE\0\0");
+        let subsystem=pe+24+68;
+        bytes[subsystem..subsystem+2].copy_from_slice(&2u16.to_le_bytes());
+        std::fs::write(root.join("gui.exe"),&bytes).unwrap();
+        bytes[subsystem..subsystem+2].copy_from_slice(&3u16.to_le_bytes());
+        std::fs::write(root.join("console.exe"),&bytes).unwrap();
+        for _ in 0..2 {
+            let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
+            let (child,_pipe)=launch_with_token(&root.join("gui.exe"),&root,
+                &["--exact","update_user::tests::restricted_child_driver","--ignored"],reduced.as_raw_handle()).unwrap();
+            let status=unsafe{WaitForSingleObject(child.as_raw_handle(),25000)};
+            if status!=WAIT_OBJECT_0{child.terminate();panic!("Restricted child timed out");}
+            let mut exit=1;assert_ne!(unsafe{GetExitCodeProcess(child.as_raw_handle(),&mut exit)},0);
+            assert_eq!(exit,0,"Restricted desktop failed its child-process assertions");
+        }
     }
 }

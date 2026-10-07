@@ -42,6 +42,8 @@ windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win
 #[cfg(test)] mod protocol_probe {
     use super::*;
     #[test] #[ignore] fn child() {
+        #[link(name="kernel32")] extern "system" {fn SetErrorMode(mode:u32)->u32;}
+        unsafe{SetErrorMode(3);}
         use std::os::windows::process::CommandExt;
         assert!(desktop_safe(token().unwrap().as_raw_handle()).unwrap());
         let helper=env!("ATLAS_PROTOCOL_PROBE_HELPER");
@@ -84,9 +86,16 @@ windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win
     if (-not $digest) { throw 'Production digest function unavailable' }
     ('use std::{path::Path,fs::OpenOptions,io::Read}; use sha2::{Digest,Sha256}; type Result<T> = std::result::Result<T,String>;' + $digest) |
         Set-Content (Join-Path $probe 'src/update_transaction.rs') -Encoding utf8
+    # The production token tests also validate installation ACLs. Compile the
+    # exact protection routines so this diagnostic remains representative.
+    $windows = Get-Content (Join-Path $repo 'src-tauri/src/update_windows.rs') -Raw
+    $protection = [regex]::Match($windows, '(?ms)^pub fn protect_installation.*?^\}').Value
+    if (-not $protection) { throw 'Production installation protection unavailable' }
+    $protection | Set-Content (Join-Path $probe 'src/update_windows.rs') -Encoding utf8
     '#![windows_subsystem = "windows"]
 mod update_user;
 mod update_transaction;
+mod update_windows;
 fn main() {}' | Set-Content (Join-Path $probe 'src/main.rs') -Encoding utf8
     $env:ATLAS_PROTOCOL_PROBE_HELPER = $helper
     $env:ATLAS_PROTOCOL_PROBE_COPY = Join-Path $probe 'AtlasMaintenance.exe'
