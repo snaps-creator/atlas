@@ -1,6 +1,8 @@
 //! Native updater entrypoint; no CEF, UI runtime or VPN backend initialization.
 #![allow(dead_code)]
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The real updater/launcher is a GUI executable. Its child-process acceptance
+// must exercise that same subsystem even when cargo test uses the Debug profile.
+#![cfg_attr(any(not(debug_assertions), test), windows_subsystem = "windows")]
 mod update_lock;
 mod update_transaction;
 mod update_integrity;

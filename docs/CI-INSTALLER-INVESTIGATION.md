@@ -120,3 +120,25 @@ child driver is invoked explicitly by that test. Remote connected upgrade still
 must pass on the newly built signed installer; these local checks do not stand
 in for installation or reboot acceptance. The pinned previous artifact can only
 be reused for harness/orchestration changes; this native change forces a rebuild.
+
+## Debug test subsystem mismatch
+
+Job 112931151002 passed 202 library, 47 maintenance and 56 updater tests, but the
+separate restricted child test timed out. The test executable used the Windows
+console subsystem in Debug; the shipped Release updater uses Windows GUI.
+Local reproduction with the exact `update_user.rs` module and real token/process
+APIs failed as a Debug console executable with NTSTATUS 0xc0000142. Rebuilding
+the same Debug probe as GUI (PE subsystem 2) passed in 0.01 seconds, exit 0.
+Evidence: `debug-token-test.*`, `debug-gui-token-test.*` and
+`token-debug-gui-build.log` under `temp/installer-contract-fix/evidence`.
+
+The updater's test executable now uses its production GUI subsystem in both
+profiles. Token assertions, the 15-second deadline and the mandatory privileged
+CI test are unchanged. Release executable subsystem/behavior is unchanged by
+this correction. This isolates the known test difference; remote CI remains
+required confirmation.
+
+The installer-source gate also no longer downloads the complete binary-heavy
+Git history. It uses GitHub's comparison API and builds fresh if history diverges,
+the response hits the 300-file cap, or evidence is unavailable. Reuse still
+requires the same pinned successful signed build and unchanged build inputs.
