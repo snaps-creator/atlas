@@ -2,7 +2,7 @@
 
 **Atlas** — VPN-клиент для Windows с быстрым выбором сервера, гибкими правилами маршрутизации и понятной диагностикой соединения. Добавьте подписку, подключитесь и управляйте трафиком из одного приложения: вручную, автоматически или по правилам для конкретных сайтов и программ.
 
-Текущая версия исходников — **Alpha 2.2.4**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
+Текущая версия исходников — **2.4.2**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
@@ -23,7 +23,7 @@
 
 ## Установка
 
-Нужна **Windows 10/11 x64**. Скачайте [последний выпуск](https://github.com/snaps-creator/atlas/releases/latest) либо выберите **Code → Download ZIP** на странице репозитория. Для установки из ZIP полностью распакуйте архив и запустите **Install Atlas.exe** из корня; папка `installer/` должна находиться рядом. Этот установочный комплект работает без подключения к интернету.
+Нужна **Windows 10/11 x64**. Скачайте установщик нужной версии из [выпусков](https://github.com/snaps-creator/atlas/releases). Для 2.4.2 используется транзакционный EXE из сборки этой версии. Комплект `Install Atlas.exe` в ZIP исходников — историческая офлайн-сборка, а не автоматически пересобранный 2.4.2.
 
 Windows может показать «Неизвестный издатель»: у установщика пока нет сертификата Authenticode. Подпись обновления Atlas и подпись издателя Windows — разные вещи. Детали установки и проверки файлов — в [INSTALLER.md](INSTALLER.md).
 
