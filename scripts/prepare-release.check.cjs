@@ -51,4 +51,44 @@ test('actual PowerShell VerifyOnly prepares all assets without any GitHub API ca
   const latest=JSON.parse(fs.readFileSync(path.join(root,'artifacts/latest.json')));
   assert.equal(latest.platforms['windows-x86_64'].signature,input.artifactSignature);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root,'artifacts/release-preparation.json'))).verified.build,input.build);
+
+  // Execute the real publication branch with an in-process API double. It must
+  // keep a draft private until every asset upload has succeeded, and must never
+  // publish when an upload fails. No request can leave this PowerShell process.
+  fs.writeFileSync(path.join(root,'run.ps1'),`$global:atlasTestApiCalls = @()
+function Invoke-RestMethod {
+  param([Parameter(Position=0)][string]$Uri,[string]$Method,$Headers,[string]$ContentType,$Body,[string]$InFile)
+  $textBody = if ($Body -is [byte[]]) { [Text.Encoding]::UTF8.GetString($Body) } else { $Body }
+  $global:atlasTestApiCalls += [pscustomobject]@{uri=$Uri;method=$Method;body=$textBody;file=$InFile}
+  if ($InFile) {
+    if (-not (Test-Path -LiteralPath $InFile)) { throw 'Missing upload input' }
+    if ($env:ATLAS_TEST_FAIL_UPLOAD -eq '1') { throw 'Injected upload failure' }
+    return @{id=2}
+  }
+  if ($Method -eq 'Post') { return @{id=42;upload_url='https://uploads.invalid/42/assets{?name,label}'} }
+  return @{html_url='https://example.invalid/release';tag_name='v2.4.2'}
+}
+try { & ./scripts/publish-verified-update.ps1 -Installer './artifacts/${input.asset}' }
+finally { ConvertTo-Json -InputObject $global:atlasTestApiCalls -Depth 5 | Set-Content calls.json -Encoding utf8NoBOM }
+`);
+  for (const fail of ['0','1']) {
+    const published=spawnSync('pwsh',['-NoProfile','-File','run.ps1'],{cwd:root,encoding:'utf8',env:{...process.env,
+      GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_STEP_SUMMARY:'',ATLAS_TEST_FAIL_UPLOAD:fail}});
+    assert.ifError(published.error);
+    assert(fs.existsSync(path.join(root,'calls.json')),published.stdout+'\n'+published.stderr);
+    const calls=JSON.parse(fs.readFileSync(path.join(root,'calls.json')));
+    assert(calls.length>0,published.stdout+'\n'+published.stderr);
+    const create=JSON.parse(calls[0].body);
+    assert.equal(create.draft,true);assert.equal(create.target_commitish,input.build);assert.equal(create.tag_name,'v2.4.2');
+    if(fail==='1') {
+      assert.notEqual(published.status,0);
+      assert(!calls.some(call=>call.method==='Patch'));
+    } else {
+      assert.equal(published.status,0,published.stdout+'\n'+published.stderr);
+      assert.equal(calls.length,7);
+      assert.deepEqual(calls.slice(1,-1).map(call=>path.basename(call.file)),[input.asset,input.asset+'.sig','latest.json','update-manifest.json','update-manifest.json.sig']);
+      assert.equal(calls.at(-1).method,'Patch');
+      assert.equal(JSON.parse(calls.at(-1).body).draft,false);
+    }
+  }
 });
