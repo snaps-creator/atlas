@@ -54,6 +54,7 @@ $metadata=@(foreach ($name in @('Atlas.exe','Atlas.Service.exe','AtlasUpdater.ex
     } finally { $reader.Dispose(); $stream.Dispose() }
     [ordered]@{name=$name;version=$item.VersionInfo.ProductVersion;architecture='x64'}
 })
+& (Join-Path $PSScriptRoot 'test-release-payload.ps1') -Payload $payload -Installer $installerPath -ExpectedVersion $ExpectedVersion
 $installerFile=Get-Item -LiteralPath $installerPath
 if ($installerFile.VersionInfo.ProductVersion -ne $ExpectedVersion) { throw 'Wrong installer product version' }
 [ordered]@{version=$ExpectedVersion;installer=$installerPath;sha256=(Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant();size=$installerFile.Length;payloadVerified=$true;corruptedPayloadRejected=$true;installed=$false;files=$files;metadata=$metadata} |
