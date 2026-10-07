@@ -110,7 +110,23 @@ pub fn uninstall(root:&Path)->Result<(),String>{
     crate::update_service::Service::remove()?;
     crate::network_guard::wait_for_clean_baseline(std::time::Duration::from_secs(5))?;
     for name in ["Atlas.exe","Atlas.Service.exe","AtlasUpdater.exe","AtlasMaintenance.exe"]{files.insert(name.into());}
+    remove_root_payload(&root,files)?;
+    for directory in states.into_iter().chain([root.join("versions")]) {
+        if directory.exists(){std::fs::remove_dir_all(&directory).map_err(|e|format!("Cannot remove Atlas installation state: {e}"))?;}
+    }
+    for path in records {std::fs::remove_file(path).map_err(|e|e.to_string())?;}
+    std::fs::remove_file(root.join("current.json")).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+fn remove_root_payload(root:&Path,files:std::collections::BTreeSet<String>)->Result<(),String>{
     for relative in files {
+        // The NSIS wrapper owns its own executable. Legacy snapshots contain
+        // uninstall.exe, but its current root copy may be the running caller.
+        // NSIS removes it after the native helper returns; version backups are
+        // still removed with the versions directory below. Keep the root updater
+        // as well, so NSIS can retry if any later payload/state removal fails.
+        if relative.eq_ignore_ascii_case("uninstall.exe") || relative.eq_ignore_ascii_case("AtlasUpdater.exe") {continue;}
         let path=root.join(relative);
         if path.try_exists().map_err(|e|e.to_string())? {
             std::fs::remove_file(&path).map_err(|e|format!("Cannot remove Atlas component {}: {e}",path.display()))?;
@@ -122,10 +138,45 @@ pub fn uninstall(root:&Path)->Result<(),String>{
             }
         }
     }
-    for directory in states.into_iter().chain([root.join("versions")]) {
-        if directory.exists(){std::fs::remove_dir_all(&directory).map_err(|e|format!("Cannot remove Atlas installation state: {e}"))?;}
-    }
-    for path in records {std::fs::remove_file(path).map_err(|e|e.to_string())?;}
-    std::fs::remove_file(root.join("current.json")).map_err(|e|e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)] mod uninstall_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    #[test] fn legacy_uninstall_keeps_locked_nsis_wrapper_and_removes_payload() {
+        let root=std::env::temp_dir().join(format!("atlas-uninstall-test-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+        let _fixture=Fixture(root.clone());
+        std::fs::create_dir(root.join("resources")).unwrap();
+        for name in ["uninstall.exe","Atlas.exe","AtlasUpdater.exe","resources/uninstall.exe","unrelated.txt"] {
+            std::fs::write(root.join(name),b"fixture").unwrap();
+        }
+        // Real Windows sharing denial models the executing NSIS wrapper. The
+        // former deletion loop fails here before completing its cleanup.
+        let wrapper=std::fs::OpenOptions::new().read(true).share_mode(1).open(root.join("uninstall.exe")).unwrap();
+        assert!(std::fs::remove_file(root.join("uninstall.exe")).is_err());
+        let files=["Uninstall.exe","Atlas.exe","AtlasUpdater.exe","resources/uninstall.exe"].map(str::to_owned).into_iter().collect();
+        remove_root_payload(&root,files).unwrap();
+        assert!(root.join("uninstall.exe").exists());
+        assert!(root.join("unrelated.txt").exists());
+        assert!(!root.join("Atlas.exe").exists());
+        assert!(root.join("AtlasUpdater.exe").exists());
+        assert!(!root.join("resources").exists());
+        remove_root_payload(&root,["uninstall.exe","Atlas.exe"].map(str::to_owned).into_iter().collect()).unwrap();
+        // Other locked files must still fail closed, with the native helper
+        // retained for a later retry. Releasing the lock makes that retry pass.
+        std::fs::write(root.join("locked.dll"),b"locked payload").unwrap();
+        let locked=std::fs::OpenOptions::new().read(true).share_mode(1).open(root.join("locked.dll")).unwrap();
+        let retry_files=||["AtlasUpdater.exe","locked.dll"].map(str::to_owned).into_iter().collect();
+        assert!(remove_root_payload(&root,retry_files()).is_err());
+        assert!(root.join("AtlasUpdater.exe").exists());
+        drop(locked);
+        remove_root_payload(&root,retry_files()).unwrap();
+        assert!(!root.join("locked.dll").exists());
+        drop(wrapper);
+        std::fs::remove_file(root.join("uninstall.exe")).unwrap();
+    }
 }

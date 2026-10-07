@@ -32,3 +32,13 @@ Offline job 112970099075 tests the immutable signed 2.3.1-alpha.1 installer. UI 
 - New PR #58 CI: pending; local results do not substitute for installed-system acceptance.
 
 Existing backend tests cover real loopback Mihomo/Xray traffic and restart, HTTPS subscription redirects, source isolation/persistence, preflight failure, rollback success/failure, killed transaction writers and repeated recovery. These do not prove all physical reboot, public provider, Wintun/WFP and installed source-switch scenarios. The user's installed Atlas and network settings were not changed. No merge, release or installer publication is performed.
+
+## Follow-up: actual CI on 58bebc4, 2026-10-08
+
+Run 37681998972 passed the ordinary PR checks. Run 37681999262 passed signed packaging and the historical offline upgrade. Its new-installer acceptance confirmed active-Wintun legacy upgrade, new UI startup/shutdown, service-channel reconnect preserving SCM PID/network epoch, tunnel reopening and repeated installs with Atlas open/closed. The previous health failure did not recur. The later upgrade-uninstall step failed.
+
+The legacy inventory contains uninstall.exe. Native uninstall replayed those relative paths against the installation root and tried to delete the currently executing NSIS wrapper (the acceptance invokes it in place). This ownership defect is reproduced using a real Windows sharing lock: deletion fails. Native cleanup now leaves root uninstall.exe and AtlasUpdater.exe to NSIS; NSIS removes them after successful native cleanup. Retaining the root helper also preserves retries if another payload/state file is temporarily locked. Version backups are still removed. The regression verifies locked-wrapper preservation, case-insensitive root matching, deletion of nested names, preservation of unrelated files, rejection of other locked payloads and successful retry after their locks are released.
+
+NSIS now records the native uninstall result. The acceptance captures the process handle before waiting, reports the actual exit code, retains the diagnostic log on failure, and checks removal of launcher/helper, journal, version tree and uninstall registration in addition to service/network cleanup. No failure is converted to success.
+
+Local NSIS compilation (without installation), PowerShell syntax and 19 package/signature contracts passed. Full backend passed: 202 library, 47 maintenance, 58 updater tests; the opt-in provider test and child drivers remain separately scoped. The new signed CI cycle is pending; its final result must be checked before declaring system acceptance complete.

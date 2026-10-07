@@ -299,8 +299,24 @@ rules:
         foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
             $uninstaller = Join-Path $installRoot 'uninstall.exe'
             $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
-            if (-not $remove.WaitForExit(180000) -or $remove.ExitCode -ne 0) { throw "Failed $cycle" }
+            $null = $remove.Handle
+            if (-not $remove.WaitForExit(180000)) { throw "Timed out: $cycle" }
+            $remove.WaitForExit()
+            if ($null -eq $remove.ExitCode -or $remove.ExitCode -ne 0) {
+                $log = Join-Path $env:TEMP 'atlas-transactional-uninstall.log'
+                if (Test-Path -LiteralPath $log) {
+                    Copy-Item -LiteralPath $log -Destination (Join-Path $fixture 'atlas-transactional-uninstall.log')
+                    Get-Content -LiteralPath $log -Tail 40
+                }
+                throw "Failed ${cycle}: exit=$($remove.ExitCode)"
+            }
             if (Get-Service AtlasNetworkService -ErrorAction SilentlyContinue) { throw 'Uninstall left the Atlas service' }
+            foreach ($remaining in @('Atlas.exe','AtlasUpdater.exe','current.json','versions')) {
+                if (Test-Path -LiteralPath (Join-Path $installRoot $remaining)) { throw "Uninstall left $remaining" }
+            }
+            if (Test-Path -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas') {
+                throw 'Uninstall left its registration'
+            }
             $inspection = & $maintenance --inspect | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Uninstall did not restore the network baseline' }
             Write-Output "PASS: $cycle; service removed and network baseline restored."

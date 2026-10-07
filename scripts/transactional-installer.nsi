@@ -66,11 +66,16 @@ Section "Uninstall"
   nsExec::ExecToStack '"$PLUGINSDIR\AtlasUpdater.exe" --uninstall-local "$INSTDIR"'
   Pop $0
   Pop $1
+  FileOpen $2 "$TEMP\atlas-transactional-uninstall.log" a
+  FileSeek $2 0 END
+  FileWrite $2 "exit=$0$\r$\n$1$\r$\n"
+  FileClose $2
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "Не удалось завершить удаление Atlas.$\r$\n$1" /SD IDOK
     SetErrorLevel 6
     Abort
   ${EndIf}
+  Delete "$INSTDIR\AtlasUpdater.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$DESKTOP\Atlas.lnk"
