@@ -298,7 +298,7 @@ fn launch_with_token(executable:&Path,directory:&Path,args:&[&str],linked:HANDLE
         assert!(!admin_enabled(current.as_raw_handle()).unwrap());
         assert_eq!(integrity(current.as_raw_handle()).unwrap(),SECURITY_MANDATORY_MEDIUM_RID as u32);
         let exe=std::env::current_exe().unwrap();let root=exe.parent().unwrap();
-        assert!(File::options().write(true).open(&exe).is_err(),"Installation must remain read/execute only");
+        assert_eq!(File::options().write(true).open(root.join("permissions.txt")).unwrap_err().raw_os_error(),Some(5),"Installation must deny writes by ACL, not executable sharing locks");
         // Exercise both PE subsystems from the protected installation. Checking
         // only the GUI parent's token misses console initialization failures.
         for name in ["gui.exe","console.exe"] {
@@ -324,6 +324,7 @@ fn launch_with_token(executable:&Path,directory:&Path,args:&[&str],linked:HANDLE
         std::fs::create_dir(&root).unwrap();
         let _fixture=Fixture(root.clone(),unsafe{SetErrorMode(3)});
         crate::update_windows::protect_installation(&root).unwrap();
+        std::fs::write(root.join("permissions.txt"),b"read-only installation probe").unwrap();
         let mut bytes=std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let pe=u32::from_le_bytes(bytes[60..64].try_into().unwrap()) as usize;
         assert_eq!(&bytes[pe..pe+4],b"PE\0\0");

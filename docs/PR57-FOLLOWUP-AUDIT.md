@@ -28,6 +28,7 @@ Offline job 112970099075 tests the immutable signed 2.3.1-alpha.1 installer. UI 
 - Package/signature contracts: 19 passed.
 - Final backend: library 202 passed, 1 opt-in live test ignored; maintenance 47 passed; updater 57 passed, 3 process-driver tests ignored in the ordinary run.
 - Isolated native regression: token assertions and separately invoked elevated GUI/console test passed after the fix; process regression failed with the original token behavior.
-- New PR CI: pending; local results do not substitute for installed-system acceptance.
+- Final AtlasUpdater binary: separately invoked elevated process regression passed (two GUI/console cycles; write denial checked against a non-executable fixture, avoiding false positives from executable sharing locks).
+- New PR #58 CI: pending; local results do not substitute for installed-system acceptance.
 
 Existing backend tests cover real loopback Mihomo/Xray traffic and restart, HTTPS subscription redirects, source isolation/persistence, preflight failure, rollback success/failure, killed transaction writers and repeated recovery. These do not prove all physical reboot, public provider, Wintun/WFP and installed source-switch scenarios. The user's installed Atlas and network settings were not changed. No merge, release or installer publication is performed.
