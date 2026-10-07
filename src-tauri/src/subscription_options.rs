@@ -29,12 +29,50 @@ impl Options {
     }
 }
 
-pub fn https_url(raw: &str) -> Result<url::Url,String> {
-    let u=url::Url::parse(raw).map_err(|_|"Некорректный URL подписки")?;
-    if u.scheme()!="https" || u.host_str().is_none() || !u.username().is_empty() || u.password().is_some() || u.fragment().is_some() {
-        return Err("Подписка должна использовать HTTPS без userinfo и фрагмента".into());
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum SubscriptionUrlError {
+    SubscriptionUrlNotHttps,
+    SubscriptionUrlContainsCredentials,
+    SubscriptionUrlMissingHost,
+    SubscriptionUrlInvalidFragment,
+    SubscriptionUrlMalformed,
+}
+impl std::fmt::Display for SubscriptionUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SubscriptionUrlNotHttps => "Ссылка подписки должна использовать HTTPS.",
+            Self::SubscriptionUrlContainsCredentials => "Ссылка не должна содержать логин и пароль перед адресом сервера.",
+            Self::SubscriptionUrlMissingHost => "В ссылке отсутствует домен или IP-адрес.",
+            Self::SubscriptionUrlInvalidFragment => "Ссылка подписки не должна содержать часть после #.",
+            Self::SubscriptionUrlMalformed => "Не удалось распознать ссылку подписки.",
+        })
     }
+}
+pub fn validate_url(raw: &str) -> Result<url::Url, SubscriptionUrlError> {
+    use SubscriptionUrlError::*;
+    let raw = raw.trim();
+    // Do not let URL's browser-style repair turn https:///path into a host.
+    if let Some((scheme, rest)) = raw.split_once("://") {
+        if scheme.eq_ignore_ascii_case("https") && (rest.is_empty() || rest.starts_with(['/', '?', '#'])) {
+            return Err(SubscriptionUrlMissingHost);
+        }
+    }
+    let u = url::Url::parse(raw).map_err(|e| match e {
+        url::ParseError::EmptyHost => SubscriptionUrlMissingHost,
+        _ => SubscriptionUrlMalformed,
+    })?;
+    if u.scheme() != "https" { return Err(SubscriptionUrlNotHttps); }
+    if u.host_str().is_none() { return Err(SubscriptionUrlMissingHost); }
+    if !u.username().is_empty() || u.password().is_some() { return Err(SubscriptionUrlContainsCredentials); }
+    if u.fragment().is_some() { return Err(SubscriptionUrlInvalidFragment); }
     Ok(u)
+}
+pub fn https_url(raw: &str) -> Result<url::Url,String> {
+    validate_url(raw).map_err(|error| {
+        // Never record raw URLs, authority credentials, query tokens or fragments.
+        crate::incident_history::record("subscription_url_rejected", serde_json::json!({"code":error}), &[]);
+        error.to_string()
+    })
 }
 
 pub fn validate_agent(value: &str) -> Result<(),String> {
@@ -103,6 +141,24 @@ pub fn extract(body: &str, headers: &BTreeMap<String,String>, previous: &Options
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subscription_url_errors_are_specific_and_secret_free() {
+        use SubscriptionUrlError::*;
+        for (raw, expected) in [
+            ("http://example.com/token", SubscriptionUrlNotHttps),
+            ("https://user:secret@example.com/token", SubscriptionUrlContainsCredentials),
+            ("https://", SubscriptionUrlMissingHost),
+            ("https:///token", SubscriptionUrlMissingHost),
+            ("not a url", SubscriptionUrlMalformed),
+            ("https://[invalid]/token", SubscriptionUrlMalformed),
+            ("https://example.com/token#secret", SubscriptionUrlInvalidFragment),
+        ] {
+            let error = validate_url(raw).unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().contains("secret"));
+        }
+        assert!(validate_url("https://example.com/token?q=private").is_ok());
+    }
     #[test]
     fn header_overrides_body_and_domain_change_preserves_secret_path() {
         let headers=BTreeMap::from([("change-user-agent".into(),"Happ/4".into())]);

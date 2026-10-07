@@ -140,7 +140,56 @@ fn receive_cancellable(file: &mut File, timeout: Duration, running: Option<&std:
 pub struct Broker {
     pipe: Mutex<Option<File>>,
 }
+#[derive(Debug, PartialEq, Eq)]
+enum ChannelRecoveryAction { Reconnect, ServiceStopped, WaitForStartup, Unknown }
+fn channel_recovery_action(process_state: &str) -> ChannelRecoveryAction {
+    match process_state {
+        "Running" => ChannelRecoveryAction::Reconnect,
+        "Stopped" | "Missing" => ChannelRecoveryAction::ServiceStopped,
+        "Starting" | "Stopping" => ChannelRecoveryAction::WaitForStartup,
+        _ => ChannelRecoveryAction::Unknown,
+    }
+}
 impl Broker {
+    fn reconnect_pipe(running: Option<&std::sync::atomic::AtomicBool>) -> Result<File, String> {
+        let process = crate::service::process_snapshot()?;
+        if channel_recovery_action(process.state) != ChannelRecoveryAction::Reconnect {
+            return Err(format!("Служба Atlas: {}; канал отключён", process.state));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if running.is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err("Подключение отменено".into());
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(SERVICE_PIPE) {
+                let mut pid = 0;
+                if unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &mut pid) } == 0 || pid != process.pid {
+                    return Err("Процесс службы изменился во время восстановления канала".into());
+                }
+                crate::service::verify_server_pid(pid)?;
+                nonblocking(&file)?;
+                receive_service_ready(&mut file, running)?;
+                crate::incident_history::record("service_channel_transition", json!({
+                    "previousState":"Reconnecting","nextState":"Connected","serviceProcess":process}), &[]);
+                return Ok(file);
+            }
+            if Instant::now() >= deadline { return Err("Восстановление канала службы превысило 3 секунды".into()); }
+            crate::service::verify_server_pid(process.pid)?;
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    pub(crate) fn reconnect(&self) -> Result<(), String> {
+        let mut slot = self.pipe.try_lock().map_err(|_| "Канал занят текущей операцией; повторите проверку")?;
+        if slot.as_ref().is_some_and(pipe_alive) { return Ok(()); }
+        *slot = None;
+        *slot = Some(Self::reconnect_pipe(None)?);
+        Ok(())
+    }
+    pub(crate) fn close_channel(&self) -> Result<(), String> {
+        let mut slot = self.pipe.try_lock().map_err(|_| "Канал занят текущей операцией")?;
+        *slot = None;
+        Ok(())
+    }
     pub fn launch() -> Result<Self, String> { Self::launch_cancellable(None) }
     pub fn launch_cancellable(running: Option<&std::sync::atomic::AtomicBool>) -> Result<Self, String> {
         // A cold Windows service start can be delayed by signature/AV checks.
@@ -216,6 +265,7 @@ impl Broker {
                 _ => return Err("Сетевая служба занята. Повторите операцию.".into()),
             }
         };
+        if slot.is_none() { *slot = Some(Self::reconnect_pipe(running)?); }
         let file = slot.as_mut().ok_or("Канал сетевой службы закрыт")?;
         let reply = (|| {
             send_cancellable(file, &json!({"op":op,"payload":payload}), running)?;
@@ -234,8 +284,9 @@ impl Broker {
             Ok(reply) => reply,
             Err(error) => {
                 // A late reply must never be mistaken for the next command's reply.
-                // Closing the pipe also ends the on-demand service session.
-                crate::incident_history::record("service_transport_failed",json!({"operation":op,"error":error}),&[]);
+                // A mutation may have completed: never replay it on a new pipe.
+                crate::incident_history::record("service_transport_failed",json!({"operation":op,"error":error,
+                    "channelState":"Disconnected","serviceProcess":crate::service::process_snapshot().ok()}),&[]);
                 *slot = None;
                 return Err(error);
             }
@@ -247,6 +298,11 @@ impl Broker {
             Ok(reply["result"].clone())
         }
     }
+}
+fn pipe_alive(file: &File) -> bool {
+    let mut available = 0;
+    unsafe { PeekNamedPipe(file.as_raw_handle(), std::ptr::null_mut(), 0,
+        std::ptr::null_mut(), &mut available, std::ptr::null_mut()) != 0 }
 }
 fn receive_service_ready(pipe: &mut File, running: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
     let hello = receive_cancellable(pipe, Duration::from_secs(10), running)?;
@@ -773,19 +829,22 @@ fn abandon_session(core: &mut Core, guard: &mut Option<network_guard::Guard>,
     errors.extend([paused, stopped, dns].into_iter().filter_map(Result::err));
     Err(errors.join("; "))
 }
-fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -> Result<(), String> {
+fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -> Result<bool, String> {
     let Controller { session: NetworkSession { core, desktop_pid, session_id, network_epoch, configured, cleanup_observer, guard, active_settings },
         scheduler: Scheduler { health, queries }, selection: recovery } = state;
     let session_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let _watch = PipeWatch::start(&pipe, session_running.clone())?;
+    if *desktop_pid != 0 && *desktop_pid != desktop_owner_pid {
+        return Err("Сетевая сессия принадлежит другому процессу Atlas".into());
+    }
     *desktop_pid = desktop_owner_pid;
     core.continue_running = Some(session_running.clone());
     // Watch the desktop before validation or any other potentially blocking
     // request, including cancellation while a connection is still starting.
-    match crate::session_cleanup::start_observer(&core.directory, *desktop_pid) {
+    if cleanup_observer.is_none() { match crate::session_cleanup::start_observer(&core.directory, *desktop_pid) {
         Ok(observer) => *cleanup_observer = Some(observer),
         Err(error) => { let _ = send_startup_failure(&mut pipe, &error); return Err(error); }
-    }
+    } }
     send(&mut pipe, &json!({"ready":true}))?;
     let mut explicit_stop = false;
     loop {
@@ -867,6 +926,8 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                     ExistingSessionAction::StartFresh => {}
                     ExistingSessionAction::Reconcile => {
                     let previous = active_settings.clone().ok_or("Нет активной конфигурации службы")?;
+                    core.preflight_verified(&s, |probe|
+                        confirm_route(&probe.client(), &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
                     // The desktop may have restarted with newer persisted
                     // settings than the still-running service. Reconcile the
                     // existing core transactionally instead of rejecting the
@@ -874,28 +935,17 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                     queries.invalidate();
                     *network_epoch = network_epoch.wrapping_add(1);
                     recovery.invalidate();
-                    if let Err(error) = core.apply(&s) {
+                    if let Err(error) = core.apply_verified(&s, |core, rollback| {
+                        let policy = guard.as_ref().ok_or("Защита сети отсутствует при проверке конфигурации")?;
+                        confirm_session(core, policy, if rollback { &previous } else { &s })
+                    }) {
                         if !core.running() {
                             explicit_stop = true;
                             return abandon_session(core, guard, configured, active_settings,
                                 format!("Не удалось восстановить существующую сессию: {error}"));
                         }
-                        return Err(format!("Существующая сессия работает; новые настройки не применены: {error}"));
-                    }
-                    let confirmed = guard.as_ref().ok_or_else(|| "Защита сети отсутствует при повторном подключении".to_owned())
-                        .and_then(|policy| confirm_session(core, policy, &s));
-                    if let Err(error) = confirmed {
-                        let rollback = core.apply(&previous).and_then(|_| {
-                            let policy = guard.as_ref().ok_or("Защита сети отсутствует при откате повторного подключения")?;
-                            confirm_session(core, policy, &previous)
-                        });
-                        if let Err(rollback_error) = rollback {
-                            explicit_stop = true;
-                            return abandon_session(core, guard, configured, active_settings,
-                                format!("Новые настройки при повторном подключении не подтверждены: {error}; откат не подтверждён: {rollback_error}"));
-                        }
                         health.reset();
-                        return Err(format!("Новые настройки не подтверждены; прежняя VPN-сессия восстановлена: {error}"));
+                        return Err(format!("Существующая сессия работает; новые настройки не применены: {error}"));
                     }
                     *active_settings = Some(s);
                     health.reset();
@@ -979,31 +1029,22 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                     *active_settings = Some(s);
                     return Ok(json!({"running":true,"policyUpdated":true}));
                 }
+                core.preflight_verified(&s, |probe|
+                    confirm_route(&probe.client(), &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
                 queries.invalidate();
                 *network_epoch = network_epoch.wrapping_add(1);
                 recovery.invalidate();
-                if let Err(error) = core.apply(&s) {
+                if let Err(error) = core.apply_verified(&s, |core, rollback| {
+                    let policy = guard.as_ref().ok_or("Защита сети отсутствует при проверке конфигурации")?;
+                    confirm_session(core, policy, if rollback { &previous } else { &s })
+                }) {
                     if !core.running() {
                         explicit_stop = true;
                         return abandon_session(core, guard, configured, active_settings,
                             format!("Обновление остановило ядро: {error}"));
                     }
-                    return Err(format!("Обновление отклонено; прежняя конфигурация сохранена: {error}"));
-                }
-                let confirmed = guard.as_ref().ok_or_else(|| "Защита сети отсутствует после обновления".to_owned())
-                    .and_then(|policy| confirm_session(core, policy, &s));
-                if let Err(error) = confirmed {
-                    let rollback = core.apply(&previous).and_then(|_| {
-                        let policy = guard.as_ref().ok_or("Защита сети отсутствует при откате")?;
-                        confirm_session(core, policy, &previous)
-                    });
-                    if let Err(rollback_error) = rollback {
-                        explicit_stop = true;
-                        return abandon_session(core, guard, configured, active_settings,
-                            format!("Новый маршрут не подтверждён: {error}; откат не подтверждён: {rollback_error}"));
-                    }
                     health.reset();
-                    return Err(format!("Новый маршрут не подтверждён: {error}; прежнее подключение восстановлено"));
+                    return Err(format!("Обновление отклонено; прежняя конфигурация сохранена: {error}"));
                 }
                 *active_settings = Some(s);
                 health.reset();
@@ -1043,6 +1084,8 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
             "status" => {
                 let running = core.running();
                 Ok(json!({"running":running,"guard":*configured && running,
+                    "adapter":guard.as_ref().map(|g|g.diagnostic()).unwrap_or_else(network_guard::tun_diagnostic),
+                    "serviceProcessState":"Running","serviceChannelState":"Connected",
                     "sessionId":session_id.as_ref().map(ToString::to_string),"networkEpoch":*network_epoch,
                     "state":if *configured && running { "Connected" }
                         else if guard.is_some() { "ProtectedPause" } else { "Disconnected" }}))
@@ -1112,10 +1155,11 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
             break;
         }
     }
-    // A lost desktop pipe ends this session. The service closes its dynamic
-    // WFP engine and owned core before reporting STOPPED to SCM.
+    // A committed session survives transport loss for the bounded accept
+    // window. Its authenticated desktop observer still controls its lifetime.
     queries.invalidate();
-    Ok(())
+    core.continue_running = None;
+    Ok(!explicit_stop && ((*configured && guard.is_some()) || (!*configured && guard.is_none())))
 }
 
 pub fn serve_service() -> Result<(), String> {
@@ -1155,7 +1199,7 @@ pub fn serve_service() -> Result<(), String> {
                 return Err(error("Не удалось открыть канал сетевой службы"));
             }
             let mut connected = false;
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(if state.session.configured { 30 } else { 3 });
             while !crate::service::is_stopping() {
                 state.tick();
                 if Instant::now() >= deadline {
@@ -1196,7 +1240,11 @@ pub fn serve_service() -> Result<(), String> {
                 break;
             }
             let file = File::from_raw_handle(handle);
-            channel_result = run_channel(file, &mut state, client_pid);
+            match run_channel(file, &mut state, client_pid) {
+                Ok(true) => continue,
+                Ok(false) => channel_result = Ok(()),
+                Err(error) => channel_result = Err(error),
+            }
         }
         break;
     }
@@ -1216,6 +1264,13 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn channel_loss_with_live_process_requires_reconnect_not_process_restart() {
+        assert_eq!(channel_recovery_action("Running"), ChannelRecoveryAction::Reconnect);
+        assert_eq!(channel_recovery_action("Stopped"), ChannelRecoveryAction::ServiceStopped);
+        assert_eq!(channel_recovery_action("Starting"), ChannelRecoveryAction::WaitForStartup);
+        assert_eq!(channel_recovery_action("Unknown"), ChannelRecoveryAction::Unknown);
+    }
     #[test]
     fn uplink_probe_checks_the_auto_selected_node_without_mutating_it() {
         use std::{io::{Read,Write},net::TcpListener};

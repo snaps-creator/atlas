@@ -290,23 +290,45 @@ pub fn verify_server_pid(pid: u32) -> Result<(), String> {
 }
 
 pub fn is_running() -> bool {
+    process_snapshot().is_ok_and(|state| state.state == "Running")
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all="camelCase")]
+pub(crate) struct ProcessSnapshot {
+    pub state: &'static str,
+    pub pid: u32,
+    pub exit_code: u32,
+}
+pub(crate) fn process_snapshot() -> Result<ProcessSnapshot, String> {
     use windows_sys::Win32::System::Services::{
         QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
     };
     unsafe {
         let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-        if manager.is_null() { return false; }
+        if manager.is_null() { return Err(windows_error("Чтение состояния SCM")); }
         let service = OpenServiceW(manager, wide(NAME).as_ptr(), SERVICE_QUERY_STATUS);
-        if service.is_null() { CloseServiceHandle(manager); return false; }
+        if service.is_null() {
+            let code = GetLastError();
+            CloseServiceHandle(manager);
+            return if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                Ok(ProcessSnapshot { state: "Missing", pid: 0, exit_code: 0 })
+            } else { Err(format!("Чтение службы Atlas: код Windows {code}")) };
+        }
         let mut status: SERVICE_STATUS_PROCESS = std::mem::zeroed();
         let mut needed = 0;
-        let running = QueryServiceStatusEx(
+        let queried = QueryServiceStatusEx(
             service, SC_STATUS_PROCESS_INFO, &mut status as *mut _ as *mut u8,
             std::mem::size_of_val(&status) as u32, &mut needed,
-        ) != 0 && status.dwCurrentState == SERVICE_RUNNING;
+        ) != 0;
+        let error = if queried { None } else { Some(windows_error("Чтение процесса службы")) };
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
-        running
+        if let Some(error) = error { return Err(error); }
+        Ok(ProcessSnapshot { state: match status.dwCurrentState {
+            SERVICE_RUNNING => "Running", SERVICE_STOPPED => "Stopped",
+            SERVICE_START_PENDING => "Starting", SERVICE_STOP_PENDING => "Stopping", _ => "Unknown",
+        }, pid: status.dwProcessId, exit_code: status.dwWin32ExitCode })
     }
 }
 

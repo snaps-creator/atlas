@@ -16,6 +16,7 @@ mod latency;
 mod resilient_selection;
 mod model;
 mod network_guard;
+mod recovery;
 mod network_change;
 mod portable;
 mod published_state;
@@ -208,7 +209,18 @@ impl App {
     }
     fn connect(&mut self) -> Result<(), String> {
         if self.status == "CleanupError" {
-            return Err("Сначала завершите безопасное восстановление сети Atlas".into());
+            // The last exception is history, not evidence that the adapter is
+            // still held. Reconcile again before deciding whether retry is safe.
+            incident_history::record("recovery_retry", json!({"operationId":uuid::Uuid::new_v4(),
+                "previousState":self.status,"previousError":self.error,
+                "nextState":"InspectActualSystemState","tun":network_guard::tun_diagnostic(),
+                "serviceProcess":service::process_snapshot().ok()}), &[]);
+            let directory = self.core.directory.clone();
+            let inspected = cleanup_network_session(Some(&mut self.core), &directory, false);
+            recovery::complete_retry(&mut self.status, &mut self.error, inspected)?;
+            incident_history::record("recovery_direct_connectivity", json!({
+                "nextState":"ValidateDirectConnectivity","evidence":support_probes::recovery_direct(),
+                "meaning":"A failed Internet probe does not imply remaining Atlas-owned network state"}), &[]);
         }
         if self.status == "Connected" && self.core.running() {
             return Ok(());
@@ -326,7 +338,7 @@ impl App {
         }
         self.settings.was_connected = false;
         if let Err(error) = self.store.save(&self.settings) {
-            self.status = "CleanupError".into();
+            self.status = "Disconnected".into();
             self.error = Some(format!("Сеть восстановлена, но не удалось сохранить отключённое состояние: {error}"));
             return Err(self.error.clone().unwrap());
         }
@@ -578,12 +590,23 @@ fn cleanup_network_session(
     directory: &std::path::Path,
     clear_legacy_filters: bool,
 ) -> Result<(), String> {
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let previous_stage = std::cell::RefCell::new("InspectActualSystemState".to_owned());
     let stage = |name: &str, operation: &mut dyn FnMut() -> Result<(), String>| {
         let started = std::time::Instant::now();
-        incident_history::record("shutdown_stage_started", json!({"stage":name}), &[]);
+        let next = match name {
+            "core" | "service" => "StopOrReconnectServiceIfNeeded",
+            "proxy_restore" => "ReconcileProxyState",
+            "legacy_filters" => "ReconcileOwnedRules",
+            "tun_release" => "ValidateAtlasBaseline",
+            _ => name,
+        };
+        let previous = previous_stage.replace(next.to_owned());
+        incident_history::record("shutdown_stage_started", json!({"operationId":operation_id,"stage":name,
+            "previousState":previous,"nextState":next}), &[]);
         let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
         let result = operation();
-        incident_history::record("shutdown_stage_completed", json!({"stage":name,
+        incident_history::record("shutdown_stage_completed", json!({"operationId":operation_id,"stage":name,
             "elapsedMs":started.elapsed().as_millis(),"error":result.as_ref().err()}), &[]);
         let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
         result
@@ -597,15 +620,29 @@ fn cleanup_network_session(
         else { stage("service", &mut || service::stop_and_wait_timeout(std::time::Duration::from_secs(1))) };
     let proxy = stage("proxy_restore", &mut || windows::restore(&directory.join("proxy-restore.json")));
     let legacy = stage("legacy_filters", &mut || if clear_legacy_filters { network_guard::clear() } else { Ok(()) });
-    let tun = stage("tun_release", &mut || network_guard::wait_for_tun_release(std::time::Duration::from_secs(1)));
+    let tun = stage("tun_release", &mut || network_guard::wait_for_clean_baseline(std::time::Duration::from_secs(1)));
+    let observed = network_guard::tun_diagnostic();
+    let process = service::process_snapshot();
+    let released = core.as_deref().is_none_or(|c| c.owned_processes_released());
+    let reconciled = released && process.as_ref().is_ok_and(|p| matches!(p.state,"Stopped"|"Missing"))
+        && observed["baselineReady"] == true && proxy.is_ok() && legacy.is_ok() && tun.is_ok();
+    incident_history::record("recovery_baseline", json!({"operationId":operation_id,
+        "serviceProcess":process.as_ref().ok(),"serviceQueryError":process.as_ref().err(),"tun":observed,
+        "serviceChannelState":if core.as_deref().is_some_and(|c|c.has_broker()) {"Unknown"} else {"Disconnected"},
+        "historicalStopError":owned_core.as_ref().err(),"historicalServiceError":service.as_ref().err(),
+        "proxyState":if proxy.is_ok() {"RestoredOrNotOwned"} else {"RestoreFailed"},
+        "dnsState":"AtlasDoesNotChangeInterfaceDnsServers",
+        "cleanupState":if reconciled {"ReadyForRetry"} else {"CleanupRequired"}}), &[]);
     let _ = incident_history::flush(&directory.join("incident-history.ndjson"));
     let errors: Vec<_> = [owned_core, service, proxy, legacy, tun].into_iter()
         .filter_map(Result::err).collect();
-    if errors.is_empty() {
+    if reconciled {
         let _ = std::fs::remove_file(directory.join("tun-guard.active"));
         Ok(())
     } else {
-        Err(format!("Очистка Atlas не завершена: {}", errors.join("; ")))
+        Err(format!("Очистка Atlas не завершена: {}", if errors.is_empty() {
+            "фактическое освобождение службы или адаптера не подтверждено".into()
+        } else { errors.join("; ") }))
     }
 }
 #[tauri::command]
@@ -1263,7 +1300,11 @@ pub fn run() {
                         let message = "Путь VPN не подтверждён. Служба выполняет ограниченное восстановление либо завершает сессию.";
                         a.error = Some(message.into());
                         a.log("ERROR",message);
-                        let _ = handle.emit("core-crashed", ());
+                        incident_history::record("session_unavailable", json!({
+                            "serviceProcess":service::process_snapshot().ok(),
+                            "channelState":if a.core.service_reachable() {"Connected"} else {"Disconnected"},
+                            "nextState":a.status,"reason":"PathNotConfirmed"}), &[]);
+                        let _ = handle.emit("core-session-unavailable", ());
                     }
                     if a.status == "ProtectedPause" {
                         if service_running == Some(true) {
@@ -1279,7 +1320,7 @@ pub fn run() {
                     }
                     let wants_connection = intent.load(std::sync::atomic::Ordering::SeqCst);
                     if !a.cancellation.settings_pending()
-                        && reconnect_retry.due(std::time::Instant::now(), wants_connection, a.status == "Error") {
+                        && reconnect_retry.due(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
                         a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
                         match a.connect() {
                             Ok(()) => reconnect_retry.reset(),
@@ -1325,6 +1366,17 @@ pub fn check_network_service() -> Result<(), String> {
     let status = broker.call("status", Value::Null)?;
     if status["running"] != false || status["guard"] != false {
         return Err("Проверка ожидала службу без активной VPN-сессии".into());
+    }
+    let before = service::process_snapshot()?;
+    broker.close_channel()?;
+    broker.reconnect()?;
+    let after = service::process_snapshot()?;
+    if before.pid == 0 || before.pid != after.pid {
+        return Err("Переподключение IPC неожиданно перезапустило процесс службы".into());
+    }
+    let restored = broker.call("status", Value::Null)?;
+    if restored["networkEpoch"] != status["networkEpoch"] || restored["running"] != false {
+        return Err("Восстановление IPC изменило сетевую сессию".into());
     }
     Ok(())
 }

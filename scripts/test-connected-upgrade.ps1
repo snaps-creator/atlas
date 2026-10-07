@@ -121,10 +121,14 @@ rules:
     do {
         $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw 'Post-exit adapter inspection failed' }
-        if ($null -eq $inspection.activeLuid) { break }
+        if ($inspection.baselineReady -eq $true) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
-    if ($null -ne $inspection.activeLuid) { throw 'Exited core left an active or misclassified Wintun adapter' }
+    if ($inspection.baselineReady -ne $true) { throw 'Exited core left an unverified recovery baseline' }
+    $handshake = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--check-network-service' -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $fixture 'ipc-reconnect.err')
+    if (-not $handshake.WaitForExit(25000)) { $handshake.Kill(); throw 'Service channel reconnect timed out' }
+    if ($handshake.ExitCode -ne 0) { throw 'Service channel reconnect changed process/session identity or failed' }
+    Write-Output 'PASS: control channel reconnect preserves SCM PID and network epoch.'
     Write-Output 'PASS: new core can reopen Atlas-TUN after the upgrade.'
     $desktop = [Diagnostics.Process]::Start($start)
     Start-Sleep -Milliseconds 300

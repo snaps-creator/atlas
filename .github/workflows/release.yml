@@ -83,4 +83,5 @@ jobs:
           npm run tauri -- build --bundles nsis
           if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          ./scripts/test-connected-upgrade.ps1 -Installer ("t/release/bundle/nsis/Atlas_" + $version + "_x64-setup.exe")
           ./scripts/publish-verified-update.ps1 -Installer ("t/release/bundle/nsis/Atlas_" + $version + "_x64-setup.exe")

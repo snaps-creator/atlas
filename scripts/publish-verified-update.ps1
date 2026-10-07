@@ -9,7 +9,7 @@ $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
 $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'Atlas-release' }
 $manifest = @{
     version = $version
-    notes = 'Исправления запуска интерфейса, обновления и завершения Atlas. Подробности — в docs/UPDATES.md.'
+    notes = 'Восстановление сети Atlas: повторная проверка очистки, переподключение канала службы, проверка подписки до применения и точные ошибки URL. Подробности — в docs/UPDATES.md.'
     pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     platforms = @{ 'windows-x86_64' = @{
         signature = (Get-Content -LiteralPath "$Installer.sig" -Raw).Trim()
