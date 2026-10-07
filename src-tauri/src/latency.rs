@@ -11,6 +11,8 @@ const DISPLAY_WORKERS: usize = 6;
 /// selected route and subscription refresh timestamps. Never expose credentials.
 pub fn node_identity(node: &Value) -> String {
     use sha2::{Digest, Sha256};
+    let mut node=node.clone();
+    if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");}
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
 // Match Clash Verge's per-node measurement without saturating the controller.
@@ -340,6 +342,7 @@ mod tests {
                     assert!(std::time::Instant::now() < deadline);
                     thread::sleep(Duration::from_millis(10));
                 };
+                connection.set_nonblocking(false).unwrap();
                 connection.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                 let _ = connection.read(&mut [0;2048]);
                 if !responds { continue; }
@@ -348,7 +351,7 @@ mod tests {
             }
         });
         let mut settings = Settings::default();
-        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})]});
         let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
         with_offline_core(settings,binary,std::env::temp_dir(),|client| {
@@ -426,7 +429,7 @@ mod tests {
         let mut settings=Settings::default();
         settings.mode="tun".into();
         settings.selected="fixture".into();
-        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),
             masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})]});
         let binary=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");

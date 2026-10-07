@@ -27,6 +27,9 @@ pub struct Core {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl Core {
+    pub(crate) fn owned_processes_released(&self) -> bool {
+        self.child.is_none() && self.xray.is_none() && self.draining_xray.is_empty() && self.broker.is_none()
+    }
     pub(crate) fn has_broker(&self) -> bool {
         self.broker.is_some()
     }
@@ -192,8 +195,7 @@ impl Core {
         if self.xray.as_mut().is_some_and(|runtime|!runtime.healthy()) {return false;}
         if let Some(broker) = &self.broker {
             if !broker.alive() {
-                let _ = std::fs::remove_file(self.directory.join("tun-guard.active"));
-                return false;
+                if broker.reconnect().is_err() { return false; }
             }
             // The service survives the UI and may hold WFP in protected pause.
             // A live pipe alone is not evidence of a working VPN path.
@@ -413,6 +415,37 @@ impl Core {
             broker.call_cancellable("apply", serde_json::to_value(s).map_err(|e| e.to_string())?, self.continue_running.as_deref())?;
             return Ok(());
         }
+        if !self.running() { return self.validate(s).map(|_| ()); }
+        self.apply_verified(s, |_, _| Ok(()))
+    }
+    /// Validate a replacement in a separate loopback-only runtime. It cannot
+    /// acquire TUN or change Windows proxy/routes/DNS, and never borrows the
+    /// current core's configuration files or listeners.
+    pub(crate) fn preflight_verified(&self, s: &Settings,
+        verify: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        let directory = self.directory.join(format!("preflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        let mut probe = Self::new(self.binary.clone(), directory.clone());
+        probe.continue_running = self.continue_running.clone();
+        let mut isolated = s.clone();
+        isolated.mode = "system".into();
+        let result = probe.use_ephemeral_ports().and_then(|_| probe.start(&isolated)).and_then(|_| verify(&mut probe));
+        let stopped = probe.stop();
+        let released = probe.owned_processes_released();
+        drop(probe);
+        let files = if released { std::fs::remove_dir_all(&directory).map_err(|e| e.to_string()) }
+            else { Err("Проверочное ядро не подтвердило остановку".into()) };
+        let errors: Vec<_> = [result, stopped, files].into_iter().filter_map(Result::err).collect();
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+    /// Keep the previous YAML, live selector and Xray workers until both the
+    /// candidate's path and disk commit have succeeded. Rollback uses the
+    /// exact pre-transaction YAML, not a regenerated provider configuration.
+    pub(crate) fn apply_verified(&mut self, s: &Settings,
+        mut verify: impl FnMut(&mut Self, bool) -> Result<(), String>) -> Result<(), String> {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        self.client().event(json!({"kind":"configuration_transition","operationId":operation_id,
+            "previousState":"Committed","nextState":"PreparingCandidate"}));
         self.reap_draining_xray();
         let mapped=self.xray.as_ref().and_then(|runtime|runtime.mapped_settings(s));
         // Bound worker accumulation without terminating anybody's live stream.
@@ -424,9 +457,7 @@ impl Core {
             prepared.validate()?; Some(prepared)
         } else {None};
         let path=self.validate_mapped(mapped.as_ref().unwrap_or_else(||&prepared.as_ref().unwrap().settings))?;
-        if !self.running() {
-            return Ok(());
-        }
+        if !self.running() { return Err("Ядро остановлено до применения новой конфигурации".into()); }
         let next_xray=prepared.map(|p|p.start_logged(self.logs.clone())).transpose()?;
         let old = self.directory.join("last-working.yaml");
         let previous = std::fs::read(&old).map_err(|e| format!("Не удалось сохранить конфигурацию для отката: {e}"))?;
@@ -442,8 +473,10 @@ impl Core {
                 } else {
                     Ok(config)
                 }
-            }).and_then(|_| self.commit(&path));
+            }).and_then(|_| verify(self, false)).and_then(|_| self.commit(&path));
         if let Err(e) = result {
+            self.client().event(json!({"kind":"configuration_transition","operationId":operation_id,
+                "previousState":"Candidate","nextState":"RollingBack","error":e}));
             let rollback = (|| {
                 // A failed commit may already have overwritten current/last-working.
                 // Use the pre-transaction bytes and the live selector, not its old default.
@@ -458,12 +491,15 @@ impl Core {
                     || self.api("GET", "/proxies/ATLAS", None)?["now"] != selected {
                     return Err("Ядро не подтвердило восстановление конфигурации и сервера".to_owned());
                 }
+                verify(self, true)?;
                 std::fs::write(self.directory.join("current.yaml"), &previous).map_err(|e| e.to_string())?;
                 std::fs::write(&old, &previous).map_err(|e| e.to_string())?;
                 let _ = std::fs::remove_file(rollback_path);
                 Ok::<(), String>(())
             })();
             if let Err(rollback_error) = rollback {
+                self.client().event(json!({"kind":"configuration_transition","operationId":operation_id,
+                    "previousState":"RollingBack","nextState":"RecoveryRequired","error":rollback_error}));
                 let cleanup = self.stop();
                 return Err(format!("{e}. Откат не подтверждён: {rollback_error}. {}",
                     match cleanup {
@@ -471,6 +507,8 @@ impl Core {
                         Err(error) => format!("Остановка сессии не подтверждена: {error}"),
                     }));
             }
+            self.client().event(json!({"kind":"configuration_transition","operationId":operation_id,
+                "previousState":"RollingBack","nextState":"PreviousRestored"}));
             return Err(e);
         }
         if let Some(next_xray)=next_xray {
@@ -479,6 +517,8 @@ impl Core {
             self.last_drain_check=Some(Instant::now());
             self.client().event(json!({"at":crate::model::now(),"kind":"xray_transport_replaced","existingStreamsPreserved":true,"drainingWorkers":self.draining_xray.len()}));
         }
+        self.client().event(json!({"kind":"configuration_transition","operationId":operation_id,
+            "previousState":"CandidateVerified","nextState":"Committed"}));
         Ok(())
     }
     pub fn select(&self, name: &str) -> Result<(), String> {
@@ -574,7 +614,7 @@ impl Core {
             }
             if tun_identity().is_some() {
                 self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_remaining","tunLuid":tun_identity()}));
-                return Err("Ядро остановлено, но Atlas-TUN всё ещё активен; восстановление сети не подтверждено".into());
+                return Err("Ядро остановлено, но освобождение Atlas-TUN не подтверждено".into());
             }
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_released"}));
         }
@@ -632,7 +672,7 @@ mod integration_tests {
         settings.mode = "system".into();
         settings.selected = "fixture".into();
         settings.routing_mode = crate::model::RoutingMode::Global;
-        settings.subscriptions.push(Subscription { options: Default::default(), id: "fixture".into(), name: "fixture".into(), masked_url: String::new(), updated_at: 0, error: None,
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(), id: "fixture".into(), name: "fixture".into(), masked_url: String::new(), updated_at: 0, error: None,
             servers: vec![json!({"name":"fixture","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}})] });
         let mut alternative=settings.subscriptions[0].servers[0].clone();
         alternative["name"]=json!("alternative");
@@ -718,7 +758,7 @@ mod integration_tests {
         let mut core=Core::new(binary,directory.clone());core.use_ephemeral_ports().unwrap();
         let mut settings=Settings::default();settings.mode="system".into();settings.selected="fixture".into();
         settings.routing_mode=crate::model::RoutingMode::Global;
-        settings.subscriptions.push(Subscription {options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+        settings.subscriptions.push(Subscription { source: Default::default(),options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}})]});
         core.start(&settings).unwrap();
         let target=std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();target.set_nonblocking(true).unwrap();
@@ -824,7 +864,7 @@ mod integration_tests {
             stopped.unwrap();
             assert!(!marker.exists(),"confirmed shutdown must clear the ownership marker");
         } else {
-            assert!(stopped.unwrap_err().contains("Atlas-TUN всё ещё активен"));
+            assert!(stopped.unwrap_err().contains("освобождение Atlas-TUN не подтверждено"));
             assert!(marker.exists(),"failed shutdown must retain ownership evidence for recovery");
             assert!(started.elapsed() < Duration::from_secs(4), "shutdown took {:?}", started.elapsed());
         }
@@ -868,7 +908,7 @@ mod integration_tests {
         core.use_ephemeral_ports().unwrap();
         let mut settings = Settings::default();
         settings.mode = "system".into();
-        settings.subscriptions.push(Subscription { options: Default::default(), id:"fixture".into(), name:"fixture".into(),
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(), id:"fixture".into(), name:"fixture".into(),
             masked_url:String::new(), updated_at:0, error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})] });
         for cycle in 0..50 {
@@ -894,7 +934,7 @@ mod integration_tests {
         );
         let mut s = Settings::default();
         s.default_route = Route::Proxy;
-        s.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
+        s.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         for text in ["version: 1\ndefault-route: proxy\nrules: []", "version: 1\ndefault-route: proxy\nrules:\n - {domain-suffix: example.com, route: direct}\n - {ip-cidr: 192.0.2.0/24, route: block, no-resolve: true}"] {
             let import = crate::portable::parse(text).unwrap(); s.groups = import.groups;
             for stack in [crate::model::TunStack::Gvisor, crate::model::TunStack::Mixed] {
@@ -916,7 +956,7 @@ mod integration_tests {
         let mut settings = Settings::default();
         settings.mode = "system".into();
         // Isolated fixture. No real subscription, credentials or OS proxy changes.
-        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         let mut tun_candidate = settings.clone();
         tun_candidate.mode = "tun".into();
         core.validate(&tun_candidate)
@@ -950,6 +990,27 @@ mod integration_tests {
             "FAILOVER"
         );
         let working = std::fs::read(directory.join("last-working.yaml")).unwrap();
+        // A candidate health failure must run rollback BEFORE committing any
+        // last-working bytes, using the old live selector and same core PID.
+        let mut candidate = settings.clone();
+        candidate.selected = "fixture".into();
+        assert!(core.preflight_verified(&candidate, |_| Err("injected preflight failure".into())).is_err());
+        assert!(core.running());
+        assert_eq!(core.child.as_ref().unwrap().id(), process);
+        assert_eq!(std::fs::read(directory.join("last-working.yaml")).unwrap(), working);
+        let mut phases = Vec::new();
+        let error = core.apply_verified(&candidate, |core, rollback| {
+            phases.push(rollback);
+            assert_eq!(std::fs::read(directory.join("last-working.yaml")).unwrap(), working);
+            assert_eq!(core.api("GET", "/proxies/ATLAS", None)?["now"],
+                if rollback { "FAILOVER" } else { "fixture" });
+            if rollback { Ok(()) } else { Err("injected candidate health failure".into()) }
+        }).unwrap_err();
+        assert!(error.contains("injected candidate health failure"));
+        assert_eq!(phases, vec![false, true]);
+        assert!(core.running());
+        assert_eq!(core.child.as_ref().unwrap().id(), process);
+        assert_eq!(std::fs::read(directory.join("last-working.yaml")).unwrap(), working);
         let mut invalid = settings.clone();
         invalid.subscriptions[0].servers[0]["type"] = json!("invalid-proxy-protocol");
         assert!(core.apply(&invalid).is_err());
@@ -986,6 +1047,7 @@ mod integration_tests {
         let worker = thread::spawn(move || {
             while worker_alive.load(Ordering::SeqCst) {
                 if let Ok((mut stream, _)) = origin.accept() {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
@@ -1097,7 +1159,11 @@ pub struct ApiClient {
 impl ApiClient {
     pub(crate) fn session_running(&self) -> Result<bool,String> {
         if let Some(broker)=&self.broker {
-            if !broker.alive() { return Ok(false); }
+            if !broker.alive() {
+                let process = crate::service::process_snapshot()?;
+                if matches!(process.state, "Stopped" | "Missing") { return Ok(false); }
+                broker.reconnect()?;
+            }
             return broker.call("status",Value::Null).map(|s|s["running"]==true && s["guard"]==true);
         }
         self.api("GET","/version",None).map(|_|true)

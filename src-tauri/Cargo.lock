@@ -267,12 +267,14 @@ dependencies = [
 
 [[package]]
 name = "atlas-vpn"
-version = "2.3.1-alpha.1"
+version = "2.4.2"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "ipnet",
  "keyring",
  "maxminddb",
+ "minisign-verify",
  "png 0.18.1",
  "regex",
  "reqwest 0.12.28",
@@ -289,6 +291,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tauri-runtime-cef",
+ "tokio",
  "url",
  "uuid",
  "windows-sys 0.59.0",

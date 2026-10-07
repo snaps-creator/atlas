@@ -37,6 +37,9 @@ export function SubscriptionCard({ sub, refreshing, canDelete, refresh, remove, 
     </div>
     <div className="subscription-meta">
       <span>{sub.servers.length} серверов</span>
+      {sub.servers.some(server => (server.protocol ?? server.type) === "vless") && (
+        <span>VLESS: {sub.servers.filter(server => (server.protocol ?? server.type) === "vless").length}</span>
+      )}
       <span title={sub.updatedAt > 0 ? new Date(sub.updatedAt * 1000).toLocaleString("ru") : undefined}>
         {sub.updatedAt > 0 ? `Обновлена ${subscriptionAge(sub.updatedAt, now)}` : "Ещё не обновлялась"}
       </span>

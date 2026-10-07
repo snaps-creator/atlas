@@ -3,7 +3,11 @@ use serde_json::{json, Value};
 /// Compare only generated network settings, ignoring the selector's initial order.
 /// UI preferences must never cause TUN reconfiguration.
 pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
-    if previous.servers()!=next.servers() {return false;}
+    let runtime_nodes=|settings:&Settings| settings.servers().into_iter().map(|mut node| {
+        if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");}
+        node
+    }).collect::<Vec<_>>();
+    if runtime_nodes(previous)!=runtime_nodes(next) {return false;}
     if previous.auto_test_interval_seconds != next.auto_test_interval_seconds { return false; }
     if previous.auto_search_ping_ms != next.auto_search_ping_ms { return false; }
     let mut comparison = next.clone();
@@ -28,7 +32,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     // loopback endpoints before any generated configuration can be launched.
     for node in &mut proxies {
         if node["type"]=="xray" {*node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":9});}
-        if let Some(object)=node.as_object_mut() {object.remove("atlas-xray-bridge");}
+        if let Some(object)=node.as_object_mut() {object.remove("atlas-xray-bridge");object.remove("extraParams");}
     }
     if proxies.is_empty() {
         return Err("Сначала добавьте подписку с серверами".into());
@@ -159,7 +163,12 @@ mod tests {
     fn generated_dns_and_route() {
         let mut s = Settings::default();
         s.mode = "system".into();
-        s.subscriptions.push(Subscription { options: Default::default(),id:"a".into(),name:"test".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"test","type":"ss","server":"127.0.0.1","port":443,"cipher":"aes-128-gcm","password":"test"})]});
+        s.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"a".into(),name:"test".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"test","type":"ss","server":"127.0.0.1","port":443,"cipher":"aes-128-gcm","password":"test"})]});
+        let mut metadata=s.clone();
+        metadata.subscriptions[0].servers[0]["extraParams"]=json!({"x-durev-prio":"2","custom":"preserved"});
+        assert!(same_network_config(&s,&metadata),"provider metadata must not reload TUN");
+        assert_eq!(crate::latency::node_identity(&s.servers()[0]),crate::latency::node_identity(&metadata.servers()[0]));
+        assert!(!generate(&metadata,"secret").unwrap().contains("extraParams"));
         let mut ui = s.clone();
         ui.theme = "light".into();
         ui.selected = "test".into();

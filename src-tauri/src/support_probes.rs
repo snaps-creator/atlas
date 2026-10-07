@@ -12,6 +12,9 @@ fn error_chain(error: &(dyn Error + 'static)) -> String {
 fn http(endpoint: &str, proxy: bool) -> Value {
     http_with(endpoint,proxy.then_some("http://127.0.0.1:17890"),Duration::from_secs(6))
 }
+pub(crate) fn recovery_direct() -> Value {
+    http_with("https://cp.cloudflare.com/generate_204", None, Duration::from_secs(2))
+}
 fn http_with(endpoint: &str, proxy: Option<&str>, timeout: Duration) -> Value {
     let started = Instant::now();
     let at = crate::model::now();

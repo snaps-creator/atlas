@@ -1,5 +1,5 @@
 //! Incident export: passive evidence first, then explicitly requested bounded probes.
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
@@ -225,9 +225,9 @@ pub(crate) fn configuration_evidence(settings: &crate::model::Settings) -> Value
             }
             Value::Object(safe)
         }).collect();
-        serde_json::json!({"name":sub.name,"updatedAt":sub.updated_at,"nodes":nodes})
+        serde_json::json!({"name":sub.name,"source":sub.source,"active":sub.source==settings.active_source,"updatedAt":sub.updated_at,"nodes":nodes})
     }).collect();
-    serde_json::json!({"subscriptions":subscriptions,"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
+    serde_json::json!({"subscriptions":subscriptions,"activeSource":settings.active_source,"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
         "compiledRules":crate::rules::compile(settings).ok(),"dns":settings.dns,"tunStack":settings.tun_stack,
         "meaning":"Endpoints and transport settings, not credentials. Matching names do not imply matching endpoints."})
 }
@@ -237,6 +237,14 @@ pub(crate) fn collect_secrets(value: &Value, result: &mut Vec<String>) {
         Value::Object(fields) => {
             for (key, value) in fields {
                 let key = key.to_ascii_lowercase();
+                if key=="extraparams" {
+                    if let Some(params)=value.as_object() {
+                        // The whole metadata map is removed by redact_value.
+                        // Also hide opaque provider values in free-form logs,
+                        // without replacing short public values such as "4" or "ws" everywhere.
+                        result.extend(params.values().filter_map(Value::as_str).filter(|s|s.len()>=8).map(str::to_owned));
+                    }
+                }
                 if [
                     "password",
                     "uuid",
@@ -271,7 +279,7 @@ pub(crate) fn redact_value(value: &Value, secrets: &[String]) -> Value {
     match value {
         Value::String(text) => Value::String(redact(text,secrets)),
         Value::Array(items) => Value::Array(items.iter().map(|v|redact_value(v,secrets)).collect()),
-        Value::Object(fields) => Value::Object(fields.iter().map(|(k,v)|(k.clone(),redact_value(v,secrets))).collect()),
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k,v)|(k.clone(),if k.eq_ignore_ascii_case("extraParams") {json!("[REDACTED]")} else {redact_value(v,secrets)})).collect()),
         other => other.clone(),
     }
 }
@@ -492,6 +500,16 @@ fn proxy_evidence(value: &Value) -> Value {
 mod tests {
     use super::*;
     #[test]
+    fn arbitrary_subscription_parameters_are_private() {
+        let node=json!({"extraParams":{"provider-token":"private-provider-token","x-durev-prio":"4"},"name":"safe"});
+        let mut secrets=Vec::new();
+        collect_secrets(&node,&mut secrets);
+        assert!(secrets.contains(&"private-provider-token".to_owned()));
+        assert!(!secrets.contains(&"4".to_owned()));
+        assert_eq!(redact_value(&node,&secrets)["extraParams"],"[REDACTED]");
+        assert!(!redact("request private-provider-token",&secrets).contains("private-provider-token"));
+    }
+    #[test]
     fn report_conclusions_do_not_turn_timeouts_or_http_errors_into_provider_outage() {
         let parts = serde_json::json!({"active":{"http":[
             {"path":"local_mixed_proxy","endpoint":"https://test","httpResponded":true,"controlSucceeded":false,"status":502},
@@ -521,7 +539,7 @@ mod tests {
     #[test]
     fn endpoint_comparison_omits_credentials_and_subscription_urls() {
         let mut s = crate::model::Settings::default();
-        s.subscriptions.push(crate::model::Subscription { options: Default::default(), id:"id".into(), name:"office".into(),
+        s.subscriptions.push(crate::model::Subscription { source: Default::default(), options: Default::default(), id:"id".into(), name:"office".into(),
             masked_url:"https://private-subscription".into(), updated_at:123, error:None,
             servers:vec![serde_json::json!({"name":"node","type":"vless","server":"192.0.2.1","port":443,
                 "uuid":"private-uuid","password":"private-pass","reality-opts":{"public-key":"private-key"}})] });

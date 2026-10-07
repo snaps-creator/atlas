@@ -3,7 +3,43 @@ on:
   pull_request:
 permissions:
   contents: read
+  actions: read
 jobs:
+  installer-source:
+    runs-on: ubuntu-latest
+    outputs:
+      run-id: ${{ steps.source.outputs.run-id }}
+    steps:
+      - uses: actions/github-script@v7
+        id: source
+        with:
+          script: |
+            // Reuse only this proven signed build, and only for changes to
+            // this orchestration or its external acceptance harness.
+            const sha = '3b0a0002850a2c64be96da5a29300a33b96a78a0';
+            const run_id = 37664177551;
+            const allowed = new Set(['.github/workflows/connected-upgrade.yml', 'scripts/test-connected-upgrade.ps1']);
+            const repo = context.repo;
+            try {
+              const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({
+                ...repo, basehead: `${sha}...${context.payload.pull_request.head.sha}`
+              });
+              // GitHub caps comparison files at 300. An incomplete comparison,
+              // divergent history or unavailable evidence must build fresh.
+              if (comparison.merge_base_commit.sha !== sha || !comparison.files || comparison.files.length >= 300) return;
+              if (comparison.files.some(file => !allowed.has(file.filename) || (file.previous_filename && !allowed.has(file.previous_filename)))) return;
+              const {data: run} = await github.rest.actions.getWorkflowRun({...repo, run_id});
+              if (run.head_sha !== sha || run.event !== 'pull_request') return;
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {...repo, run_id, per_page: 100});
+              if (!jobs.some(job => job.name === 'build-installer / installer' && job.conclusion === 'success')) return;
+              const {data} = await github.rest.actions.listWorkflowRunArtifacts({...repo, run_id});
+              const name = `Atlas-Windows-x64-PR-${context.issue.number}`;
+              if (!data.artifacts.some(artifact => artifact.name === name && !artifact.expired)) return;
+              core.info(`Reusing signed installer from ${sha}; all build inputs are unchanged.`);
+              core.setOutput('run-id', String(run_id));
+            } catch (error) {
+              core.info(`Cannot establish artifact provenance; build fresh: ${error.message}`);
+            }
   offline-connected-upgrade:
     runs-on: windows-latest
     timeout-minutes: 15
@@ -32,10 +68,13 @@ jobs:
             ${{ runner.temp }}/atlas-ui-acceptance-*/**
           retention-days: 7
   build-installer:
+    needs: installer-source
+    if: needs.installer-source.outputs.run-id == ''
     uses: ./.github/workflows/pr-installer.yml
     secrets: inherit
   connected-upgrade:
-    needs: build-installer
+    needs: [installer-source, build-installer]
+    if: always() && needs.installer-source.result == 'success' && (needs.build-installer.result == 'success' || (needs.build-installer.result == 'skipped' && needs.installer-source.outputs.run-id != ''))
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -50,7 +89,9 @@ jobs:
         with:
           name: Atlas-Windows-x64-PR-${{ github.event.pull_request.number }}
           path: candidate-installer
-      - name: Verify upgrade using the installer built from this commit
+          run-id: ${{ needs.installer-source.outputs.run-id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify upgrade using the signed installer with matching build inputs
         shell: pwsh
         run: |
           $candidates = @(Get-ChildItem candidate-installer -Filter '*Setup.exe' -File)

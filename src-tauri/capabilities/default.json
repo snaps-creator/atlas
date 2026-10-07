@@ -1,5 +1,11 @@
 {
   "identifier": "main",
-  "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-set-title", "updater:default"]
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "updater:allow-check"
+  ]
 }

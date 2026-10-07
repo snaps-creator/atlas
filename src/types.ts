@@ -8,8 +8,9 @@ export type Group = {
   route: Route;
   rules: Rule[];
 };
-export type Server = { name: string; type: string; country?: string | null; probeId: string };
+export type Server = { name: string; type: string; protocol?: string | null; country?: string | null; probeId: string };
 export type Subscription = {
+  source?: SubscriptionSource;
   options?: { userAgent: string | null; userAgentOverride: string | null; updateIntervalHours: number | null };
   id: string;
   name: string;
@@ -19,6 +20,8 @@ export type Subscription = {
   servers: Server[];
 };
 export type Settings = {
+  activeSource?: SubscriptionSource;
+  sourceSelections?: Partial<Record<SubscriptionSource, string>>;
   groups: Group[];
   subscriptions: Subscription[];
   selected: string;
@@ -41,6 +44,7 @@ export type Settings = {
   wasConnected: boolean;
   favorites: string[];
 };
+export type SubscriptionSource = "URL" | "VLESS";
 export type Log = { time: number; level: string; message: string };
 export type Snapshot = {
   refreshingSubscriptions?: string[];

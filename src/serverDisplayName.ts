@@ -1,4 +1,4 @@
 // Internal names remain unchanged for selection, latency and favorites.
 export function serverDisplayName(name: string): string {
-  return name.replace(/\s+·\s+[a-f0-9]{8}-\d+$/i, "");
+  return name.replace(/\s+·\s+[a-f0-9]{8}-(?:\d+|[a-f0-9]{16})$/i, "");
 }

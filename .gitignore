@@ -81,3 +81,6 @@ incident-history.ndjson
 # Keep package-lock.json, Cargo.lock, build configuration, icons,
 # src-tauri/resources and third_party: these are required build inputs.
 /dist-installer/
+/artifacts/
+/LOCAL-UPDATE.md
+/scripts/update-local.ps1

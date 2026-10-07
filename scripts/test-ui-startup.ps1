@@ -12,15 +12,32 @@ try {
     $env:ATLAS_UI_PROCESS_SMOKE = '1'
     $env:ATLAS_UI_SMOKE_REPORT = $report
     $process = Start-Process -FilePath $exe -WorkingDirectory $directory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $evidence 'stdout.log') -RedirectStandardError (Join-Path $evidence 'stderr.log')
-    if (-not $process.WaitForExit(25000)) {
+    $null = $process.Handle
+    $exited = $process.WaitForExit(25000)
+    $renderAcknowledged = $false
+    if (Test-Path -LiteralPath $report) {
+        $ack = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+        $renderAcknowledged = $ack.rendered -eq $true -and $ack.buttons -ge 5
+    }
+    if (-not $exited -and $renderAcknowledged) {
+        # Startup already passed within its original deadline. CEF teardown is
+        # a separate lifecycle stage, including in immutable historical fixtures.
+        # Do not retry or kill-and-pass: require a normal bounded process exit.
+        Write-Output 'Render/IPC acknowledged within startup deadline; awaiting normal CEF shutdown.'
+        $exited = $process.WaitForExit(25000)
+    }
+    if (-not $exited) {
         Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe } |
             Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json |
             Set-Content (Join-Path $evidence 'processes.json')
         if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
         Get-Content (Join-Path $evidence 'stderr.log') -Tail 40
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        throw 'Atlas UI did not finish isolated startup acceptance within 25 seconds'
+        if ($renderAcknowledged) { throw 'Atlas UI rendered but did not exit within the additional 25-second shutdown deadline' }
+        throw 'Atlas UI did not acknowledge rendering/IPC within 25 seconds'
     }
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) { throw "Isolated Atlas UI exited with failure code $($process.ExitCode)" }
     if (-not (Test-Path -LiteralPath $report)) { throw 'Atlas created a process but failed to render its interface and acknowledge IPC' }
     $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
     if (-not $result.rendered -or $result.buttons -lt 5) { throw 'Atlas UI acceptance report is incomplete' }

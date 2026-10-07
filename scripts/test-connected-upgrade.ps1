@@ -19,23 +19,157 @@ $candidateFiles = Join-Path $fixture 'candidate'
 & $sevenZip x $candidate "-o$candidateFiles" -y | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Candidate extraction failed' }
 $maintenance = Join-Path $candidateFiles 'AtlasMaintenance.exe'
+$transactional = Test-Path -LiteralPath (Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasUpdater.exe')
+if ($transactional) { $maintenance = Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasMaintenance.exe' }
+$activeRoot = $installRoot
+function Diagnose-RestrictedHelper([string]$helper) {
+    # Execute the production token-launch code in a small native harness on the
+    # disposable runner. The child only reads --protocol; no service/network API.
+    $probe = Join-Path $fixture 'token-probe'
+    New-Item -ItemType Directory -Path (Join-Path $probe 'src') -Force | Out-Null
+    @'
+[package]
+name = "atlas-protocol-probe"
+version = "2.4.2"
+edition = "2021"
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win32_Security_Authorization","Win32_System_Threading","Win32_System_SystemServices","Win32_System_Pipes","Win32_UI_Shell","Win32_UI_WindowsAndMessaging","Win32_System_Com"]}
+'@ | Set-Content (Join-Path $probe 'Cargo.toml') -Encoding utf8
+    Copy-Item (Join-Path $repo 'src-tauri/src/update_user.rs') (Join-Path $probe 'src/update_user.rs')
+    @'
+#[cfg(test)] mod protocol_probe {
+    use super::*;
+    #[test] #[ignore] fn child() {
+        #[link(name="kernel32")] extern "system" {fn SetErrorMode(mode:u32)->u32;}
+        unsafe{SetErrorMode(3);}
+        use std::os::windows::process::CommandExt;
+        assert!(desktop_safe(token().unwrap().as_raw_handle()).unwrap());
+        let helper=env!("ATLAS_PROTOCOL_PROBE_HELPER");
+        let mut results=Vec::new();
+        results.push(serde_json::json!({"readHelperError":std::fs::File::open(helper).err().and_then(|e|e.raw_os_error()),
+            "openNullError":std::fs::File::options().read(true).write(true).open("NUL").err().and_then(|e|e.raw_os_error())}));
+        for flags in [0x08000000,0] {
+            let result=std::process::Command::new(helper).arg("--protocol").creation_flags(flags)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).output();
+            results.push(match result {
+                Ok(out)=>serde_json::json!({"flags":flags,"exit":out.status.code(),"protocolValid":serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok_and(|v|v["protocol"]==1)}),
+                Err(e)=>serde_json::json!({"flags":flags,"spawnError":e.raw_os_error()})
+            });
+        }
+        for (name,path) in [("copied-helper",env!("ATLAS_PROTOCOL_PROBE_COPY")),("system",r"C:\Windows\System32\whoami.exe")] {
+            std::fs::write(env!("ATLAS_PROTOCOL_PROBE_REPORT"),serde_json::to_vec(&results).unwrap()).unwrap();
+            let result=std::process::Command::new(path).arg("--protocol").creation_flags(0x08000000)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+            results.push(match result {Ok(mut child)=>{
+                let wait=unsafe{WaitForSingleObject(child.as_raw_handle(),3000)};
+                if wait!=WAIT_OBJECT_0 {let _=child.kill();let _=child.wait();}
+                serde_json::json!({"target":name,"started":true,"wait":wait})
+            },Err(e)=>serde_json::json!({"target":name,"spawnError":e.raw_os_error()})});
+        }
+        std::fs::write(env!("ATLAS_PROTOCOL_PROBE_REPORT"),serde_json::to_vec(&results).unwrap()).unwrap();
+    }
+    #[test] fn parent() {
+        let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
+        let exe=std::env::current_exe().unwrap();
+        let (child,_pipe)=launch_with_token(&exe,exe.parent().unwrap(),
+            &["--exact","update_user::protocol_probe::child","--ignored"],reduced.as_raw_handle()).unwrap();
+        let status=unsafe{WaitForSingleObject(child.as_raw_handle(),15000)};
+        if status!=WAIT_OBJECT_0 {child.terminate();panic!("Protocol probe timed out");}
+        let mut exit=1;assert_ne!(unsafe{GetExitCodeProcess(child.as_raw_handle(),&mut exit)},0);assert_eq!(exit,0);
+    }
+}
+'@ | Add-Content (Join-Path $probe 'src/update_user.rs') -Encoding utf8
+    $transaction = Get-Content (Join-Path $repo 'src-tauri/src/update_transaction.rs') -Raw
+    $digest = [regex]::Match($transaction, '(?ms)^pub fn digest\(.*?^\}').Value
+    if (-not $digest) { throw 'Production digest function unavailable' }
+    ('use std::{path::Path,fs::OpenOptions,io::Read}; use sha2::{Digest,Sha256}; type Result<T> = std::result::Result<T,String>;' + $digest) |
+        Set-Content (Join-Path $probe 'src/update_transaction.rs') -Encoding utf8
+    # The production token tests also validate installation ACLs. Compile the
+    # exact protection routines so this diagnostic remains representative.
+    $windows = Get-Content (Join-Path $repo 'src-tauri/src/update_windows.rs') -Raw
+    $protection = [regex]::Match($windows, '(?ms)^pub fn protect_installation.*?^\}').Value
+    if (-not $protection) { throw 'Production installation protection unavailable' }
+    $protection | Set-Content (Join-Path $probe 'src/update_windows.rs') -Encoding utf8
+    '#![windows_subsystem = "windows"]
+mod update_user;
+mod update_transaction;
+mod update_windows;
+fn main() {}' | Set-Content (Join-Path $probe 'src/main.rs') -Encoding utf8
+    $env:ATLAS_PROTOCOL_PROBE_HELPER = $helper
+    $env:ATLAS_PROTOCOL_PROBE_COPY = Join-Path $probe 'AtlasMaintenance.exe'
+    Copy-Item -LiteralPath $helper -Destination $env:ATLAS_PROTOCOL_PROBE_COPY
+    $env:ATLAS_PROTOCOL_PROBE_REPORT = Join-Path $fixture 'restricted-helper-codes.log'
+    . (Join-Path $PSScriptRoot 'initialize-msvc.ps1')
+    & cargo test --manifest-path (Join-Path $probe 'Cargo.toml') -- --exact update_user::protocol_probe::parent
+    if ($LASTEXITCODE -ne 0) { Write-Output 'Restricted helper diagnostic could not finish' }
+    if (Test-Path $env:ATLAS_PROTOCOL_PROBE_REPORT) { Get-Content $env:ATLAS_PROTOCOL_PROBE_REPORT }
+}
+function Recovery-Root {
+    $registered = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
+    if ($registered.PathName -eq ('"' + (Join-Path $installRoot 'Atlas.Service.exe') + '" --network-service')) { return $installRoot }
+    $journalPath = Join-Path $installRoot 'current.json'
+    if (Test-Path -LiteralPath $journalPath) {
+        $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+        if ($journal.active.absent -ne $true -and $journal.active.id -match '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,99}$') {
+            $directory = Join-Path $installRoot ('versions/' + $journal.active.id)
+            if (Test-Path -LiteralPath (Join-Path $directory 'Atlas.Service.exe')) { return $directory }
+        }
+    }
+    return $installRoot
+}
 function Install-Checked([string]$path) {
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
     if ($process.ExitCode -ne 0) {
         Write-Output "Failed installer: $path; expected installation: $installRoot"
-        $nativeLog = Join-Path $env:TEMP 'atlas-install-recovery.log'
-        if (Test-Path -LiteralPath $nativeLog) {
-            Copy-Item -LiteralPath $nativeLog -Destination (Join-Path $fixture 'installer-original-failure.log')
-            Get-Content -LiteralPath $nativeLog -Tail 30
+        foreach ($logName in @('atlas-transactional-install.log','atlas-install-recovery.log')) {
+            $nativeLog = Join-Path $env:TEMP $logName
+            if (Test-Path -LiteralPath $nativeLog) {
+                Copy-Item -LiteralPath $nativeLog -Destination (Join-Path $fixture $logName)
+                Get-Content -LiteralPath $nativeLog -Tail 60
+            }
+        }
+        # Never export incident contents. Emit only source locations of known
+        # literal messages found in the disposable runner's history.
+        $history = Join-Path $env:LOCALAPPDATA 'net.atlasvpn.desktop/incident-history.ndjson'
+        if (Test-Path -LiteralPath $history) {
+            $incidentText = (Get-Content -LiteralPath $history -Tail 100 -Encoding UTF8) -join "`n"
+            $categories = @('history_present')
+            foreach ($kind in @('application_start','frontend_event','incident_summary')) {
+                if ($incidentText.Contains('"kind":"' + $kind + '"')) { $categories += $kind }
+            }
+            foreach ($source in @('lib.rs','broker.rs','service.rs','update_process.rs')) {
+                $lineNumber = 0
+                foreach ($line in (Get-Content -LiteralPath (Join-Path $repo "src-tauri/src/$source") -Encoding UTF8)) {
+                    $lineNumber++
+                    foreach ($literal in [regex]::Matches($line, '"([^"\\]{16,})"')) {
+                        if ($incidentText.Contains($literal.Groups[1].Value)) {
+                            $categories += "${source}:$lineNumber"
+                        }
+                    }
+                }
+            }
+            $categories | Sort-Object -Unique | Tee-Object -FilePath (Join-Path $fixture 'candidate-health-categories.log')
+        }
+        $journalPath = Join-Path $installRoot 'current.json'
+        if (Test-Path -LiteralPath $journalPath) {
+            $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+            $journal |
+                Select-Object stage,sequence,network_state,health_state,migration_state |
+                ConvertTo-Json | Tee-Object -FilePath (Join-Path $fixture 'transaction-state.log')
         }
         Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'" | Select-Object Name,State,PathName | Format-List
         Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('Atlas.exe','Atlas.Service.exe','Atlas.Core.exe','Atlas.Xray.exe') } |
             Select-Object ProcessId,ParentProcessId,Name,ExecutablePath | Format-List
         Get-Item (Join-Path $installRoot 'Atlas.exe') | ForEach-Object { $_.VersionInfo | Select-Object FileName,FileVersion,ProductVersion | Format-List }
         & $maintenance --inspect
-        & $maintenance --prepare-install $installRoot 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')
+        & $maintenance --prepare-install (Recovery-Root) 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')
         Write-Output "Independent recovery exit: $LASTEXITCODE"
+        if ($transactional -and $journal.candidate.id -match '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,99}$') {
+            Diagnose-RestrictedHelper (Join-Path $installRoot ('versions/' + $journal.candidate.id + '/AtlasMaintenance.exe'))
+        }
         throw "Installer failed: $($process.ExitCode)"
     }
 }
@@ -49,8 +183,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Old release signature does not match Atlas tru
 # Seed the actual signed old binaries and register their real service. The
 # regression concerns upgrading an EXISTING old installation, not whether its
 # obsolete cleanup hook can provision a fresh Windows Server CI image.
-& $sevenZip x $previous "-o$installRoot" -y | Out-Null
+# NSIS expands $PLUGINSDIR into its temporary directory, never $INSTDIR.
+# A raw archive extraction otherwise invents an installed "$PLUGINSDIR" folder;
+# the transactional legacy inventory correctly rejects that invalid path.
+& $sevenZip x $previous "-o$installRoot" '-xr!$PLUGINSDIR' -y | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Old release extraction failed' }
+if (Test-Path -LiteralPath (Join-Path $installRoot '$PLUGINSDIR')) { throw 'NSIS temporary files leaked into the installed fixture' }
 Copy-Item (Join-Path $installRoot 'Atlas.exe') (Join-Path $installRoot 'Atlas.Service.exe')
 $register = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--install-service' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'register.log') -RedirectStandardError (Join-Path $fixture 'register.err')
 if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old service registration failed: $(Get-Content (Join-Path $fixture 'register.err') -Raw)" }
@@ -99,12 +237,24 @@ rules:
     if ($desktop.HasExited) { throw 'Old desktop fixture failed to remain open' }
     Install-Checked $candidate
     if (-not $core.WaitForExit(5000) -or -not $desktop.WaitForExit(5000)) { throw 'Update left old Atlas processes running' }
-    $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $null -ne $inspection.activeLuid) { throw 'Update left an active or unverified Atlas-TUN' }
+    if ($transactional) {
+        $journal = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+        if ($journal.stage -ne 'Committed') { throw 'Upgrade was not durably committed' }
+        $activeRoot = Join-Path $installRoot ('versions/' + $journal.active.id)
+        $expectedVersion = (Get-Content (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version
+        if ($journal.active.version -ne $expectedVersion) { throw 'Wrong active version after upgrade' }
+        # Commit already checked authenticated UI/service readiness. Stop this
+        # disposable runner's candidate before the independent TUN reuse test.
+        & $maintenance --prepare-install (Recovery-Root)
+        if ($LASTEXITCODE -ne 0) { throw 'Committed candidate did not quiesce' }
+    }
+    $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+    $baseline = if ($inspection.PSObject.Properties.Name -contains 'baselineReady') { $inspection.baselineReady } else { $null -eq $inspection.activeLuid }
+    if ($LASTEXITCODE -ne 0 -or -not $baseline) { throw 'Update left an active or unverified Atlas-TUN' }
     if ((Get-Service AtlasNetworkService).Status -ne 'Stopped') { throw 'Service still runs after update' }
-    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $installRoot 'Atlas.exe')
+    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe')
     Write-Output 'PASS: signed 2.2.3 -> candidate upgrade with real active Wintun, service and desktop; old processes exited, tunnel released, new UI rendered.'
-    $core = Start-Process -FilePath (Join-Path $installRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
+    $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
         if ($core.HasExited) { throw 'New core cannot reopen the released tunnel' }
@@ -113,32 +263,75 @@ rules:
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($adapter.Status -ne 'Up') { throw 'New core failed to reconnect after the upgrade' }
-    $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+    $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $inspection.verifiedWintunDriver) { throw 'Live Wintun driver identity was not verified' }
     $core.Kill()
     $core.WaitForExit(5000) | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
-        $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+        $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw 'Post-exit adapter inspection failed' }
-        if ($null -eq $inspection.activeLuid) { break }
+        $hasRecoveryBaseline = $inspection.PSObject.Properties.Name -contains 'baselineReady'
+        if (($hasRecoveryBaseline -and $inspection.baselineReady -eq $true) -or
+            (-not $hasRecoveryBaseline -and $null -eq $inspection.activeLuid)) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
-    if ($null -ne $inspection.activeLuid) { throw 'Exited core left an active or misclassified Wintun adapter' }
+    if (($hasRecoveryBaseline -and $inspection.baselineReady -ne $true) -or
+        (-not $hasRecoveryBaseline -and $null -ne $inspection.activeLuid)) { throw 'Exited core left an unverified recovery baseline' }
+    if ($hasRecoveryBaseline) {
+        $handshake = Start-Process -FilePath (Join-Path $activeRoot 'Atlas.exe') -ArgumentList '--check-network-service' -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $fixture 'ipc-reconnect.err')
+        if (-not $handshake.WaitForExit(25000)) { $handshake.Kill(); throw 'Service channel reconnect timed out' }
+        if ($handshake.ExitCode -ne 0) { throw 'Service channel reconnect changed process/session identity or failed' }
+        Write-Output 'PASS: control channel reconnect preserves SCM PID and network epoch.'
+    }
     Write-Output 'PASS: new core can reopen Atlas-TUN after the upgrade.'
+    $start.FileName = Join-Path $activeRoot 'Atlas.exe'
     $desktop = [Diagnostics.Process]::Start($start)
     Start-Sleep -Milliseconds 300
     if ($desktop.HasExited) { throw 'Disconnected desktop fixture failed to remain open' }
     Install-Checked $candidate
-    if (-not $desktop.WaitForExit(5000)) { throw 'Update left the disconnected desktop running' }
+    if (-not $transactional -and -not $desktop.WaitForExit(5000)) { throw 'Update left the disconnected desktop running' }
+    if (-not $desktop.HasExited) { $desktop.Kill(); $desktop.WaitForExit(5000) | Out-Null }
     Write-Output 'PASS: installation succeeds with Atlas open and tunnel disconnected.'
     Install-Checked $candidate
     Write-Output 'PASS: installation also succeeds with Atlas closed and tunnel disconnected.'
+    if ($transactional) {
+        foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
+            $uninstaller = Join-Path $installRoot 'uninstall.exe'
+            $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
+            $null = $remove.Handle
+            if (-not $remove.WaitForExit(180000)) { throw "Timed out: $cycle" }
+            $remove.WaitForExit()
+            if ($null -eq $remove.ExitCode -or $remove.ExitCode -ne 0) {
+                $log = Join-Path $env:TEMP 'atlas-transactional-uninstall.log'
+                if (Test-Path -LiteralPath $log) {
+                    Copy-Item -LiteralPath $log -Destination (Join-Path $fixture 'atlas-transactional-uninstall.log')
+                    Get-Content -LiteralPath $log -Tail 40
+                }
+                throw "Failed ${cycle}: exit=$($remove.ExitCode)"
+            }
+            if (Get-Service AtlasNetworkService -ErrorAction SilentlyContinue) { throw 'Uninstall left the Atlas service' }
+            foreach ($remaining in @('Atlas.exe','AtlasUpdater.exe','current.json','versions')) {
+                if (Test-Path -LiteralPath (Join-Path $installRoot $remaining)) { throw "Uninstall left $remaining" }
+            }
+            if (Test-Path -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas') {
+                throw 'Uninstall left its registration'
+            }
+            $inspection = & $maintenance --inspect | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Uninstall did not restore the network baseline' }
+            Write-Output "PASS: $cycle; service removed and network baseline restored."
+            if ($cycle -eq 'upgrade uninstall') { Install-Checked $candidate }
+        }
+    }
 } finally {
     foreach ($process in @($core,$desktop)) {
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
     }
     # The guard above established that this disposable job created the service.
-    & $maintenance --prepare-install $installRoot
-    sc.exe delete AtlasNetworkService | Out-Null
+    if (Get-Service AtlasNetworkService -ErrorAction SilentlyContinue) {
+        & $maintenance --prepare-install (Recovery-Root)
+        if ($LASTEXITCODE -ne 0) { throw 'Disposable fixture cleanup failed' }
+        sc.exe delete AtlasNetworkService | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Disposable fixture service removal failed' }
+    }
 }

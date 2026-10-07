@@ -19,7 +19,7 @@ fn comparable(path: &Path) -> String {
     path.to_string_lossy().trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase()
 }
 fn owned_image(root: &Path, image: &Path, desktop: bool) -> bool {
-    let names: &[&str] = if desktop { &["Atlas.exe"] }
+    let names: &[&str] = if desktop { &["Atlas.exe", "AtlasUpdater.exe", "AtlasLauncher.exe"] }
         else { &["Atlas.Service.exe", "resources/Atlas.Core.exe", "resources/Atlas.Xray.exe"] };
     names.iter().any(|name| comparable(&root.join(name)) == comparable(image))
 }
@@ -57,9 +57,9 @@ fn stop_owned(root: &Path, desktop: bool) -> Result<(), String> {
     let mut more = unsafe {Process32FirstW(snapshot.0, &mut entry)};
     while more != 0 {
         let name = String::from_utf16_lossy(&entry.szExeFile).trim_end_matches('\0').to_lowercase();
-        let candidate = if desktop {name == "atlas.exe"}
+        let candidate = if desktop {matches!(name.as_str(),"atlas.exe"|"atlasupdater.exe"|"atlaslauncher.exe")}
             else {matches!(name.as_str(), "atlas.service.exe" | "atlas.core.exe" | "atlas.xray.exe")};
-        if candidate {
+        if candidate && entry.th32ProcessID!=std::process::id() {
             let raw = unsafe {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, entry.th32ProcessID)};
             if raw.is_null() {
                 // A raced exit is harmless; access denied is not proof of cleanup.
@@ -168,14 +168,33 @@ pub fn prepare(directory: &Path) -> Result<(), String> {
     let _ = graceful;
     let mut failures = Vec::new();
     let mut run = |result: Result<(),String>| {if let Err(e)=result {failures.push(e);}};
-    run(crate::network_guard::wait_for_tun_release(Duration::from_secs(3)));
+    // A first observation may race driver teardown. Only the final inspection
+    // after selective cleanup is authoritative for the TUN/route baseline.
+    let _ = crate::network_guard::wait_for_tun_release(Duration::from_secs(3));
     run(crate::network_guard::clear_routes_for_reusable_tun().map(|_|()));
     run(crate::network_guard::clear());
     run(crate::windows::restore_loaded_profiles());
+    run(crate::network_guard::wait_for_clean_baseline(Duration::from_secs(3)));
     #[link(name="dnsapi")]
     extern "system" {fn DnsFlushResolverCache() -> i32;}
     if unsafe {DnsFlushResolverCache()} == 0 {failures.push(error("Flush DNS after Atlas shutdown"));}
     if failures.is_empty() {Ok(())} else {Err(failures.join("; "))}
+}
+
+/// Transaction cleanup covers both immutable versions, but touches SCM only
+/// after its exact image has been matched against this transaction's roots.
+pub fn prepare_transaction(roots:&[PathBuf])->Result<(),String> {
+    if !crate::update_service::Service::exists()? {
+        for root in roots {stop_owned(root,true)?;stop_owned(root,false)?;}
+        return prepare(roots.first().ok_or("Missing installation roots")?);
+    }
+    let configuration=crate::update_service::Service::open(false)?.configuration()?;
+    let current=roots.iter().find(|root|crate::update_service::command(root).is_ok_and(|command|command.eq_ignore_ascii_case(&configuration.binary)))
+        .ok_or("Atlas service image is outside this update transaction")?;
+    for root in roots {stop_owned(root,true)?;}
+    prepare(current)?;
+    for root in roots {stop_owned(root,false)?;}
+    crate::network_guard::wait_for_clean_baseline(Duration::from_secs(3))
 }
 
 #[cfg(test)]

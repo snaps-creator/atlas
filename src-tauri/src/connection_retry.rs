@@ -17,7 +17,7 @@ impl ConnectionRetry {
     /// Returns true when an Error state is due for another attempt. The initial
     /// delay is three seconds; repeated failures grow exponentially to one minute.
     pub(crate) fn due(&mut self, now: Instant, wanted: bool, in_error: bool) -> bool {
-        if !wanted || !in_error {
+        if !wanted || !in_error || self.failures >= 5 {
             if !wanted {
                 self.reset();
             }
@@ -77,5 +77,15 @@ mod tests {
         assert_eq!(ConnectionRetry::delay(4), Duration::from_secs(48));
         assert_eq!(ConnectionRetry::delay(5), Duration::from_secs(60));
         assert_eq!(ConnectionRetry::delay(30), Duration::from_secs(60));
+    }
+    #[test]
+    fn repeated_failures_exhaust_budget_until_user_disconnects() {
+        let now = Instant::now();
+        let mut retry = ConnectionRetry::default();
+        for _ in 0..5 { retry.failed(now); }
+        assert!(!retry.due(now + Duration::from_secs(600), true, true));
+        assert!(!retry.due(now, false, true));
+        assert!(!retry.due(now, true, true));
+        assert!(retry.due(now + Duration::from_secs(3), true, true));
     }
 }

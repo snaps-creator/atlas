@@ -1,24 +1,35 @@
-; Double-click upgrades must take the same in-place path as the updater. The
-; stock reinstall page otherwise launches the OLD uninstaller before our hook.
+; GUI initialization precedes PageReinstall, which can invoke the OLD
+; uninstaller before NSIS_HOOK_PREINSTALL. Reject registered upgrades here too,
+; independent of /D, /P or /UPDATE. Silent installs reach the preinstall guard.
 !define MUI_CUSTOMFUNCTION_GUIINIT AtlasUpgradeEntry
 Function AtlasUpgradeEntry
-  ${GetOptions} $CMDLINE "/UPDATE" $0
-  ${IfNot} ${Errors}
-    Return
-  ${EndIf}
-  IfFileExists "$INSTDIR\Atlas.exe" 0 atlas_entry_done
-    ExecWait '"$EXEPATH" /P /UPDATE /R /D=$INSTDIR' $0
-    ${If} ${Errors}
-      MessageBox MB_OK|MB_ICONSTOP "Не удалось запустить установку обновления Atlas." /SD IDOK
-      SetErrorLevel 1
-      Quit
-    ${EndIf}
-    SetErrorLevel $0
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\AtlasNetworkService" "ImagePath"
+  StrCmp $0 "" 0 atlas_entry_blocked
+  ReadRegStr $0 HKLM "${UNINSTKEY}" "UninstallString"
+  StrCmp $0 "" 0 atlas_entry_blocked
+  ReadRegStr $0 HKCU "${UNINSTKEY}" "UninstallString"
+  StrCmp $0 "" 0 atlas_entry_blocked
+  IfFileExists "$INSTDIR\Atlas.exe" atlas_entry_blocked atlas_entry_done
+  atlas_entry_blocked:
+    MessageBox MB_OK|MB_ICONSTOP "Обновление остановлено до удаления предыдущей версии: транзакционная установка Atlas ещё не прошла обязательные проверки безопасности." /SD IDOK
+    SetErrorLevel 5
     Quit
   atlas_entry_done:
 FunctionEnd
 
 !macro NSIS_HOOK_PREINSTALL
+  ; Fail closed while the transactional activation/health gate is not certified.
+  ; This check runs before maintenance or any change to the installed payload.
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\AtlasNetworkService" "ImagePath"
+  StrCmp $0 "" 0 atlas_unsafe_upgrade
+  ReadRegStr $0 SHCTX "${UNINSTKEY}" "InstallLocation"
+  StrCmp $0 "" 0 atlas_unsafe_upgrade
+  IfFileExists "$INSTDIR\Atlas.exe" atlas_unsafe_upgrade atlas_fresh_install
+  atlas_unsafe_upgrade:
+    MessageBox MB_OK|MB_ICONSTOP "Обновление остановлено до изменения файлов: транзакционная установка Atlas ещё не прошла обязательные проверки безопасности." /SD IDOK
+    SetErrorLevel 5
+    Abort
+  atlas_fresh_install:
   ; Extract NEW native recovery before replacing any installed files. Never
   ; execute the old app's broken cleanup (and never require CEF for recovery).
   InitPluginsDir
@@ -39,6 +50,8 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
+  !searchreplace ATLAS_UPDATER_BINARY "${MAINBINARYSRCPATH}" "${MAINBINARYNAME}.exe" "AtlasUpdater.exe"
+  File /oname=AtlasUpdater.exe "${ATLAS_UPDATER_BINARY}"
   CopyFiles /SILENT "$PLUGINSDIR\AtlasMaintenance.exe" "$INSTDIR\AtlasMaintenance.exe"
   ; Tauri's CEF bundle contains upstream bootstrap hosts for a DLL-hosted
   ; application. Atlas is an EXE-hosted application and never launches them.
@@ -53,8 +66,16 @@ FunctionEnd
   ${EndIf}
   nsExec::ExecToLog 'sc.exe failure AtlasNetworkService reset= 0 actions= ""'
   Pop $0
+  ${If} $0 != 0
+    SetErrorLevel 6
+    Abort "Не удалось настроить восстановление службы Atlas."
+  ${EndIf}
   nsExec::ExecToLog 'sc.exe failureflag AtlasNetworkService 0'
   Pop $0
+  ${If} $0 != 0
+    SetErrorLevel 6
+    Abort "Не удалось проверить политику восстановления службы Atlas."
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -74,6 +95,7 @@ FunctionEnd
   ${EndIf}
   Delete "$INSTDIR\Atlas.Service.exe"
   Delete "$INSTDIR\AtlasMaintenance.exe"
+  Delete "$INSTDIR\AtlasUpdater.exe"
 !macroend
 ; Tauri's default macro kills by executable NAME across all directories. The
 ; preinstall/preuninstall helper below already stops exact verified paths.

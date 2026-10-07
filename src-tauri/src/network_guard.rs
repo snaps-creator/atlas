@@ -97,6 +97,34 @@ fn guid_value(guid: GUID) -> u128 {
         | ((guid.data3 as u128) << 64)
         | u64::from_be_bytes(guid.data4) as u128
 }
+const OWNED_TUN_KEY: &str = r"SOFTWARE\AtlasVPN\NetworkOwnership";
+fn recorded_tun() -> Option<(u64, u128)> {
+    use winreg::{RegKey, enums::{HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE}};
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(OWNED_TUN_KEY, KEY_QUERY_VALUE).ok()?;
+    let value: String = key.get_value("TunIdentity").ok()?;
+    let (luid, guid) = value.split_once(':')?;
+    Some((luid.parse().ok()?, u128::from_str_radix(guid, 16).ok()?))
+}
+fn record_owned_tun(identity: (u64, u128)) -> Result<(), String> {
+    use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
+    if recorded_tun() == Some(identity) { return Ok(()); }
+    // Written by the privileged service; ordinary desktop clients only read.
+    // One value prevents a reader observing half of an identity update.
+    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(OWNED_TUN_KEY)
+        .map_err(|e| format!("Запись владения Atlas-TUN: {e}"))?;
+    key.set_value("TunIdentity", &format!("{}:{:032x}",identity.0,identity.1))
+        .map_err(|e| format!("Запись идентификатора Atlas-TUN: {e}"))
+}
+fn owns_current_tun(luid: u64) -> bool {
+    let Some((recorded_luid, recorded_guid)) = recorded_tun() else { return false; };
+    if luid != recorded_luid { return false; }
+    unsafe {
+        let mut id: NET_LUID_LH = std::mem::zeroed();
+        id.Value = luid;
+        let mut guid: GUID = std::mem::zeroed();
+        ConvertInterfaceLuidToGuid(&id, &mut guid) == 0 && guid_value(guid) == recorded_guid
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct TunProbe {
@@ -106,14 +134,59 @@ struct TunProbe {
     interface_type: Option<u32>,
     description: Option<String>,
     verified_wintun: bool,
+    driver_observed: Option<bool>,
+    route_count: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum TunState {
+    Missing, Available, ActiveOwnedByAtlas, ActiveForeign,
+    DisabledReusable, CleanupRequired, InvalidDriver, Unknown,
+}
+fn is_down(probe: &TunProbe) -> bool {
+    probe.query_code == Some(0) && probe.oper_status.is_some_and(|s|
+        s == IfOperStatusDown || s == IfOperStatusLowerLayerDown || s == IfOperStatusNotPresent)
+}
+fn classify_tun(probe: &TunProbe, owned: Option<u64>) -> TunState {
+    if probe.alias_luid.is_none() {
+        return if probe.query_code.is_none() || matches!(probe.query_code, Some(2 | 1168)) {
+            TunState::Missing
+        } else { TunState::Unknown };
+    }
+    if matches!(probe.query_code, Some(2 | 1168)) {
+        return if probe.route_count == Some(0) { TunState::Missing } else { TunState::CleanupRequired };
+    }
+    if probe.query_code != Some(0) { return TunState::Unknown; }
+    if probe.driver_observed == Some(false) {
+        return if probe.oper_status == Some(windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp) {
+            TunState::ActiveForeign
+        } else { TunState::InvalidDriver };
+    }
+    if is_down(probe) {
+        if probe.route_count.is_some_and(|n| n > 0) { return TunState::CleanupRequired; }
+        if reusable_wintun(probe) { return TunState::DisabledReusable; }
+        // A withdrawn driver key is not proof of an active owner. There is
+        // nothing to clean when Windows confirms DOWN and no routes remain.
+        if probe.route_count == Some(0) { return TunState::Available; }
+        return TunState::Unknown;
+    }
+    if probe.oper_status == Some(windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp) {
+        return if owned == probe.alias_luid { TunState::ActiveOwnedByAtlas }
+            else { TunState::Unknown };
+    }
+    TunState::Unknown
+}
+fn baseline_ready(probe: &TunProbe) -> bool {
+    matches!(classify_tun(probe, None), TunState::Missing | TunState::Available | TunState::DisabledReusable)
+        && (probe.alias_luid.is_none() || probe.route_count == Some(0))
 }
 
 // The interface description is chosen by the application (Mihomo uses
 // "Meta Tunnel"). Verify the actual driver through the adapter's GUID instead.
-fn verified_wintun_driver(luid: &NET_LUID_LH) -> bool {
+fn verified_wintun_driver(luid: &NET_LUID_LH) -> Option<bool> {
     use winreg::{RegKey,enums::{HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE}};
     let mut guid: GUID=unsafe {std::mem::zeroed()};
-    if unsafe {ConvertInterfaceLuidToGuid(luid,&mut guid)}!=0 {return false;}
+    if unsafe {ConvertInterfaceLuidToGuid(luid,&mut guid)}!=0 {return None;}
     let id=format!("{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
         guid.data1,guid.data2,guid.data3,guid.data4[0],guid.data4[1],guid.data4[2],guid.data4[3],guid.data4[4],guid.data4[5],guid.data4[6],guid.data4[7]);
     let machine=RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -146,20 +219,23 @@ fn verified_wintun_driver(luid: &NET_LUID_LH) -> bool {
             &device.get_value::<String,_>("Service").ok()?,
             &device.get_value::<Vec<String>,_>("HardwareID").ok()?))
     });
-    // Windows can withdraw the device's registry key before its down interface
-    // row disappears. Retain positive driver evidence for THIS exact instance,
-    // never for an alias alone. A conflicting driver revokes that evidence.
-    static IDENTITY: Mutex<Option<(u64,u128)>> = Mutex::new(None);
-    let identity=(unsafe {luid.Value},guid_value(guid));
-    let mut cached=IDENTITY.lock().unwrap_or_else(|e|e.into_inner());
-    verified_driver_identity(&mut cached,identity,observed)
+    // No process-local positive cache: desktop and service use the same
+    // current evidence, including an explicit Unknown when a key disappears.
+    resolve_driver_evidence(observed, owns_current_tun(unsafe { luid.Value }))
+}
+fn resolve_driver_evidence(observed: Option<bool>, owned_instance: bool) -> Option<bool> {
+    observed.or_else(|| owned_instance.then_some(true))
 }
 
-fn verified_driver_identity(cached: &mut Option<(u64,u128)>, identity: (u64,u128), observed: Option<bool>) -> bool {
-    match observed {
-        Some(true) => { *cached=Some(identity); true },
-        Some(false) => { *cached=None; false },
-        None => *cached==Some(identity),
+fn tun_route_count(luid: u64) -> Option<usize> {
+    use windows_sys::Win32::{NetworkManagement::IpHelper::{GetIpForwardTable2, FreeMibTable}, Networking::WinSock::AF_UNSPEC};
+    unsafe {
+        let mut table = ptr::null_mut();
+        if GetIpForwardTable2(AF_UNSPEC, &mut table) != 0 { return None; }
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let count = rows.iter().filter(|r| r.InterfaceLuid.Value == luid).count();
+        FreeMibTable(table.cast());
+        Some(count)
     }
 }
 
@@ -178,7 +254,16 @@ fn tun_probe() -> TunProbe {
     unsafe {
         let mut tun: NET_LUID_LH = std::mem::zeroed();
         if ConvertInterfaceAliasToLuid(wide("Atlas-TUN").as_ptr(), &mut tun) != 0 {
-            return TunProbe::default();
+            use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfTable2Ex, FreeMibTable, MibIfTableNormal};
+            let mut table = ptr::null_mut();
+            let status = GetIfTable2Ex(MibIfTableNormal, &mut table);
+            if status != 0 { return TunProbe { query_code: Some(status), ..Default::default() }; }
+            let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+            let found = rows.iter().find(|row| String::from_utf16_lossy(&row.Alias).trim_matches('\0') == "Atlas-TUN")
+                .map(|row| row.InterfaceLuid);
+            FreeMibTable(table.cast());
+            let Some(found) = found else { return TunProbe::default(); };
+            tun = found;
         }
         let mut row: MIB_IF_ROW2 = std::mem::zeroed();
         row.InterfaceLuid = tun;
@@ -186,6 +271,7 @@ fn tun_probe() -> TunProbe {
         // Ask IP Helper whether the interface itself still exists. This variant
         // avoids querying driver statistics while Windows is recovering.
         let status = GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut row);
+        let driver = if status == 0 { verified_wintun_driver(&tun) } else { None };
         TunProbe {
             alias_luid: Some(tun.Value),
             query_code: Some(status),
@@ -193,7 +279,9 @@ fn tun_probe() -> TunProbe {
             interface_type: (status == 0).then_some(row.Type),
             description: (status == 0).then(|| String::from_utf16_lossy(&row.Description)
                 .trim_matches('\0').to_owned()),
-            verified_wintun: status==0 && verified_wintun_driver(&tun),
+            verified_wintun: driver == Some(true),
+            driver_observed: driver,
+            route_count: tun_route_count(tun.Value),
         }
     }
 }
@@ -217,7 +305,7 @@ fn reusable_wintun(probe: &TunProbe) -> bool {
 
 fn active_tun(probe: &TunProbe) -> Option<u64> {
     let alias = present_tun(probe.alias_luid, probe.query_code)?;
-    if reusable_wintun(probe) { None } else { Some(alias) }
+    if reusable_wintun(probe) || baseline_ready(probe) { None } else { Some(alias) }
 }
 
 pub fn tun_identity() -> Option<u64> {
@@ -226,6 +314,9 @@ pub fn tun_identity() -> Option<u64> {
 
 pub(crate) fn tun_diagnostic() -> serde_json::Value {
     let probe = tun_probe();
+    diagnostic_probe(&probe, None)
+}
+fn diagnostic_probe(probe: &TunProbe, owned: Option<u64>) -> serde_json::Value {
     serde_json::json!({
         "aliasLuid": probe.alias_luid,
         "interfaceQueryCode": probe.query_code,
@@ -234,8 +325,19 @@ pub(crate) fn tun_diagnostic() -> serde_json::Value {
         "interfaceType": probe.interface_type,
         "description": probe.description,
         "verifiedWintunDriver": probe.verified_wintun,
+        "driverEvidence": probe.driver_observed,
+        "ownershipRecorded": probe.alias_luid.is_some_and(owns_current_tun),
+        "state": classify_tun(probe, owned),
+        "adapterName": "Atlas-TUN",
+        "routeCount": probe.route_count,
+        "baselineReady": baseline_ready(&probe),
+        "adapterEnabled": probe.oper_status.map(|s| s == windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp),
         "reusableWintun": reusable_wintun(&probe),
-        "activeLuid": active_tun(&probe),
+        "activeLuid": if probe.query_code == Some(0)
+            && probe.oper_status == Some(windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp) {
+                probe.alias_luid
+            } else { None },
+        "blockingLuid": active_tun(&probe),
         "meaning": "A verified, down Wintun adapter may persist after its process exits and can be reused",
     })
 }
@@ -250,10 +352,17 @@ pub(crate) fn clear_routes_for_reusable_tun() -> Result<usize, String> {
         Networking::WinSock::AF_UNSPEC,
     };
     let probe = tun_probe();
-    let Some(luid) = probe.alias_luid else { return Ok(0); };
+    let Some(luid) = probe.alias_luid else {
+        return if baseline_ready(&probe) { Ok(0) } else { Err("Не удалось проверить наличие Atlas-TUN".into()) };
+    };
+    if baseline_ready(&probe) { return Ok(0); }
     let stale_alias = matches!(probe.query_code, Some(2 | 1168));
+    if !owns_current_tun(luid) {
+        return Err("Оставшиеся маршруты Atlas-TUN не имеют подтверждённой записи владения; чужие маршруты не изменены".into());
+    }
     if !stale_alias && !reusable_wintun(&probe) {
-        return Err(format!("Интерфейс Atlas-TUN занят или не подтверждён как выключенный Wintun (LUID {luid})"));
+        return Err(format!("Очистка Atlas-TUN не подтверждена: состояние {:?}, драйвер {:?}, маршруты {:?} (LUID {luid})",
+            classify_tun(&probe, None), probe.driver_observed, probe.route_count));
     }
     unsafe {
         let mut table = ptr::null_mut();
@@ -265,6 +374,11 @@ pub(crate) fn clear_routes_for_reusable_tun() -> Result<usize, String> {
         FreeMibTable(table.cast());
         let mut removed = 0;
         for route in stale {
+            let current = tun_probe();
+            if current.alias_luid != Some(luid) || !owns_current_tun(luid)
+                || (!matches!(current.query_code, Some(2 | 1168)) && !reusable_wintun(&current)) {
+                return Err("Состояние Atlas-TUN изменилось во время очистки; удаление маршрутов остановлено".into());
+            }
             let status = DeleteIpForwardEntry2(&route);
             if status == 0 { removed += 1; }
             else if status != ERROR_NOT_FOUND && status != ERROR_FILE_NOT_FOUND {
@@ -278,11 +392,23 @@ pub(crate) fn clear_routes_for_reusable_tun() -> Result<usize, String> {
 pub(crate) fn wait_for_tun_release(timeout: std::time::Duration) -> Result<(), String> {
     wait_for_tun_release_with(timeout, tun_identity)
 }
+pub(crate) fn wait_for_clean_baseline(timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let probe = tun_probe();
+        if baseline_ready(&probe) { return Ok(()); }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("Сеть Atlas требует восстановления: {:?}; маршруты {:?}",
+                classify_tun(&probe, None), probe.route_count));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
 fn wait_for_tun_release_with(timeout: std::time::Duration, identity: impl Fn() -> Option<u64>) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     while identity().is_some() {
         if std::time::Instant::now() >= deadline {
-            return Err("Atlas-TUN всё ещё активен после остановки службы. Очистка не подтверждена; неизвестный интерфейс не изменён".into());
+            return Err("Освобождение Atlas-TUN после остановки службы не подтверждено; неизвестный интерфейс не изменён".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -380,6 +506,19 @@ pub fn check_competing_routes() -> Result<(), String> {
 }
 
 impl Guard {
+    pub(crate) fn diagnostic(&self) -> serde_json::Value {
+        let probe = tun_probe();
+        let owned = self.owned_tun.lock().ok().and_then(|slot| *slot).and_then(|(luid, guid)| {
+            if probe.alias_luid != Some(luid) { return None; }
+            unsafe {
+                let mut identity: NET_LUID_LH = std::mem::zeroed();
+                identity.Value = luid;
+                let mut current: GUID = std::mem::zeroed();
+                (ConvertInterfaceLuidToGuid(&identity, &mut current) == 0 && guid_value(current) == guid).then_some(luid)
+            }
+        });
+        diagnostic_probe(&probe, owned)
+    }
     pub fn prepare(core: &Path) -> Result<Self, String> {
         if tun_identity().is_some() {
             return Err("Atlas-TUN появился до запуска ядра; его происхождение не подтверждено".into());
@@ -397,7 +536,7 @@ impl Guard {
     }
     pub fn reset_for_recovery(&self) -> Result<(), String> {
         if tun_identity().is_some() {
-            return Err("Atlas-TUN всё ещё активен; восстановление остановлено".into());
+            return Err("Освобождение Atlas-TUN не подтверждено; восстановление остановлено".into());
         }
         *self.owned_tun.lock().map_err(|_| "Не удалось сбросить идентификатор TUN")? = None;
         Ok(())
@@ -554,6 +693,11 @@ impl Guard {
             FwpmFreeMemory0(&mut app_id as *mut _ as *mut _);
             if !xray_app_id.is_null() {FwpmFreeMemory0(&mut xray_app_id as *mut _ as *mut _);}
             if outcome.is_ok() && tun_ready {
+                if let Some(identity) = tun_instance {
+                    let probe = tun_probe();
+                    if !probe.verified_wintun { return Err("Драйвер созданного Atlas-TUN не подтверждён".into()); }
+                    record_owned_tun(identity)?;
+                }
                 *self.owned_tun.lock().map_err(|_| "Не удалось записать идентификатор TUN")? = tun_instance;
             }
             outcome
@@ -605,15 +749,35 @@ fn dhcp_conditions(local: u16, remote: u16) -> [FWPM_FILTER_CONDITION0; 3] {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn withdrawn_registry_key_preserves_only_the_verified_interface_instance() {
-        let mut cached=None;
-        assert!(!super::verified_driver_identity(&mut cached,(42,7),None));
-        assert!(super::verified_driver_identity(&mut cached,(42,7),Some(true)));
-        assert!(super::verified_driver_identity(&mut cached,(42,7),None));
-        assert!(!super::verified_driver_identity(&mut cached,(42,8),None));
-        assert!(!super::verified_driver_identity(&mut cached,(43,7),None));
-        assert!(!super::verified_driver_identity(&mut cached,(42,7),Some(false)));
-        assert!(!super::verified_driver_identity(&mut cached,(42,7),None));
+    fn shared_ownership_evidence_never_overrides_a_conflicting_driver() {
+        assert_eq!(super::resolve_driver_evidence(None, true), Some(true));
+        assert_eq!(super::resolve_driver_evidence(None, false), None);
+        assert_eq!(super::resolve_driver_evidence(Some(false), true), Some(false));
+        assert_eq!(super::resolve_driver_evidence(Some(true), false), Some(true));
+    }
+    #[test]
+    fn withdrawn_driver_key_with_no_routes_is_available_without_claiming_verified_driver() {
+        let probe = super::TunProbe { alias_luid: Some(42), query_code: Some(0),
+            oper_status: Some(super::IfOperStatusDown), route_count: Some(0), ..Default::default() };
+        assert_eq!(super::classify_tun(&probe, None), super::TunState::Available);
+        assert!(super::baseline_ready(&probe));
+        assert!(!super::reusable_wintun(&probe));
+        assert_eq!(super::active_tun(&probe), None);
+    }
+    #[test]
+    fn retry_recomputes_cleanup_state_and_is_idempotent() {
+        let mut probe = super::TunProbe { alias_luid: Some(42), query_code: Some(0),
+            oper_status: Some(super::IfOperStatusDown), verified_wintun: true,
+            interface_type: Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL),
+            route_count: Some(2), ..Default::default() };
+        assert!(!super::baseline_ready(&probe));
+        assert_eq!(super::classify_tun(&probe,None), super::TunState::CleanupRequired);
+        probe.route_count = Some(0);
+        for _ in 0..2 {
+            assert!(super::baseline_ready(&probe));
+            assert_eq!(super::classify_tun(&probe,None), super::TunState::DisabledReusable);
+            assert_eq!(super::active_tun(&probe), None);
+        }
     }
     #[test]
     fn driver_identity_uses_network_guid_not_pnp_instance_shape() {
@@ -656,7 +820,7 @@ mod tests {
         let mut probe = super::TunProbe { alias_luid: Some(42), query_code: Some(0),
             oper_status: Some(super::IfOperStatusDown),
             interface_type: Some(windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL),
-            description: Some("Meta Tunnel".into()), verified_wintun: true };
+            description: Some("Meta Tunnel".into()), verified_wintun: true, ..Default::default() };
         assert!(super::reusable_wintun(&probe));
         assert_eq!(super::active_tun(&probe), None);
         probe.oper_status = Some(windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp);
