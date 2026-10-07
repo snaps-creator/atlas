@@ -46,6 +46,8 @@ windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win
         assert!(desktop_safe(token().unwrap().as_raw_handle()).unwrap());
         let helper=env!("ATLAS_PROTOCOL_PROBE_HELPER");
         let mut results=Vec::new();
+        results.push(serde_json::json!({"readHelperError":std::fs::File::open(helper).err().and_then(|e|e.raw_os_error()),
+            "openNullError":std::fs::File::options().read(true).write(true).open("NUL").err().and_then(|e|e.raw_os_error())}));
         for flags in [0x08000000,0] {
             let result=std::process::Command::new(helper).arg("--protocol").creation_flags(flags)
                 .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).output();
@@ -53,6 +55,11 @@ windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win
                 Ok(out)=>serde_json::json!({"flags":flags,"exit":out.status.code(),"protocolValid":serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok_and(|v|v["protocol"]==1)}),
                 Err(e)=>serde_json::json!({"flags":flags,"spawnError":e.raw_os_error()})
             });
+        }
+        for (name,path) in [("copied-helper",env!("ATLAS_PROTOCOL_PROBE_COPY")),("system",r"C:\Windows\System32\whoami.exe")] {
+            let result=std::process::Command::new(path).arg("--protocol").creation_flags(0x08000000)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            results.push(match result {Ok(status)=>serde_json::json!({"target":name,"exit":status.code()}),Err(e)=>serde_json::json!({"target":name,"spawnError":e.raw_os_error()})});
         }
         std::fs::write(env!("ATLAS_PROTOCOL_PROBE_REPORT"),serde_json::to_vec(&results).unwrap()).unwrap();
     }
@@ -77,6 +84,8 @@ mod update_user;
 mod update_transaction;
 fn main() {}' | Set-Content (Join-Path $probe 'src/main.rs') -Encoding utf8
     $env:ATLAS_PROTOCOL_PROBE_HELPER = $helper
+    $env:ATLAS_PROTOCOL_PROBE_COPY = Join-Path $probe 'AtlasMaintenance.exe'
+    Copy-Item -LiteralPath $helper -Destination $env:ATLAS_PROTOCOL_PROBE_COPY
     $env:ATLAS_PROTOCOL_PROBE_REPORT = Join-Path $fixture 'restricted-helper-codes.log'
     . (Join-Path $PSScriptRoot 'initialize-msvc.ps1')
     & cargo test --manifest-path (Join-Path $probe 'Cargo.toml') -- --exact update_user::protocol_probe::parent
