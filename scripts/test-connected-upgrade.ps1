@@ -54,8 +54,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Old release signature does not match Atlas tru
 # Seed the actual signed old binaries and register their real service. The
 # regression concerns upgrading an EXISTING old installation, not whether its
 # obsolete cleanup hook can provision a fresh Windows Server CI image.
-& $sevenZip x $previous "-o$installRoot" -y | Out-Null
+# NSIS expands $PLUGINSDIR into its temporary directory, never $INSTDIR.
+# A raw archive extraction otherwise invents an installed "$PLUGINSDIR" folder;
+# the transactional legacy inventory correctly rejects that invalid path.
+& $sevenZip x $previous "-o$installRoot" '-xr!$PLUGINSDIR' -y | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Old release extraction failed' }
+if (Test-Path -LiteralPath (Join-Path $installRoot '$PLUGINSDIR')) { throw 'NSIS temporary files leaked into the installed fixture' }
 Copy-Item (Join-Path $installRoot 'Atlas.exe') (Join-Path $installRoot 'Atlas.Service.exe')
 $register = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--install-service' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'register.log') -RedirectStandardError (Join-Path $fixture 'register.err')
 if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old service registration failed: $(Get-Content (Join-Path $fixture 'register.err') -Raw)" }
