@@ -22,6 +22,67 @@ $maintenance = Join-Path $candidateFiles 'AtlasMaintenance.exe'
 $transactional = Test-Path -LiteralPath (Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasUpdater.exe')
 if ($transactional) { $maintenance = Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasMaintenance.exe' }
 $activeRoot = $installRoot
+function Diagnose-RestrictedHelper([string]$helper) {
+    # Execute the production token-launch code in a small native harness on the
+    # disposable runner. The child only reads --protocol; no service/network API.
+    $probe = Join-Path $fixture 'token-probe'
+    New-Item -ItemType Directory -Path (Join-Path $probe 'src') -Force | Out-Null
+    @'
+[package]
+name = "atlas-protocol-probe"
+version = "2.4.2"
+edition = "2021"
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+windows-sys = {version="0.59",features=["Win32_Foundation","Win32_Security","Win32_Security_Authorization","Win32_System_Threading","Win32_System_SystemServices","Win32_System_Pipes","Win32_UI_Shell","Win32_UI_WindowsAndMessaging","Win32_System_Com"]}
+'@ | Set-Content (Join-Path $probe 'Cargo.toml') -Encoding utf8
+    Copy-Item (Join-Path $repo 'src-tauri/src/update_user.rs') (Join-Path $probe 'src/update_user.rs')
+    @'
+#[cfg(test)] mod protocol_probe {
+    use super::*;
+    #[test] #[ignore] fn child() {
+        use std::os::windows::process::CommandExt;
+        assert!(desktop_safe(token().unwrap().as_raw_handle()).unwrap());
+        let helper=env!("ATLAS_PROTOCOL_PROBE_HELPER");
+        let mut results=Vec::new();
+        for flags in [0x08000000,0] {
+            let result=std::process::Command::new(helper).arg("--protocol").creation_flags(flags)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).output();
+            results.push(match result {
+                Ok(out)=>serde_json::json!({"flags":flags,"exit":out.status.code(),"protocolValid":serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok_and(|v|v["protocol"]==1)}),
+                Err(e)=>serde_json::json!({"flags":flags,"spawnError":e.raw_os_error()})
+            });
+        }
+        std::fs::write(env!("ATLAS_PROTOCOL_PROBE_REPORT"),serde_json::to_vec(&results).unwrap()).unwrap();
+    }
+    #[test] fn parent() {
+        let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
+        let exe=std::env::current_exe().unwrap();
+        let (child,_pipe)=launch_with_token(&exe,exe.parent().unwrap(),
+            &["--exact","update_user::protocol_probe::child","--ignored"],reduced.as_raw_handle()).unwrap();
+        let status=unsafe{WaitForSingleObject(child.as_raw_handle(),15000)};
+        if status!=WAIT_OBJECT_0 {child.terminate();panic!("Protocol probe timed out");}
+        let mut exit=1;assert_ne!(unsafe{GetExitCodeProcess(child.as_raw_handle(),&mut exit)},0);assert_eq!(exit,0);
+    }
+}
+'@ | Add-Content (Join-Path $probe 'src/update_user.rs') -Encoding utf8
+    $transaction = Get-Content (Join-Path $repo 'src-tauri/src/update_transaction.rs') -Raw
+    $digest = [regex]::Match($transaction, '(?ms)^pub fn digest\(.*?^\}').Value
+    if (-not $digest) { throw 'Production digest function unavailable' }
+    ('use std::{path::Path,fs::OpenOptions,io::Read}; use sha2::{Digest,Sha256}; type Result<T> = std::result::Result<T,String>;' + $digest) |
+        Set-Content (Join-Path $probe 'src/update_transaction.rs') -Encoding utf8
+    '#![windows_subsystem = "windows"]
+mod update_user;
+mod update_transaction;
+fn main() {}' | Set-Content (Join-Path $probe 'src/main.rs') -Encoding utf8
+    $env:ATLAS_PROTOCOL_PROBE_HELPER = $helper
+    $env:ATLAS_PROTOCOL_PROBE_REPORT = Join-Path $fixture 'restricted-helper-codes.log'
+    . (Join-Path $PSScriptRoot 'initialize-msvc.ps1')
+    & cargo test --manifest-path (Join-Path $probe 'Cargo.toml') -- --exact update_user::protocol_probe::parent
+    if ($LASTEXITCODE -ne 0) { Write-Output 'Restricted helper diagnostic could not finish' }
+    if (Test-Path $env:ATLAS_PROTOCOL_PROBE_REPORT) { Get-Content $env:ATLAS_PROTOCOL_PROBE_REPORT }
+}
 function Recovery-Root {
     $registered = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
     if ($registered.PathName -eq ('"' + (Join-Path $installRoot 'Atlas.Service.exe') + '" --network-service')) { return $installRoot }
@@ -71,7 +132,8 @@ function Install-Checked([string]$path) {
         }
         $journalPath = Join-Path $installRoot 'current.json'
         if (Test-Path -LiteralPath $journalPath) {
-            Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json |
+            $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+            $journal |
                 Select-Object stage,sequence,network_state,health_state,migration_state |
                 ConvertTo-Json | Tee-Object -FilePath (Join-Path $fixture 'transaction-state.log')
         }
@@ -82,6 +144,9 @@ function Install-Checked([string]$path) {
         & $maintenance --inspect
         & $maintenance --prepare-install (Recovery-Root) 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')
         Write-Output "Independent recovery exit: $LASTEXITCODE"
+        if ($transactional -and $journal.candidate.id -match '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,99}$') {
+            Diagnose-RestrictedHelper (Join-Path $installRoot ('versions/' + $journal.candidate.id + '/AtlasMaintenance.exe'))
+        }
         throw "Installer failed: $($process.ExitCode)"
     }
 }
@@ -157,7 +222,7 @@ rules:
         if ($journal.active.version -ne $expectedVersion) { throw 'Wrong active version after upgrade' }
         # Commit already checked authenticated UI/service readiness. Stop this
         # disposable runner's candidate before the independent TUN reuse test.
-        & $maintenance --prepare-install $installRoot
+        & $maintenance --prepare-install (Recovery-Root)
         if ($LASTEXITCODE -ne 0) { throw 'Committed candidate did not quiesce' }
     }
     $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
