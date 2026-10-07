@@ -84,6 +84,12 @@ pub fn noises(raw: &str) -> Result<Value,String> {
 pub fn uri(line: &str) -> Result<Option<Value>,String> {
     let u=url::Url::parse(line).map_err(|_|"Некорректный URI")?;
     let mut q: HashMap<String,String>=u.query_pairs().into_owned().collect();
+    for (alias,key) in [("publicKey","pbk"),("shortId","sid"),("fingerprint","fp"),("serverName","sni")] {
+        if let Some(value)=q.get(alias).cloned() {
+            if q.get(key).is_some_and(|current|current!=&value) { return Err("VLESS: противоречащие параметры URI".into()); }
+            q.entry(key.into()).or_insert(value);
+        }
+    }
     // INCY share links use three separate fields rather than Happ's tuple.
     // Normalize before adapter selection so Trojan cannot silently lose them.
     if !q.contains_key("fragment") && ["fragmentPackets","fragmentLength","fragmentInterval"].iter().any(|key|q.contains_key(*key)) {
@@ -96,8 +102,9 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
     let needs_xray=["fragment","noises","atlas-xray","fm","pcs","vcn","ech","peer"].iter().any(|key|q.contains_key(*key))
         || q.get("type").is_some_and(|v|["xhttp","splithttp","httpupgrade","kcp"].contains(&v.as_str()));
     if u.scheme()!="vless" && !(u.scheme()=="trojan" && needs_xray) {return Ok(None);}
-    let host=u.host_str().ok_or("В URI отсутствует сервер")?;
+    let host=u.host_str().ok_or("В URI отсутствует сервер")?.trim_start_matches('[').trim_end_matches(']');
     let port=u.port().ok_or("В URI отсутствует порт")?;
+    if host.is_empty() || port==0 { return Err("Некорректный сервер или порт".into()); }
     let decode=|s: &str|url::form_urlencoded::parse(format!("v={}",s.replace('+',"%2B")).as_bytes()).next().map(|(_,v)|v.into_owned()).unwrap_or_default();
     let name=u.fragment().map(decode).unwrap_or_else(||format!("{host}:{port}"));
     let get=|key: &str,default: &str|q.get(key).cloned().unwrap_or_else(||default.to_owned());
@@ -116,10 +123,23 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
         "httpupgrade" => stream["httpupgradeSettings"]=json!({"path":get("path","/"),"host":get("host",host)}),
         "xhttp"|"splithttp" => {
             let mut settings=json!({"path":get("path","/"),"host":get("host",host),"mode":get("mode","auto")});
+            if !["auto","packet-up","stream-up","stream-one"].contains(&get("mode","auto").as_str()) {
+                return Err("XHTTP: неподдерживаемый mode".into());
+            }
             if let Some(extra)=q.get("extra") {
                 let extra: Value=serde_json::from_str(extra).map_err(|_|"XHTTP extra: некорректный JSON")?;
                 if !extra.is_object() {return Err("XHTTP extra должен быть объектом".into());}
                 settings["extra"]=extra;
+            }
+            if let Some(raw)=q.get("concurrency") {
+                let count=raw.parse::<i32>().ok().filter(|n|*n>0).ok_or("XHTTP: concurrency должен быть положительным целым числом")?;
+                let target=if settings.get("extra").is_some() {&mut settings["extra"]} else {&mut settings};
+                if target.get("xmux").is_none() {target["xmux"]=json!({});}
+                if !target["xmux"].is_object() {return Err("XHTTP: xmux должен быть объектом".into());}
+                if target["xmux"].get("maxConcurrency").is_some_and(|value|value!=&json!(count)) {
+                    return Err("XHTTP: противоречащие параметры concurrency и xmux".into());
+                }
+                target["xmux"]["maxConcurrency"]=json!(count);
             }
             stream["xhttpSettings"]=settings;
         }
@@ -134,7 +154,7 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
             }
             stream["finalmask"]=json!({"udp":masks});
         }
-        _ => return Err(format!("Xray: неподдерживаемый transport {network}")),
+        _ => return Err("Xray: неподдерживаемый transport".into()),
     }
     let security=get("security",if u.scheme()=="trojan" {"tls"} else {"none"});
     stream["security"]=json!(security);
@@ -149,7 +169,10 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
             }
             if let Some(alpn)=q.get("alpn") {tls["alpn"]=json!(alpn.split(',').collect::<Vec<_>>());}
             if security=="reality" {
-                tls["publicKey"]=json!(q.get("pbk").ok_or("Reality: отсутствует public key")?);
+                let key=q.get("pbk").filter(|key|!key.is_empty()).ok_or("Reality: отсутствует public key")?;
+                let sid=get("sid","");
+                if sid.len()>16 || sid.len()%2!=0 || !sid.bytes().all(|c|c.is_ascii_hexdigit()) { return Err("Reality: shortId должен содержать до 16 шестнадцатеричных символов чётной длины".into()); }
+                tls["publicKey"]=json!(key);
                 tls["shortId"]=json!(get("sid","")); tls["spiderX"]=json!(get("spx",""));
                 if let Some(value)=q.get("pqv") {tls["mldsa65Verify"]=json!(value);}
             }
@@ -164,6 +187,13 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
         stream["finalmask"]=mask;
     }
     let credentials=decode(u.username());
+    if credentials.is_empty() || u.password().is_some() { return Err("URI: отсутствуют или повреждены учётные данные".into()); }
+    if u.scheme()=="vless" {
+        if uuid::Uuid::parse_str(&credentials).is_err() && (credentials.len()>30 || credentials.chars().any(char::is_control)) {
+            return Err("VLESS: некорректный UUID или идентификатор Xray".into());
+        }
+        if !["","xtls-rprx-vision","xtls-rprx-vision-udp443"].contains(&get("flow","").as_str()) { return Err("VLESS: неподдерживаемый flow".into()); }
+    }
     let settings=if u.scheme()=="vless" {
         json!({"vnext":[{"address":host,"port":port,"users":[{"id":credentials,"encryption":get("encryption","none"),"flow":get("flow","")}]}]})
     } else {json!({"servers":[{"address":host,"port":port,"password":credentials}]})};
@@ -177,7 +207,8 @@ pub fn uri(line: &str) -> Result<Option<Value>,String> {
         outbounds.push(json!({"tag":"atlas-transport","protocol":"freedom","settings":settings}));
     }
     outbounds.insert(0,outbound);
-    Ok(Some(json!({"name":name,"type":"xray","server":host,"port":port,"xraySimple":true,"xray": {"outbounds":outbounds}})))
+    let params:std::collections::BTreeMap<String,String>=u.query_pairs().into_owned().collect();
+    Ok(Some(json!({"name":name,"type":"xray","server":host,"port":port,"extraParams":params,"xraySimple":true,"xray": {"outbounds":outbounds}})))
 }
 
 /// Prefix every reference as well as the definition; separate URI profiles can

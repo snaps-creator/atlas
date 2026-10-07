@@ -42,11 +42,15 @@ mod interface_evidence;
 mod lan_diagnostics;
 mod lan_discovery;
 mod windows;
+mod update_lock;
+mod update_process;
+mod update_health;
+mod update_frontend;
 use model::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
+mod startup;
 struct App {
     revision: u64,
     published: published_state::PublishedState,
@@ -96,7 +100,7 @@ impl App {
             sub.options.parameters.clear();
             sub.options.provider_id = None;
             for p in &mut sub.servers {
-                *p = json!({"name":p["name"],"type":p["type"],"country":country::detect(p),"probeId":latency::node_identity(p)});
+                *p = json!({"name":p["name"],"type":p["type"],"protocol":p["xray"]["outbounds"][0]["protocol"].as_str().or_else(||p["type"].as_str()),"country":country::detect(p),"probeId":latency::node_identity(p)});
             }
         }
         let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs,"buildId":env!("ATLAS_BUILD_ID")});
@@ -107,24 +111,27 @@ impl App {
         self.published.set(value.clone());
         value
     }
-    fn install_subscription(&mut self, id: String, url: String, downloaded: subscriptions::Downloaded, label: Option<String>, entry: Option<keyring::Entry>) -> Result<(),String> {
-                let mut nodes=downloaded.nodes;
-                for (i, node) in nodes.iter_mut().enumerate() {
-                    let name = node["name"].as_str().unwrap_or("Сервер");
-                    node["name"] = json!(format!("{} · {}-{}", name, &id[..8], i + 1));
-                }
+    fn install_subscription(&mut self, id: String, url: String, mut downloaded: subscriptions::Downloaded, label: Option<String>, entry: Option<keyring::Entry>, source: SubscriptionSource) -> Result<(),String> {
+                let before=downloaded.nodes.len();
+                let mut skipped=downloaded.diagnostics.len();
+                downloaded.nodes.retain(|node|source.accepts(node));
+                skipped+=before-downloaded.nodes.len();
+                if downloaded.nodes.is_empty() {return Err("Источник не содержит серверов выбранного типа подписок".into());}
+                if downloaded.nodes.len()!=before {downloaded.diagnostics.push(format!("Пропущено {} узлов другого типа",before-downloaded.nodes.len()));}
+                let previous=self.settings.subscriptions.iter().find(|s|s.id==id).map(|s|s.servers.as_slice()).unwrap_or(&[]);
+                let nodes=subscriptions::reconcile_nodes(&id,downloaded.nodes,previous);
                 let mut next = self.settings.clone();
                 let old = next.subscriptions.iter().position(|s| s.id == id);
                 let name = label
                     .or_else(|| old.map(|i| next.subscriptions[i].name.clone()))
                     .unwrap_or("Подписка".into());
-                let sub = Subscription {
+                let sub = Subscription { source,
                     options: downloaded.options,
                     id: id.clone(),
                     name,
                     masked_url: subscriptions::mask(&url),
                     updated_at: now(),
-                    error: None,
+                    error: (!downloaded.diagnostics.is_empty()).then(||downloaded.diagnostics.iter().take(100).cloned().collect::<Vec<_>>().join("; ")),
                     servers: nodes,
                 };
                 if let Some(i) = old {
@@ -137,13 +144,45 @@ impl App {
                 {
                     next.selected = "AUTO".into()
                 };
-                self.core.validate(&next)?;
+                let mut validation=next.clone();
+                if validation.active_source!=source {validation.switch_source(source);}
+                if let Err(batch_error)=self.core.validate(&validation) {
+                    let index=next.subscriptions.iter().position(|s|s.id==id).ok_or("Подписка отсутствует")?;
+                    let candidates=next.subscriptions[index].servers.clone();
+                    let mut accepted=Vec::new();
+                    let mut rejected=Vec::new();
+                    for (position,node) in candidates.into_iter().enumerate() {
+                        let mut probe=Settings::default();
+                        probe.mode="system".into();
+                        probe.active_source=source;
+                        let mut sub=next.subscriptions[index].clone();sub.servers=vec![node.clone()];
+                        probe.subscriptions=vec![sub];
+                        if self.core.validate(&probe).is_ok() {accepted.push(node);}
+                        else {rejected.push(format!("Узел {}: конфигурация отклонена встроенным ядром",position+1));}
+                    }
+                    if accepted.is_empty() || rejected.is_empty() {return Err(batch_error);}
+                    skipped+=rejected.len();
+                    next.subscriptions[index].servers=accepted;
+                    let warning=rejected.join("; ");
+                    next.subscriptions[index].error=Some(match next.subscriptions[index].error.take() {
+                        Some(previous)=>format!("{previous}; {warning}"),None=>warning,
+                    });
+                    if !next.servers().iter().any(|s|s["name"]==next.selected) && !["AUTO","FAILOVER"].contains(&next.selected.as_str()) {next.selected="AUTO".into();}
+                    validation=next.clone();
+                    if validation.active_source!=source {validation.switch_source(source);}
+                    self.core.validate(&validation)?;
+                }
+                if let Some(sub)=next.subscriptions.iter_mut().find(|s|s.id==id) {
+                    if let Some(details)=sub.error.take() {sub.error=Some(format!("Импортировано: {}. Пропущено: {skipped}. {details}",sub.servers.len()));}
+                }
                 if let Some(entry) = entry { entry.set_password(&url).map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?; }
                 self.save(next)?;
                 self.log("INFO", "Подписка обновлена и проверена Mihomo");
         Ok(())
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
+        if next.active_source!=self.settings.active_source {return Err("Используйте переключатель источника подписок".into());}
+        next.reconcile_selection();
         next.mode = "tun".into();
         if next.rules_semantics_version < self.settings.rules_semantics_version {
             return Err("Возврат к старой семантике правил требует отдельной миграции".into());
@@ -167,7 +206,7 @@ impl App {
         let same_config = config::same_network_config(&self.settings, &next);
         let selection_only = same_config && next.selected != self.settings.selected;
         let mut changed_live = false;
-        if !next.subscriptions.is_empty() {
+        if !next.servers().is_empty() {
             if selection_only {
                 if !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
                     && !next.servers().iter().any(|p| p["name"] == next.selected)
@@ -208,7 +247,15 @@ impl App {
         Ok(())
     }
     fn connect(&mut self) -> Result<(), String> {
+        if self.settings.servers().is_empty() {return Err("Нет серверов в активном источнике. Добавьте подписку.".into());}
         if self.status == "CleanupError" {
+            if self.core.running() {
+                incident_history::record("recovery_reattached", json!({"previousState":self.status,
+                    "previousError":self.error,"nextState":"Connected","reason":"LiveServiceSessionConfirmed"}), &[]);
+                self.status = "Connected".into();
+                self.error = None;
+                return Ok(());
+            }
             // The last exception is history, not evidence that the adapter is
             // still held. Reconcile again before deciding whether retry is safe.
             incident_history::record("recovery_retry", json!({"operationId":uuid::Uuid::new_v4(),
@@ -360,10 +407,11 @@ impl App {
     }
     fn dispatch(
         &mut self,
-        app: &tauri::AppHandle,
+        _app: &tauri::AppHandle,
         action: &str,
         p: Value,
     ) -> Result<Value, String> {
+        if update_health::pending() && !matches!(action,"snapshot"|"quit") {return Err("Atlas проверяет обновление; изменения доступны после завершения проверки".into());}
         match action {
             "snapshot" => return Ok(self.snapshot()),
             "applications" => return Ok(json!(applications::list())),
@@ -452,21 +500,33 @@ impl App {
             }
             "connect" => self.connect()?,
             "disconnect" => self.disconnect()?,
+            "subscription_source" => {
+                let source: SubscriptionSource=serde_json::from_value(p["source"].clone()).map_err(|_|"Неизвестный источник подписок")?;
+                if source!=self.settings.active_source {
+                    incident_history::record("source_switch_started",json!({"previousSource":self.settings.active_source,"requestedSource":source,"state":self.status}),&[]);
+                    let restored=self.disconnect();
+                    incident_history::record("source_switch_network_restored",json!({"requestedSource":source,"success":restored.is_ok(),"state":self.status}),&[]);
+                    restored?;
+                    let mut next=self.settings.clone();
+                    next.switch_source(source);
+                    self.store.save(&next)?;
+                    self.settings=next;
+                    self.revision=self.revision.wrapping_add(1);
+                    self.error=None;
+                    self.control_error=None;
+                    incident_history::record("source_switch_completed",json!({"activeSource":source,"state":self.status,"connected":false}),&[]);
+                }
+            }
             "save" => {
                 let mut next: Settings =
                     serde_json::from_value(p).map_err(|_| "Некорректные настройки")?;
                 next.subscriptions = self.settings.subscriptions.clone();
+                if next.active_source!=self.settings.active_source {return Err("Источник изменился. Обновите настройки.".into());}
+                next.source_selections=self.settings.source_selections.clone();
                 let enabled = next.startup.launch_with_windows;
                 let previous = self.settings.startup.launch_with_windows;
                 self.save(next)?;
-                let registered = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
-                let result = if registered == enabled {
-                    Ok(())
-                } else if enabled {
-                    app.autolaunch().enable()
-                } else {
-                    app.autolaunch().disable()
-                };
+                let result = startup::configure(enabled,true);
                 if let Err(e) = result {
                     let mut back = self.settings.clone();
                     back.startup.launch_with_windows = previous;
@@ -493,7 +553,7 @@ impl App {
                 }
                 let mut next = self.settings.clone();
                 next.subscriptions.retain(|s| s.id != id);
-                next.selected = "AUTO".into();
+                next.reconcile_selection();
                 self.save(next)?;
                 let _ = keyring::Entry::new("AtlasVPN", id).and_then(|e| e.delete_credential());
             }
@@ -665,7 +725,13 @@ async fn request_inner(
     action: String,
     payload: Option<Value>,
 ) -> Result<Value, String> {
+    if update_health::pending() && !matches!(action.as_str(),"snapshot"|"frontend_diagnostic"|"quit") {return Err("Atlas проверяет обновление; изменения доступны после завершения проверки".into());}
     let shared = state.inner().clone();
+    if action=="update_install" {
+        let payload=payload.unwrap_or(Value::Null);
+        update_frontend::start(app,payload["version"].as_str().ok_or("Не указана версия обновления")?)?;
+        return Ok(json!({"started":true}));
+    }
     if action == "frontend_diagnostic" {
         let value=payload.unwrap_or(Value::Null);
         let text=|key: &str,limit|value[key].as_str().unwrap_or("").chars().take(limit).collect::<String>();
@@ -960,8 +1026,12 @@ async fn request_inner(
             let _lease = subscription_refresh::Lease::take(&id).ok_or("Эта подписка уже обновляется")?;
             let entry = keyring::Entry::new("AtlasVPN", &id).map_err(|_|"Хранилище Windows недоступно")?;
             let adding = action == "subscription_add";
+            let source=if adding {
+                serde_json::from_value(p["source"].clone()).map_err(|_|"Укажите источник подписки")?
+            } else {captured.settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка не найдена")?.source};
             let url = if adding { p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned() }
                 else { entry.get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")? };
+            if source==SubscriptionSource::Url {subscription_options::https_url(&url)?;}
             // Download never owns the mutation lock: Quit must not wait for HTTPS.
             let options=captured.settings.subscriptions.iter().find(|s|s.id==id)
                 .map(|s|s.options.clone()).unwrap_or_default();
@@ -976,7 +1046,7 @@ async fn request_inner(
                 return Err("Подписка уже изменена; результат загрузки не применён".into());
             }
             match downloaded {
-                Ok(nodes) => a.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned), adding.then_some(entry))?,
+                Ok(nodes) => a.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned), adding.then_some(entry),source)?,
                 Err(error) => {
                     if let Some(sub) = a.settings.subscriptions.iter_mut().find(|s|s.id == id) { sub.error=Some(error.clone()); }
                     let settings = a.settings.clone();
@@ -988,7 +1058,10 @@ async fn request_inner(
             Ok(a.snapshot())
         }).await.map_err(|e|e.to_string())?;
     }
-    let settings_change = if action == "save" {
+    let settings_change = if action == "subscription_source" {
+        serde_json::from_value::<SubscriptionSource>(payload.as_ref().unwrap_or(&Value::Null)["source"].clone()).map_err(|_|"Неизвестный источник подписок")?;
+        Some(app.state::<cancellation::Cancellation>().settings_change())
+    } else if action == "save" {
         // Reject malformed requests before yielding a connection attempt.
         serde_json::from_value::<Settings>(payload.clone().unwrap_or(Value::Null))
             .map_err(|_| "Некорректные настройки")?;
@@ -1036,6 +1109,7 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            let _startup_update_guard=if update_health::challenge().is_none(){Some(update_lock::UpdateLock::admit_session().map_err(std::io::Error::other)?)}else{None};
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             // A previous UI may have crashed while its on-demand service was
@@ -1043,6 +1117,12 @@ pub fn run() {
             // new connection. A cleanup error must not abort Tauri setup and
             // leave a blank window; publish it as recoverable application state.
             let startup_cleanup = (|| -> Result<(),String> {
+                if update_health::challenge().is_some() {
+                    // The supervisor already quiesced the previous session and
+                    // started the candidate service. Health must inspect that
+                    // service, not stop it as a stale desktop session.
+                    return network_guard::wait_for_clean_baseline(std::time::Duration::from_secs(3));
+                }
                 let _ = network_guard::tun_identity();
                 if service::is_running() { service::stop_and_wait()?; }
                 windows::restore(&dir.join("proxy-restore.json"))?;
@@ -1056,9 +1136,11 @@ pub fn run() {
             let mut settings = store.load().map_err(std::io::Error::other)?;
             settings.mode = "tun".into();
             // Repair stale startup registration to match the saved user preference.
-            if !settings.startup.launch_with_windows {
-                let _ = app.autolaunch().disable();
-                if std::env::args().any(|arg| arg == "--autostart") {
+            if update_health::challenge().is_none() {
+                if let Err(error)=startup::configure(settings.startup.launch_with_windows,false) {
+                    eprintln!("Atlas startup registration failed: {error}");
+                }
+                if !settings.startup.launch_with_windows && std::env::args().any(|arg| arg == "--autostart") {
                     app.handle().exit(0);
                     return Ok(());
                 }
@@ -1070,7 +1152,7 @@ pub fn run() {
             let core = core::Core::new(binary, dir.clone());
             // A stale service or marker is crash residue, never permission to
             // resume VPN traffic. Only the explicit user preference can start it.
-            let auto = settings.startup.auto_connect && startup_cleanup.is_ok();
+            let auto = update_health::challenge().is_none() && settings.startup.auto_connect && startup_cleanup.is_ok();
             let delay = settings.startup.delay_seconds.min(300);
             if settings.startup.start_in_tray {
                 if let Some(w) = app.get_webview_window("main") {
@@ -1178,6 +1260,7 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { return; }
                     let id = event.id.as_ref();
+                    if update_health::pending() && !matches!(id,"show"|"quit") {return;}
                     if id == "show" {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
@@ -1261,10 +1344,12 @@ pub fn run() {
             std::thread::spawn(move || {
                 let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));
                 let mut reconnect_retry = connection_retry::ConnectionRetry::default();
+                let mut cleanup_retry = connection_retry::ConnectionRetry::default();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if shutdown.load(std::sync::atomic::Ordering::SeqCst)
                         || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
+                    if update_health::pending() {continue;}
                     // Query the service without holding the mutation lock. A
                     // result from an earlier revision cannot affect a new session.
                     let observed=handle.state::<published_state::ReadState>().get().ok()
@@ -1319,6 +1404,13 @@ pub fn run() {
                         reconnect_retry.reset();
                     }
                     let wants_connection = intent.load(std::sync::atomic::Ordering::SeqCst);
+                    if !wants_connection && a.status == "CleanupError"
+                        && cleanup_retry.due(std::time::Instant::now(), true, true) {
+                        match a.disconnect() {
+                            Ok(()) => cleanup_retry.reset(),
+                            Err(_) => cleanup_retry.failed(std::time::Instant::now()),
+                        }
+                    }
                     if !a.cancellation.settings_pending()
                         && reconnect_retry.due(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
                         a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
@@ -1344,7 +1436,12 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![request])
+        .on_page_load(|webview,_| {
+            if update_health::challenge().is_some() {
+                let _=webview.eval(r#"(() => { const timer=setInterval(() => { if(document.querySelector('main') && document.querySelectorAll('button').length>=5) { clearInterval(timer); window.__TAURI_INTERNALS__.invoke('update_health_ready'); } },100); })()"#);
+            }
+        })
+        .invoke_handler(tauri::generate_handler![request,update_health_ready])
         .run(tauri::generate_context!())
         .expect("Atlas failed to initialize");
 }
@@ -1353,12 +1450,49 @@ pub fn network_service() -> Result<(), String> {
     service::run()
 }
 
+#[tauri::command]
+async fn update_health_ready(state:tauri::State<'_,Arc<Mutex<App>>>)->Result<(),String> {
+    let (transaction_id,nonce)=update_health::challenge().ok_or("No updater health challenge")?;
+    {
+        let app=state.lock().map_err(|_|"Application state unavailable")?;
+        if app.status!="Disconnected" || app.error.is_some() {return Err("Candidate startup baseline is not clean".into());}
+        let _=app.store.load()?;
+    }
+    tauri::async_runtime::spawn_blocking(move||{
+        let executable=std::env::current_exe().map_err(|_|"Candidate executable unavailable")?;
+        let protocol=update_process::json(&executable.with_file_name("AtlasMaintenance.exe"),&["--protocol"],std::time::Duration::from_secs(5))?;
+        if protocol["protocol"]!=1 || protocol["version"]!=env!("CARGO_PKG_VERSION") || protocol["build"]!=env!("ATLAS_BUILD_ID") {return Err("Candidate helper compatibility failed".into());}
+        let health_connection=probe_network_service()?;
+        let report=update_health::Report{transaction_id,nonce,version:env!("CARGO_PKG_VERSION").into(),build:env!("ATLAS_BUILD_ID").into(),pid:std::process::id(),service_pid:service::process_snapshot()?.pid,
+            ui_ready:true,settings_readable:true,subscriptions_readable:true,service_ready:true,helper_protocol:1};
+        use std::io::Write;
+        {
+            let mut out=std::io::stdout().lock();write!(out,"ATLAS_HEALTH_V1:").map_err(|_|"Health IPC write failed")?;serde_json::to_writer(&mut out,&report).map_err(|_|"Health IPC serialization failed")?;writeln!(out).map_err(|_|"Health IPC write failed")?;out.flush().map_err(|_|"Health IPC flush failed".to_owned())?;
+        }
+        // The on-demand service exits after three seconds without an IPC client.
+        // Keep the authenticated connection through the supervisor's stability
+        // window and durable commit, rather than mistaking normal idle shutdown
+        // for an activation failure. No VPN session is started by this probe.
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+        while update_health::pending() {
+            if !health_connection.alive() {return Err("Candidate service health connection closed before commit".into());}
+            if std::time::Instant::now()>=deadline {return Err("Candidate update commit timed out".into());}
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(health_connection);
+        Ok(())
+    }).await.map_err(|_|"Health worker failed")?
+}
+
 pub fn watch_network_session(pid: u32, desktop_pid: u32, directory: &std::path::Path) -> Result<(), String> {
     session_cleanup::run(pid, desktop_pid, directory)
 }
 
 /// Exercises the installed service handshake without starting a network core.
 pub fn check_network_service() -> Result<(), String> {
+    probe_network_service().map(drop)
+}
+fn probe_network_service() -> Result<broker::Broker, String> {
     let broker = broker::Broker::launch()?;
     if service::verify_server_pid(std::process::id()).is_ok() {
         return Err("Проверка службы приняла посторонний PID".into());
@@ -1378,7 +1512,7 @@ pub fn check_network_service() -> Result<(), String> {
     if restored["networkEpoch"] != status["networkEpoch"] || restored["running"] != false {
         return Err("Восстановление IPC изменило сетевую сессию".into());
     }
-    Ok(())
+    Ok(broker)
 }
 
 pub fn install_network_service() -> Result<(), String> {

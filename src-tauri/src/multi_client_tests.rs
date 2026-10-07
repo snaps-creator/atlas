@@ -25,9 +25,100 @@ fn isolated_core() -> Core {
 }
 
 #[test]
+#[ignore = "Requires ATLAS_VLESS_TEST_FILE and explicit permission to use the supplied server"]
+fn supplied_vless_subscription_reaches_https_after_refresh_and_restart() {
+    use std::io::BufRead;
+    use base64::Engine;
+    let source_path=std::env::var("ATLAS_VLESS_TEST_FILE").expect("Set ATLAS_VLESS_TEST_FILE");
+    let source=std::fs::read_to_string(&source_path).expect("Read fixture file");
+    let mut publisher=None;
+    let mut publisher_job=None;
+    let mut certificate=Vec::new();
+    let url=if source.trim().starts_with("https://") {source.trim().to_owned()} else {
+        let mut child=Command::new("pwsh").creation_flags(0x08000000)
+            .args(["-NoProfile","-File"])
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/test-subscription-https-server.ps1"))
+            .arg("-SourceFile").arg(source_path).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().expect("Start HTTPS publisher");
+        publisher_job=Some(crate::job::Job::attach(&child).unwrap());
+        let mut line=String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let ready:Value=serde_json::from_str(&line).expect("HTTPS publisher readiness");
+        certificate=base64::engine::general_purpose::STANDARD.decode(ready["certificate"].as_str().unwrap()).unwrap();
+        let url=format!("https://127.0.0.1:{}/subscription",ready["port"].as_u64().unwrap());
+        publisher=Some(child);url
+    };
+    let fetch=|| if certificate.is_empty() {crate::subscriptions::download(&url,false,&Default::default())}
+        else {crate::subscriptions::download_test_https(&url,&certificate)};
+    let downloaded=fetch().unwrap_or_else(|error| panic!("HTTPS subscription download failed: {}",crate::support_report::redact(&error,&[url.clone()])));
+    assert!(downloaded.nodes.iter().any(|n|n["xray"]["outbounds"][0]["protocol"]=="vless"));
+    let reality=downloaded.nodes.iter().any(|n|n["xray"]["outbounds"][0]["streamSettings"]["security"]=="reality");
+    let mut core=isolated_core();
+    let directory=core.directory.clone();
+    let mut settings=Settings::default();settings.mode="system".into();settings.routing_mode=crate::model::RoutingMode::Global;
+    let nodes=crate::subscriptions::reconcile_nodes("live-test",downloaded.nodes,&[]);
+    settings.selected=nodes[0]["name"].as_str().unwrap().into();
+    settings.subscriptions.push(Subscription { source: Default::default(),id:"live-test".into(),name:"Live acceptance".into(),masked_url:String::new(),updated_at:0,error:None,options:Default::default(),servers:nodes});
+    let mut alternative=settings.subscriptions[0].clone();
+    alternative.source=crate::model::SubscriptionSource::Vless;alternative.id="vless-test".into();
+    alternative.servers=crate::subscriptions::reconcile_nodes("vless-test",fetch().expect("Second source download").nodes,&[]);
+    settings.subscriptions.push(alternative);
+    let db=directory.join("acceptance.db");
+    {let mut store=crate::storage::Store::open(&db).unwrap();store.save(&settings).unwrap();}
+    let loaded=crate::storage::Store::open(&db).unwrap().load().unwrap();
+    assert!(loaded.selected==settings.selected);assert!(loaded.servers()==settings.servers());
+    core.start(&loaded).unwrap_or_else(|_|panic!("Core start failed"));
+    let client=reqwest::blocking::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{}",core.ports[0])).unwrap()).timeout(Duration::from_secs(25)).build().unwrap();
+    let check=|| {
+        for attempt in 0..3 {
+            if let Ok(response)=client.get("https://www.cloudflare.com/cdn-cgi/trace").send() {
+                if response.status().is_success() && response.text().unwrap_or_default().contains("ip=") {return;}
+            }
+            if attempt<2 {thread::sleep(Duration::from_millis(500));}
+        }
+        panic!("HTTPS through VLESS failed after three bounded attempts");
+    };
+    println!("Checking initial VLESS connection");
+    check();
+    for (transport,security) in [("xhttp","reality"),("ws","tls")] {
+        let selected=loaded.subscriptions[0].servers.iter().find(|node| {
+            let stream=&node["xray"]["outbounds"][0]["streamSettings"];
+            stream["network"]==transport && stream["security"]==security
+        });
+        if let Some(node)=selected {
+            println!("Checking live transport: {transport} + {security}");
+            core.select(node["name"].as_str().unwrap()).unwrap();check();
+            println!("Live transport passed: {transport} + {security}");
+        }
+    }
+    core.select("AUTO").unwrap();core.select(&loaded.selected).unwrap();check();
+    let mut refreshed=loaded.clone();
+    refreshed.subscriptions[0].servers=crate::subscriptions::reconcile_nodes("live-test",fetch().expect("Refresh download").nodes,&loaded.servers());
+    assert!(refreshed.servers()==loaded.servers());core.apply(&refreshed).unwrap();check();
+    core.stop().unwrap();assert!(core.owned_processes_released());
+    core.start(&refreshed).unwrap_or_else(|_|panic!("Restart failed"));check();core.stop().unwrap();
+    let url_selection=refreshed.selected.clone();
+    for source in [crate::model::SubscriptionSource::Vless,crate::model::SubscriptionSource::Url,crate::model::SubscriptionSource::Vless] {
+        assert!(core.owned_processes_released(),"A source must not change while its core is alive");
+        refreshed.switch_source(source);
+        if refreshed.selected=="AUTO" {refreshed.selected=refreshed.servers()[0]["name"].as_str().unwrap().into();}
+        if source==crate::model::SubscriptionSource::Url {assert!(refreshed.selected==url_selection);}
+        core.start(&refreshed).unwrap_or_else(|_|panic!("Source start failed"));check();core.stop().unwrap();
+        {let mut store=crate::storage::Store::open(&db).unwrap();store.save(&refreshed).unwrap();}
+        refreshed=crate::storage::Store::open(&db).unwrap().load().unwrap();
+        assert_eq!(refreshed.active_source,source);
+    }
+    println!("Live VLESS acceptance passed; REALITY={reality}; HTTPS, selection, refresh, encrypted persistence, stop/restart");
+    if let Some(mut publisher)=publisher {crate::process_stop::stop(&mut publisher,||drop(publisher_job),Duration::from_secs(5)).unwrap();}
+    drop(core);std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn xray_vless_transports_reach_a_real_loopback_server() {
+    use std::io::BufRead;
+    use base64::Engine;
     let mut core=isolated_core();
     let id="00000000-0000-0000-0000-000000000001";
+    let mut uris=Vec::new();
     let mut nodes=Vec::new();let mut inbounds=Vec::new();let mut reservations=Vec::new();
     for transport in ["tcp","ws","grpc","httpupgrade","xhttp","kcp"] {
         let (tcp,udp)=loop {
@@ -37,11 +128,32 @@ fn xray_vless_transports_reach_a_real_loopback_server() {
         let port=tcp.local_addr().unwrap().port();reservations.push((tcp,udp));
         let uri=format!("vless://{id}@127.0.0.1:{port}?security=none&type={transport}#{transport}");
         let node=crate::subscriptions::parse(&uri).unwrap().remove(0);
+        uris.push(uri);
         inbounds.push(json!({"listen":"127.0.0.1","port":port,"protocol":"vless","tag":transport,
             "settings":{"clients":[{"id":id}],"decryption":"none"},
             "streamSettings":node["xray"]["outbounds"][0]["streamSettings"]}));
         nodes.push(node);
     }
+    let fixture=core.directory.join("subscription.txt");
+    std::fs::write(&fixture,uris.join("\r\n")).unwrap();
+    let mut publisher=Command::new("pwsh").creation_flags(0x08000000)
+        .args(["-NoProfile","-File"])
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/test-subscription-https-server.ps1"))
+        .arg("-SourceFile").arg(&fixture).args(["-Redirect","-Gzip"])
+        .stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+    let publisher_job=crate::job::Job::attach(&publisher).unwrap();
+    let mut line=String::new();
+    std::io::BufReader::new(publisher.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let ready:Value=serde_json::from_str(&line).unwrap();
+    let certificate=base64::engine::general_purpose::STANDARD.decode(ready["certificate"].as_str().unwrap()).unwrap();
+    let url=format!("https://127.0.0.1:{}/subscription",ready["port"].as_u64().unwrap());
+    for (path,reason) in [("unsafe","HTTPS"),("cross-origin","другой источник"),("loop","перенаправлений")] {
+        let error=crate::subscriptions::download_test_https(&url.replace("/subscription",&format!("/{path}")),&certificate).err().expect("Unsafe redirect must fail");
+        assert!(error.contains(reason),"{error}");
+    }
+    let downloaded=crate::subscriptions::download_test_https(&url,&certificate).unwrap();
+    assert_eq!(downloaded.nodes,nodes);
+    let nodes=downloaded.nodes;
     let server_path=core.directory.join("xray-server.json");
     std::fs::write(&server_path,json!({"log":{"loglevel":"warning"},"inbounds":inbounds,"outbounds":[{"protocol":"freedom"}]}).to_string()).unwrap();
     drop(reservations);
@@ -62,7 +174,7 @@ fn xray_vless_transports_reach_a_real_loopback_server() {
         }
     });
     let mut settings=Settings::default();settings.mode="system".into();settings.selected="tcp".into();settings.routing_mode=crate::model::RoutingMode::Global;
-    settings.subscriptions.push(Subscription {options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,servers:nodes});
+    settings.subscriptions.push(Subscription { source: Default::default(),options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,servers:nodes});
     core.start(&settings).unwrap();
     let client=reqwest::blocking::Client::builder().no_proxy().proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{}",core.ports[0])).unwrap()).timeout(Duration::from_secs(5)).build().unwrap();
     for transport in ["tcp","ws","grpc","httpupgrade","xhttp","kcp"] {
@@ -71,7 +183,17 @@ fn xray_vless_transports_reach_a_real_loopback_server() {
         assert_eq!(response.text().unwrap(),"atlas","{transport}");
         assert!(server.try_wait().unwrap().is_none());
     }
+    let refreshed=crate::subscriptions::download_test_https(&url,&certificate).unwrap();
+    assert_eq!(refreshed.nodes,settings.subscriptions[0].servers);
+    core.stop().unwrap();
+    let db=core.directory.join("acceptance.db");
+    {let mut store=crate::storage::Store::open(&db).unwrap();store.save(&settings).unwrap();}
+    let loaded=crate::storage::Store::open(&db).unwrap().load().unwrap();
+    assert_eq!(loaded.servers(),settings.servers());assert_eq!(loaded.selected,settings.selected);
+    core.start(&loaded).unwrap();
+    assert_eq!(client.get(format!("http://127.0.0.1:{origin_port}/")).send().unwrap().text().unwrap(),"atlas");
     core.stop().unwrap();done.store(true,Ordering::SeqCst);worker.join().unwrap();
+    crate::process_stop::stop(&mut publisher,||drop(publisher_job),Duration::from_secs(5)).unwrap();
     crate::process_stop::stop(&mut server,||drop(server_job),Duration::from_secs(5)).unwrap();
     let directory=core.directory.clone();drop(core);std::fs::remove_dir_all(directory).unwrap();
 }
@@ -104,7 +226,7 @@ fn windows_ipv6_probe_gets_no_fake_ipv4_when_upstream_has_no_address() {
     settings.mode = "system".into();
     settings.dns.fake_ip = true;
     settings.dns.ipv6 = false;
-    settings.subscriptions.push(Subscription { options: Default::default(), id:"fixture".into(), name:"fixture".into(),
+    settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(), id:"fixture".into(), name:"fixture".into(),
         masked_url:String::new(), updated_at:0, error:None,
         servers:vec![json!({"name":"fixture","type":"direct"})] });
     let mut config: Value = serde_yaml::from_str(&crate::config::generate(&settings, &core.secret).unwrap()).unwrap();
@@ -264,7 +386,7 @@ fn direct_dns_survives_a_dead_vpn_with_real_core() {
     settings.selected = "dead-vpn".into();
     settings.default_route = Route::Direct;
     settings.dns.servers = vec!["1.1.1.1".into()];
-    settings.subscriptions.push(Subscription { options: Default::default(),
+    settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),
         id: "fixture".into(), name: "fixture".into(), masked_url: "hidden".into(),
         updated_at: 0, error: None,
         servers: vec![json!({"name":"dead-vpn","type":"ss","server":"127.0.0.1",
@@ -444,7 +566,7 @@ fn independent_clients_share_vless_server_and_recover_after_its_restart() {
     settings.mode = "system".into();
     settings.default_route = Route::Proxy;
     settings.selected = "shared".into();
-    settings.subscriptions.push(Subscription { options: Default::default(),
+    settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),
         id:"fixture".into(), name:"fixture".into(), masked_url:"hidden".into(), updated_at:0, error:None,
         servers:vec![json!({"name":"shared", "type":"vless", "server":"127.0.0.1", "port":port, "uuid":id, "tls":false})],
     });
@@ -559,7 +681,7 @@ fn recovery_accepts_one_working_control_and_encoded_names_on_real_vless() {
     let id=uuid::Uuid::new_v4().to_string();let mut server=isolated_core();start_server(&mut server,port,&id);
     let name="🇸🇪 Швеция + A/B · regression";
     let mut settings=Settings::default();settings.mode="system".into();settings.selected=name.into();
-    settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"".into(),updated_at:0,error:None,
+    settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"".into(),updated_at:0,error:None,
         servers:vec![json!({"name":name,"type":"vless","server":"127.0.0.1","port":port,"uuid":id,"tls":false})]});
     let mut client=isolated_core();client.start(&settings).unwrap();
     let first=format!("http://127.0.0.1:{origin_port}/first");let second=format!("http://127.0.0.1:{origin_port}/second");

@@ -614,7 +614,7 @@ impl Core {
             }
             if tun_identity().is_some() {
                 self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_remaining","tunLuid":tun_identity()}));
-                return Err("Ядро остановлено, но Atlas-TUN всё ещё активен; восстановление сети не подтверждено".into());
+                return Err("Ядро остановлено, но освобождение Atlas-TUN не подтверждено".into());
             }
             self.client().event(json!({"at":crate::model::now(),"kind":"core_shutdown_tun_released"}));
         }
@@ -672,7 +672,7 @@ mod integration_tests {
         settings.mode = "system".into();
         settings.selected = "fixture".into();
         settings.routing_mode = crate::model::RoutingMode::Global;
-        settings.subscriptions.push(Subscription { options: Default::default(), id: "fixture".into(), name: "fixture".into(), masked_url: String::new(), updated_at: 0, error: None,
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(), id: "fixture".into(), name: "fixture".into(), masked_url: String::new(), updated_at: 0, error: None,
             servers: vec![json!({"name":"fixture","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}})] });
         let mut alternative=settings.subscriptions[0].servers[0].clone();
         alternative["name"]=json!("alternative");
@@ -758,7 +758,7 @@ mod integration_tests {
         let mut core=Core::new(binary,directory.clone());core.use_ephemeral_ports().unwrap();
         let mut settings=Settings::default();settings.mode="system".into();settings.selected="fixture".into();
         settings.routing_mode=crate::model::RoutingMode::Global;
-        settings.subscriptions.push(Subscription {options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+        settings.subscriptions.push(Subscription { source: Default::default(),options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"fixture","type":"xray","server":"127.0.0.1","port":443,"xray":{"outbounds":[{"protocol":"freedom"}]}})]});
         core.start(&settings).unwrap();
         let target=std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();target.set_nonblocking(true).unwrap();
@@ -864,7 +864,7 @@ mod integration_tests {
             stopped.unwrap();
             assert!(!marker.exists(),"confirmed shutdown must clear the ownership marker");
         } else {
-            assert!(stopped.unwrap_err().contains("Atlas-TUN всё ещё активен"));
+            assert!(stopped.unwrap_err().contains("освобождение Atlas-TUN не подтверждено"));
             assert!(marker.exists(),"failed shutdown must retain ownership evidence for recovery");
             assert!(started.elapsed() < Duration::from_secs(4), "shutdown took {:?}", started.elapsed());
         }
@@ -908,7 +908,7 @@ mod integration_tests {
         core.use_ephemeral_ports().unwrap();
         let mut settings = Settings::default();
         settings.mode = "system".into();
-        settings.subscriptions.push(Subscription { options: Default::default(), id:"fixture".into(), name:"fixture".into(),
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(), id:"fixture".into(), name:"fixture".into(),
             masked_url:String::new(), updated_at:0, error:None,
             servers:vec![json!({"name":"fixture","type":"direct"})] });
         for cycle in 0..50 {
@@ -934,7 +934,7 @@ mod integration_tests {
         );
         let mut s = Settings::default();
         s.default_route = Route::Proxy;
-        s.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
+        s.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         for text in ["version: 1\ndefault-route: proxy\nrules: []", "version: 1\ndefault-route: proxy\nrules:\n - {domain-suffix: example.com, route: direct}\n - {ip-cidr: 192.0.2.0/24, route: block, no-resolve: true}"] {
             let import = crate::portable::parse(text).unwrap(); s.groups = import.groups;
             for stack in [crate::model::TunStack::Gvisor, crate::model::TunStack::Mixed] {
@@ -956,7 +956,7 @@ mod integration_tests {
         let mut settings = Settings::default();
         settings.mode = "system".into();
         // Isolated fixture. No real subscription, credentials or OS proxy changes.
-        settings.subscriptions.push(Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
+        settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,servers:vec![json!({"name":"fixture","type":"ss","server":"127.0.0.1","port":1,"cipher":"aes-128-gcm","password":"fixture-only"})]});
         let mut tun_candidate = settings.clone();
         tun_candidate.mode = "tun".into();
         core.validate(&tun_candidate)

@@ -1,5 +1,8 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { SubscriptionCard } from "./SubscriptionCard";
+import { SubscriptionSourceSwitch } from "./SubscriptionSourceSwitch";
+import { activeSubscriptions, sourceLabels } from "./subscriptionSource";
+import type { SubscriptionSource } from "./types";
 import { diagnosticEvent } from "./diagnosticEvents";
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
@@ -103,7 +106,10 @@ function App() {
   const [data, setData] = useState<Snapshot | null>(null);
   const { health: poolHealth, checkPool } = usePoolRecovery(data);
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [pendingOperations, setPendingOperations] = useState(0);
+  const busy = pendingOperations > 0;
+  const [switchingSource, setSwitchingSource] = useState(false);
+  const sourceSwitchPending = useRef(false);
   const [reportBusy, setReportBusy] = useState(false);
   const [reportSaved, setReportSaved] = useState(false);
   const [query, setQuery] = useState("");
@@ -154,7 +160,8 @@ function App() {
     if (refreshPending.current) return;
     refreshPending.current = true;
     try {
-      setData(await request<Snapshot>("snapshot"));
+      const snapshot = await request<Snapshot>("snapshot");
+      setData(current => current && (current.revision ?? 0) > (snapshot.revision ?? 0) ? current : snapshot);
     } catch (e) {
       if (!String(e).includes("Atlas занят")) setError(String(e));
     } finally {
@@ -209,6 +216,7 @@ function App() {
         data.settings.routingMode,
         data.settings.tunStack,
         data.settings.selected,
+        data.settings.activeSource,
         data.settings.dns.servers.join("|"),
         data.settings.groups
           .filter((group) => group.enabled)
@@ -298,17 +306,17 @@ function App() {
   }, [data?.running]);
   async function act(action: string, payload?: unknown) {
     if (action === "connect") setProtection(connectionProtection(false, "Connecting")!);
-    setBusy(true);
+    setPendingOperations(count => count + 1);
     setError("");
     try {
       const r = await request<Snapshot>(action, payload);
-      if (r?.settings) setData(r);
+      if (r?.settings) setData(current => current && (current.revision ?? 0) > (r.revision ?? 0) ? current : r);
       return r;
     } catch (e) {
       setError(String(e));
       throw e;
     } finally {
-      setBusy(false);
+      setPendingOperations(count => Math.max(0, count - 1));
     }
   }
   async function save(s: Settings) {
@@ -318,44 +326,45 @@ function App() {
     void f().catch(() => {});
   }
   async function installUpdate() {
-    if (!availableUpdate || updateStatus === "downloading" || updateStatus === "installing") return;
+    if (!availableUpdate || updateBusy.current) return;
     updateBusy.current = true;
-    setUpdateStatus("downloading");
-    setUpdateProgress(0);
-    setUpdateError("");
-    let downloaded = 0;
-    let total = 0;
+    setUpdateStatus("downloading"); setUpdateProgress(0); setUpdateError("");
+    let unlisten: UnlistenFn | undefined;
     try {
-      const latest = await check({ timeout: 15000 });
-      if (!latest) { setAvailableUpdate(null); setUpdateStatus("idle"); return; }
-      setAvailableUpdate(latest);
-      await diagnosticEvent("updater", "download_started", latest.version);
-      await latest.download((event) => {
-        if (event.event === "Started") {
-          total = event.data.contentLength ?? 0;
-        } else if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
-          if (total > 0)
-            setUpdateProgress(Math.min(100, Math.round((downloaded / total) * 100)));
-        } else if (event.event === "Finished") {
-          setUpdateProgress(100);
-          setUpdateStatus("installing");
+      unlisten = await listen<{ stage: string; message?: string }>("atlas-update-progress", ({ payload }) => {
+        if (payload.stage === "installing") { setUpdateProgress(100); setUpdateStatus("installing"); }
+        if (payload.stage === "error" || payload.stage === "complete") {
+          updateBusy.current = false; unlisten?.();
+          setUpdateStatus(payload.stage === "error" ? "error" : "idle");
+          setUpdateError(payload.message ?? "");
         }
       });
-      setUpdateStatus("installing");
-      // The signed installer's NEW native helper owns stop/cleanup/replacement.
-      // Calling the OLD app's disconnect here can permanently block its repair.
-      // Keep the working tunnel until the package is downloaded and verified.
-      await diagnosticEvent("updater", "install_started", latest.version);
-      await latest.install({ restartAfterInstall: true });
-    } catch (reason) {
-      setUpdateStatus("error");
-      setUpdateError(`Не удалось установить обновление: ${String(reason)}`);
-      void diagnosticEvent("updater", "update_failed", reason);
-    } finally { updateBusy.current = false; }
+      await request("update_install", { version: availableUpdate.version });
+    } catch (error) {
+      unlisten?.(); updateBusy.current = false;
+      setUpdateStatus("error"); setUpdateError(String(error));
+    }
   }
   const s = data?.settings;
-  const servers = s?.subscriptions.flatMap((v) => v.servers) ?? [];
+  const source = s?.activeSource ?? "URL";
+  const subscriptions = activeSubscriptions(s);
+  const servers = subscriptions.flatMap((v) => v.servers);
+  async function switchSource(next: SubscriptionSource) {
+    if (sourceSwitchPending.current || next === source) return;
+    sourceSwitchPending.current = true;
+    setSwitchingSource(true);
+    try {
+      await act("subscription_source", { source: next });
+      setQuery(""); setOnlyFavorites(false); setConnections([]); setTrafficError("");
+    } finally {
+      sourceSwitchPending.current = false;
+      setSwitchingSource(false);
+      await refresh();
+    }
+  }
+  const sourceSwitch = <SubscriptionSourceSwitch value={source} pending={switchingSource}
+    disabled={!s || adding}
+    onChange={next => run(() => switchSource(next))} />;
   const connected = data?.running ?? false;
   const connecting = data?.status === "Connecting";
   const protectedPause = data?.status === "ProtectedPause";
@@ -392,7 +401,7 @@ function App() {
     </div>
   );
   const addButton = (
-    <button className="primary" onClick={() => setAdding(true)}>
+    <button className="primary" disabled={busy || switchingSource} onClick={() => setAdding(true)}>
       <Plus size={16} />
       Добавить подписку
     </button>
@@ -537,8 +546,8 @@ function App() {
             >
               <Icon size={18} strokeWidth={1.7} />
               <span>{pageNames[p]}</span>
-              {p === "Subscriptions" && !!s?.subscriptions.length && (
-                <small>{s.subscriptions.length}</small>
+              {p === "Subscriptions" && !!subscriptions.length && (
+                <small>{subscriptions.length}</small>
               )}
             </button>
           ))}
@@ -551,14 +560,16 @@ function App() {
           >
             <Shield size={15} />
             <span>
-              {protectionLabel(protection)}
-              {protectionChecking && data?.running && data.status === "Connected" && (
-                <RefreshCw
-                  size={12}
-                  className="spin protection-check-spinner"
-                  aria-label="Проверка защиты"
-                />
-              )}
+              <span className="protection-heading">
+                {protectionLabel(protection)}
+                {protectionChecking && data?.running && data.status === "Connected" && (
+                  <RefreshCw
+                    size={12}
+                    className="spin protection-check-spinner"
+                    aria-label="Проверка защиты"
+                  />
+                )}
+              </span>
               <small>{protection.detail}</small>
               {protection.secure === null && protection.lastConfirmedAt && (
                 <small>Последнее подтверждение: {new Date(protection.lastConfirmedAt * 1000).toLocaleString("ru-RU")}</small>
@@ -574,7 +585,7 @@ function App() {
                 disabled={updateStatus === "downloading" || updateStatus === "installing"}
                 onClick={() => { setPage("Updates"); void installUpdate(); }}
               >
-                {updateStatus === "downloading" ? `${updateProgress}%` : updateStatus === "installing" ? "Установка…" : "Обновить"}
+                {updateStatus === "downloading" ? "Загрузка…" : updateStatus === "installing" ? "Установка…" : "Обновить"}
               </button>
             ) : <span>{versionLabel}</span>}
           </div>
@@ -625,7 +636,7 @@ function App() {
                   <strong>Доступно обновление Atlas {availableUpdate.version}</strong>
                   <p>
                     {updateStatus === "downloading"
-                      ? `Загрузка: ${updateProgress}%`
+                      ? "Загрузка и проверка подписанного установщика…"
                       : updateStatus === "installing"
                         ? "Установка обновления…"
                         : updateError || "Можно скачать и установить новую версию."}
@@ -869,6 +880,7 @@ function App() {
               )}
               {page === "Servers" && (
                 <>
+                  {sourceSwitch}
                   {header(
                     "GLOBAL NETWORK",
                     "Найдите свой маршрут.",
@@ -959,8 +971,8 @@ function App() {
                     </div>
                   ) : (
                     empty(
-                      "Пока нет серверов",
-                      "Добавьте подписку, чтобы загрузить доступные серверы.",
+                      sourceLabels[source].empty,
+                      sourceLabels[source].hint,
                       addButton,
                     )
                   )}
@@ -975,15 +987,16 @@ function App() {
               )}
               {page === "Subscriptions" && (
                 <>
+                  {sourceSwitch}
                   {header(
                     "YOUR PROVIDERS",
                     "Одна ссылка. Вся сеть.",
                     "Секретные URL хранятся в Windows Credential Manager.",
                     addButton,
                   )}
-                  {s?.subscriptions.length ? (
+                  {subscriptions.length ? (
                     <div className="list">
-                      {s.subscriptions.map((sub) => (
+                      {subscriptions.map((sub) => (
                         <SubscriptionCard key={sub.id} sub={sub}
                           refreshing={data?.refreshingSubscriptions?.includes(sub.id) ?? false}
                           canDelete={!busy && !connected}
@@ -1001,8 +1014,8 @@ function App() {
                     </div>
                   ) : (
                     empty(
-                      "Подключите вашего провайдера",
-                      "Поддерживаются Clash/Mihomo YAML, Xray JSON, Base64 и proxy URI.",
+                      sourceLabels[source].empty,
+                      sourceLabels[source].hint,
                       addButton,
                     )
                   )}
@@ -1181,13 +1194,13 @@ function App() {
                       disabled={busy}
                       onClick={() =>
                         run(async () => {
-                          setBusy(true);
+                          setPendingOperations(count => count + 1);
                           try {
                             setChecks(await request("diagnostics"));
                           } catch (e) {
                             setError(String(e));
                           } finally {
-                            setBusy(false);
+                            setPendingOperations(count => Math.max(0, count - 1));
                           }
                         })
                       }
@@ -1320,6 +1333,8 @@ function App() {
               )}
               {page === "Settings" && s && (
                 <>
+                  <h2>Активный тип подписок</h2>
+                  {sourceSwitch}
                   {header(
                     "MAKE IT YOURS",
                     "Всё под вашим контролем.",
@@ -1533,13 +1548,13 @@ function App() {
             aria-label="Новая подписка"
           >
             <div className="section-head">
-              <h2>Добавьте вашу подписку</h2>
+              <h2>{sourceLabels[source].title}: добавить источник</h2>
               <button aria-label="Закрыть" onClick={() => setAdding(false)}>
                 <X size={18} />
               </button>
             </div>
             <p>
-              Atlas загрузит серверы по HTTPS и проверит их с помощью Mihomo.
+              {source === "VLESS" ? "Вставьте HTTPS-подписку с VLESS-серверами или один VLESS-ключ." : "Вставьте HTTPS-ссылку на подписку вашего провайдера."}
             </p>
             <label>
               Название
@@ -1551,14 +1566,14 @@ function App() {
               />
             </label>
             <label>
-              Ссылка HTTPS
+              {sourceLabels[source].input}
               <input
                 type="password"
                 autoComplete="off"
                 spellCheck={false}
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="https://provider.example/sub/…"
+                placeholder={source === "VLESS" ? "https://… или vless://…" : "https://provider.example/sub/…"}
               />
             </label>
             <p className="footnote">
@@ -1574,7 +1589,7 @@ function App() {
                 className="primary"
                 onClick={() =>
                   run(async () => {
-                    await act("subscription_add", { name, url });
+                    await act("subscription_add", { name, url, source });
                     setUrl("");
                     setName("");
                     setAdding(false);

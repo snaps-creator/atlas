@@ -76,6 +76,8 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
         let db = Connection::open(path).map_err(|e| e.to_string())?;
+        let schema:i64=db.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if !(0..=2).contains(&schema) {return Err("Версия базы настроек новее поддерживаемой; база не изменена".into());}
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS backups(id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER NOT NULL, payload BLOB NOT NULL);").map_err(|e|e.to_string())?;
         // Keep the original encrypted payload outside the rotating backup history.
         // The stored group schema remains compatible; normalization is performed on compilation.
@@ -94,6 +96,17 @@ impl Store {
             Some(b) => serde_json::from_slice(&crypt(&b, false)?)
                 .map_err(|_| "Повреждены сохранённые настройки".into()),
         }
+    }
+    /// SQLite takes a consistent snapshot including WAL contents. Copying only
+    /// atlas.db would silently omit recently committed subscriptions/settings.
+    pub fn update_snapshot(&self, destination:&Path)->Result<(),String> {
+        if destination.exists() {return Err("Snapshot destination already exists".into());}
+        let destination=destination.to_str().ok_or("Invalid snapshot path")?;
+        self.db.execute("VACUUM INTO ?1",params![destination]).map_err(|e|e.to_string())?;
+        std::fs::OpenOptions::new().read(true).write(true).open(destination).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+        let snapshot=Connection::open_with_flags(destination,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+        let check:String=snapshot.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if check!="ok" {return Err("Settings snapshot integrity failed".into());}Ok(())
     }
     pub fn save(&mut self, s: &Settings) -> Result<(), String> {
         let data = crypt(&serde_json::to_vec(s).map_err(|e| e.to_string())?, true)?;
@@ -123,6 +136,20 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn newer_schema_is_rejected_without_rewriting_it() {
+        let p=std::env::temp_dir().join(format!("atlas-schema-{}.db",uuid::Uuid::new_v4()));
+        {let db=Connection::open(&p).unwrap();db.execute_batch("PRAGMA user_version=99; CREATE TABLE future(value TEXT); INSERT INTO future VALUES('unchanged');").unwrap();}
+        let before=std::fs::read(&p).unwrap();assert!(Store::open(&p).is_err());assert_eq!(std::fs::read(&p).unwrap(),before);std::fs::remove_file(p).unwrap();
+    }
+    #[test]
+    fn update_snapshot_includes_wal_and_survives_candidate_changes() {
+        let dir=std::env::temp_dir().join(format!("atlas-snapshot-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
+        {let mut db=Store::open(&dir.join("atlas.db")).unwrap();let mut settings=Settings::default();settings.active_source=crate::model::SubscriptionSource::Vless;db.save(&settings).unwrap();db.update_snapshot(&dir.join("previous.db")).unwrap();settings.active_source=crate::model::SubscriptionSource::Url;db.save(&settings).unwrap();
+            let snapshot=Store::open(&dir.join("previous.db")).unwrap();assert_eq!(snapshot.load().unwrap().active_source,crate::model::SubscriptionSource::Vless);
+            assert!(db.update_snapshot(&dir.join("previous.db")).is_err());}
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn persistence_backup_and_encryption() {
         let p = std::env::temp_dir().join(format!("atlas-test-{}.db", uuid::Uuid::new_v4()));

@@ -408,7 +408,7 @@ fn wait_for_tun_release_with(timeout: std::time::Duration, identity: impl Fn() -
     let deadline = std::time::Instant::now() + timeout;
     while identity().is_some() {
         if std::time::Instant::now() >= deadline {
-            return Err("Atlas-TUN всё ещё активен после остановки службы. Очистка не подтверждена; неизвестный интерфейс не изменён".into());
+            return Err("Освобождение Atlas-TUN после остановки службы не подтверждено; неизвестный интерфейс не изменён".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -536,7 +536,7 @@ impl Guard {
     }
     pub fn reset_for_recovery(&self) -> Result<(), String> {
         if tun_identity().is_some() {
-            return Err("Atlas-TUN всё ещё активен; восстановление остановлено".into());
+            return Err("Освобождение Atlas-TUN не подтверждено; восстановление остановлено".into());
         }
         *self.owned_tun.lock().map_err(|_| "Не удалось сбросить идентификатор TUN")? = None;
         Ok(())

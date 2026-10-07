@@ -49,6 +49,7 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
         let mut last_logs = 0;
         let mut failed = HashSet::new();
         while !stop.load(Ordering::SeqCst) {
+            if crate::update_health::pending() {std::thread::sleep(Duration::from_millis(200));continue;}
             for id in rx.try_iter() { in_flight.remove(&id); outstanding.remove(&id); }
             let Ok(snapshot)=reads.get() else { std::thread::sleep(Duration::from_millis(200)); continue; };
             outstanding.retain(|id|snapshot.settings.subscriptions.iter().any(|s| &s.id==id));
@@ -62,8 +63,8 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
             }
             for sub in &snapshot.settings.subscriptions {
                 if in_flight.len()>=2 { break; }
-                let failed = sub.servers.iter().any(|n|n["name"].as_str().is_some_and(|n|failed.contains(n)))
-                    || (snapshot.status=="Error" && shared.try_lock().is_ok_and(|a|a.reconnect.load(Ordering::SeqCst)));
+                let failed = sub.source==snapshot.settings.active_source && (sub.servers.iter().any(|n|n["name"].as_str().is_some_and(|n|failed.contains(n)))
+                    || (snapshot.status=="Error" && shared.try_lock().is_ok_and(|a|a.reconnect.load(Ordering::SeqCst))));
                 let Some(trigger)=reason(outstanding.contains(&sub.id),sub.updated_at,attempts.get(&sub.id).copied(),now,failed,sub.options.refresh_interval_seconds()) else { continue; };
                 let Some(lease)=Lease::take(&sub.id) else { continue; };
                 let id=sub.id.clone(); attempts.insert(id.clone(),now); in_flight.insert(id.clone());
@@ -83,19 +84,26 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                         if !subscriptions::refresh_is_current(before.settings.subscriptions.iter().find(|s|s.id==id),a.settings.subscriptions.iter().find(|s|s.id==id)) {
                             return Ok(()); // Deleted or superseded; never recreate/overwrite it.
                         }
-                        a.install_subscription(id.clone(),url,nodes,None,None)?;
+                        let source=before.settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка удалена")?.source;
+                        a.install_subscription(id.clone(),url,nodes,None,None,source)?;
                         if trigger=="recovery" && a.status=="Error" && a.reconnect.load(Ordering::SeqCst) { a.connect()?; }
                         a.snapshot(); Ok(())
                     })();
                     incident_history::record("subscription_refresh_completed",json!({"subscription":id,"trigger":trigger,
                         "elapsedMs":started.elapsed().as_millis(),"success":result.is_ok(),"error":result.as_ref().err()}),&[]);
-                    drop(lease);
                     if !stop.load(Ordering::SeqCst) {
                         if let Ok(mut a)=shared.lock() {
-                            if let Err(error)=result { if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id) { sub.error=Some(error); } }
+                            if let Err(error)=result {
+                                if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id) {
+                                    sub.error=Some(error);
+                                    let settings=a.settings.clone();
+                                    if a.store.save(&settings).is_err() {a.log("WARN","Не удалось сохранить состояние обновления подписки");}
+                                }
+                            }
                             a.snapshot();
                         }
                     }
+                    drop(lease);
                     let _=tx.send(id);
                 });
             }

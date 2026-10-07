@@ -451,19 +451,26 @@ mod tests {
     #[test]
     fn replacement_is_returned_before_the_slow_candidate_finishes() {
         use std::{io::{Read,Write}, net::TcpListener, sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+        // Other HTTP tests can leave cancelled workers draining the shared
+        // admission gate. Establish an idle gate before measuring this fixture;
+        // queue time from a preceding test is not replacement-selection latency.
+        let idle:Vec<_>=(0..8).map(|_|crate::query_admission::acquire(true).unwrap()).collect();
+        drop(idle);
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();
         let port=listener.local_addr().unwrap().port(); listener.set_nonblocking(true).unwrap();
         let stop=Arc::new(AtomicBool::new(false)); let stopped=stop.clone();
         let (release,wait)=mpsc::channel(); let wait=Arc::new(Mutex::new(wait));
+        let slow_finished=Arc::new(AtomicBool::new(false));let observed_slow=slow_finished.clone();
         let server=std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 if let Ok((mut socket,_))=listener.accept() {
                     let wait=wait.clone();
+                    let slow_finished=slow_finished.clone();
                     std::thread::spawn(move || {
                         socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                         let mut request=[0;4096]; let n=socket.read(&mut request).unwrap_or(0);
                         let request=String::from_utf8_lossy(&request[..n]);
-                        if request.contains("/slow/delay?") { let _=wait.lock().unwrap().recv_timeout(Duration::from_secs(5)); }
+                        if request.contains("/slow/delay?") { let _=wait.lock().unwrap().recv_timeout(Duration::from_secs(30));slow_finished.store(true,Ordering::SeqCst); }
                         let body=if request.contains("/delay?") { json!({"delay":40}) } else {
                             let health=json!({"alive":true,"extra":{crate::latency::DISPLAY_URL:{"alive":true}}});
                             json!({"proxies":{"slow":health.clone(),"fast":health}})
@@ -474,13 +481,15 @@ mod tests {
             }
         });
         let mut settings=Settings::default();
-        settings.subscriptions.push(crate::model::Subscription { options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+        settings.subscriptions.push(crate::model::Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
             servers:vec![json!({"name":"slow","server":"127.0.0.1","port":1}),json!({"name":"fast","server":"127.0.0.1","port":2})]});
         let (tx,rx)=mpsc::channel();
         std::thread::spawn(move || { let _=tx.send(verify_replacement(&ApiClient::loopback_fixture(port),&settings,&HashSet::new(),None,Default::default())); });
         let result=rx.recv_timeout(Duration::from_secs(3));
+        let returned_before_slow=!observed_slow.load(Ordering::SeqCst);
         let _=release.send(()); stop.store(true,Ordering::SeqCst); server.join().unwrap();
         assert_eq!(result.unwrap()["candidate"],"fast");
+        assert!(returned_before_slow,"Replacement waited for the blocked candidate");
     }
     #[test]
     fn controller_errors_do_not_quarantine_remote_nodes() {
@@ -526,7 +535,7 @@ mod tests {
     #[test]
     fn quarantine_is_bound_to_node_configuration() {
         let mut s=Settings::default();
-        s.subscriptions.push(crate::model::Subscription { options: Default::default(),id:"x".into(),name:"x".into(),masked_url:"".into(),updated_at:0,error:None,
+        s.subscriptions.push(crate::model::Subscription { source: Default::default(), options: Default::default(),id:"x".into(),name:"x".into(),masked_url:"".into(),updated_at:0,error:None,
             servers:vec![json!({"name":"Sweden","server":"1.2.3.4","port":443}),json!({"name":"Germany","server":"1.2.3.4","port":443}),json!({"name":"other","server":"5.6.7.8","port":443})]});
         let p=json!({"proxies":{"Sweden":{"alive":true},"Germany":{"alive":true},"other":{"alive":true}}});
         let first = node_key(&s.servers()[0]);

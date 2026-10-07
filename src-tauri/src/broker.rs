@@ -671,6 +671,7 @@ impl HealthState {
                 *session_id = None;
                 return;
             }
+            let Ok(_update_admission) = crate::update_lock::UpdateLock::admit_session() else { return; };
             self.attempts.push_back(now);
             if observer.as_mut().is_none_or(|child| !matches!(child.try_wait(), Ok(None))) {
                 match crate::session_cleanup::start_observer(&core.directory, desktop_pid) {
@@ -908,6 +909,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 }
             }
             "start" => {
+                let _update_admission = crate::update_lock::UpdateLock::admit_session()?;
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;
@@ -1017,6 +1019,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 Ok(json!({"running":true}))
             }
             "apply" => {
+                let _update_admission = crate::update_lock::UpdateLock::admit_session()?;
                 let s: Settings = serde_json::from_value(payload.clone())
                     .map_err(|_| "Некорректные настройки")?;
                 validate_settings(&s)?;

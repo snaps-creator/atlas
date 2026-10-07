@@ -1,12 +1,16 @@
 [package]
 name = "atlas-vpn"
-version = "2.3.2-alpha.1"
+version = "2.4.2"
 edition = "2021"
 default-run = "atlas-vpn"
 
 [[bin]]
 name = "AtlasMaintenance"
 path = "src/maintenance_main.rs"
+
+[[bin]]
+name = "AtlasUpdater"
+path = "src/updater_main.rs"
 
 [lib]
 name = "atlas"
@@ -27,11 +31,14 @@ serde_yaml = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
+flate2 = "1.1.10"
 url = "2"
 ipnet = "2"
 keyring = { version = "3", features = ["windows-native"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+tokio = { version = "=1.53.1", features = ["rt", "time"] }
+minisign-verify = "=0.2.5"
 ring = "0.17"
 maxminddb = "0.32.0"
 rfd = "0.17.2"
