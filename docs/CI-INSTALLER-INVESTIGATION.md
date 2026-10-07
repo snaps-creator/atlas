@@ -81,3 +81,42 @@ The user initially required isolation; no PR changes were made during reproducti
 Job 112897483284 failed in the historical offline-upgrade scenario, whose immutable signed payload is 2.3.1-alpha.1, not the freshly built 2.4.2. Its artifact contains a successful render acknowledgement (12 buttons) and only the parent Atlas process remaining at the 25-second deadline; stderr records a CEF browser-info timeout. The assertion conflated successful render/IPC with final CEF process teardown.
 
 The check retains its 25-second startup deadline. Only an already valid render/IPC acknowledgement permits a separate bounded 25-second normal-shutdown wait. A forced termination is still failure, helper processes must all exit, and a nonzero process exit is now explicitly rejected. The same signed archival bytes passed three isolated local runs; the fresh 2.4.2 payload also passed. The CI-only delayed exit was not reproduced locally, so the new remote run remains the confirmation for that runner-specific timing.
+
+## Connected upgrade failures after the signed build passed
+
+The signed build at f874270 passed packaging verification. Job 112919283601 then
+reported `Invalid update identifier`. The legacy fixture extracted NSIS's
+temporary `$PLUGINSDIR` into the simulated install root. That directory is not
+part of a real installation. The harness now excludes it at extraction and
+asserts its absence. Locally, the same signature-verified 2.2.3-alpha.47.1 archive
+produced 31 application files with valid relative paths. Production path
+validation remains unchanged.
+
+Job 112922173526 progressed past that failure and reported
+`User-context check must be started elevated`. The updater incorrectly treated
+`TokenElevationTypeDefault` as non-administrative. Microsoft defines it as having
+no linked token, which also includes unsplit administrator tokens:
+https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_elevation_type
+
+The updater now checks actual administrative group access and integrity. Normal
+UAC launches retain the same-user, same-session shell token path. An unsplit
+administrator uses `CreateRestrictedToken` with LUA_TOKEN and
+DISABLE_MAX_PRIVILEGE, explicitly lowered to medium integrity. The token is
+validated before process creation; the native child report independently binds
+PID, SID, session, administrative access and integrity. System/service accounts
+are rejected. No administrative desktop fallback is allowed.
+
+Local evidence in `temp/installer-contract-fix/evidence`:
+
+- `native-token-regression.log`: 202 library + 47 maintenance + 56 updater PASS.
+- `elevated-token-test.log` and `.exit`: real restricted child process PASS,
+  exit 0; its own token assertions verify medium integrity and no admin group.
+- `user-context-result.json`: production helper UAC/IPC probe PASS, exit 0;
+  child elevation type Limited, adminEnabled false, integrity 8192.
+
+The privileged child test has a mandatory explicit invocation in PR and release
+CI; it is excluded from ordinary non-admin developer unit-test runs. Its ignored
+child driver is invoked explicitly by that test. Remote connected upgrade still
+must pass on the newly built signed installer; these local checks do not stand
+in for installation or reboot acceptance. The pinned previous artifact can only
+be reused for harness/orchestration changes; this native change forces a rebuild.

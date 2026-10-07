@@ -1,7 +1,9 @@
-//! Launch the desktop with the same user's existing shell token. Never fall back
-//! to an elevated desktop when Windows refuses the requested user context.
+//! Launch the desktop with the same user's limited token. Split UAC tokens use
+//! the interactive shell; unsplit administrators use a verified restricted token.
+//! Never fall back to an administrative desktop when token preparation fails.
 use std::{fs::File, os::windows::{ffi::OsStrExt,io::{AsRawHandle,FromRawHandle,OwnedHandle}},path::Path,ptr};
 use windows_sys::Win32::{Foundation::*, Security::*, System::{Threading::*,Pipes::CreatePipe}};
+use windows_sys::Win32::System::SystemServices::{SE_GROUP_ENABLED,SE_GROUP_INTEGRITY,SECURITY_MANDATORY_MEDIUM_RID};
 
 pub struct Process { handle:OwnedHandle, pub pid:u32 }
 impl AsRawHandle for Process {fn as_raw_handle(&self)->HANDLE{self.handle.as_raw_handle()}}
@@ -18,6 +20,58 @@ fn elevation(handle:HANDLE)->Result<TOKEN_ELEVATION_TYPE,String>{unsafe{
         return Err(failure("Cannot inspect updater elevation"));
     }
     Ok(value)
+}}
+fn token_info(handle:HANDLE,class:TOKEN_INFORMATION_CLASS)->Result<Vec<usize>,String>{unsafe{
+    let mut size=0;GetTokenInformation(handle,class,ptr::null_mut(),0,&mut size);
+    if size==0 || size>65536{return Err("Invalid token information size".into());}
+    let mut buffer=vec![0usize;(size as usize).div_ceil(std::mem::size_of::<usize>())];
+    if GetTokenInformation(handle,class,buffer.as_mut_ptr().cast(),size,&mut size)==0{return Err(failure("Cannot inspect desktop token"));}
+    Ok(buffer)
+}}
+fn integrity(handle:HANDLE)->Result<u32,String>{unsafe{
+    let buffer=token_info(handle,TokenIntegrityLevel)?;
+    let label=&*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
+    if IsValidSid(label.Label.Sid)==0{return Err("Invalid token integrity SID".into());}
+    let count=*GetSidSubAuthorityCount(label.Label.Sid);
+    if count==0{return Err("Missing token integrity level".into());}
+    Ok(*GetSidSubAuthority(label.Label.Sid,u32::from(count-1)))
+}}
+fn admin_enabled(handle:HANDLE)->Result<bool,String>{unsafe{
+    let buffer=token_info(handle,TokenGroups)?;
+    let groups=&*buffer.as_ptr().cast::<TOKEN_GROUPS>();
+    for group in std::slice::from_raw_parts(groups.Groups.as_ptr(),groups.GroupCount as usize) {
+        if IsWellKnownSid(group.Sid,WinBuiltinAdministratorsSid)!=0 && group.Attributes & SE_GROUP_ENABLED as u32 != 0 {return Ok(true);}
+    }
+    Ok(false)
+}}
+fn session(handle:HANDLE)->Result<u32,String>{
+    let buffer=token_info(handle,TokenSessionId)?;Ok(unsafe{*buffer.as_ptr().cast::<u32>()})
+}
+fn desktop_safe(handle:HANDLE)->Result<bool,String>{Ok(!admin_enabled(handle)? && integrity(handle)?<=SECURITY_MANDATORY_MEDIUM_RID as u32)}
+fn restricted_desktop(current:HANDLE)->Result<OwnedHandle,String>{unsafe{
+    // TokenElevationTypeDefault means "no linked token", not "non-admin".
+    // Keep the user's SID/session while removing administrative groups and all
+    // privileges except traversal. Do not synthesize a token for another user.
+    let user=token_info(current,TokenUser)?;
+    let user=&*user.as_ptr().cast::<TOKEN_USER>();
+    if [WinLocalSystemSid,WinLocalServiceSid,WinNetworkServiceSid].iter().any(|kind|IsWellKnownSid(user.User.Sid,*kind)!=0) {
+        return Err("A service account cannot be used as the original desktop user".into());
+    }
+    let mut duplicate=ptr::null_mut();
+    if DuplicateTokenEx(current,TOKEN_ALL_ACCESS,ptr::null(),SecurityImpersonation,TokenPrimary,&mut duplicate)==0{return Err(failure("Cannot duplicate unsplit user token"));}
+    let duplicate=OwnedHandle::from_raw_handle(duplicate);let mut restricted=ptr::null_mut();
+    if CreateRestrictedToken(duplicate.as_raw_handle(),DISABLE_MAX_PRIVILEGE|LUA_TOKEN,0,ptr::null(),0,ptr::null(),0,ptr::null(),&mut restricted)==0{return Err(failure("Cannot restrict unsplit user token"));}
+    let restricted=OwnedHandle::from_raw_handle(restricted);
+    let text:Vec<u16>="S-1-16-8192".encode_utf16().chain(Some(0)).collect();let mut medium=ptr::null_mut();
+    if Authorization::ConvertStringSidToSidW(text.as_ptr(),&mut medium)==0{return Err(failure("Cannot create medium integrity SID"));}
+    let label=TOKEN_MANDATORY_LABEL{Label:SID_AND_ATTRIBUTES{Sid:medium,Attributes:SE_GROUP_INTEGRITY as u32}};
+    let result=SetTokenInformation(restricted.as_raw_handle(),TokenIntegrityLevel,(&label as *const TOKEN_MANDATORY_LABEL).cast(),std::mem::size_of_val(&label) as u32+GetLengthSid(medium));
+    let error=if result==0{Some(failure("Cannot lower desktop integrity"))}else{None};LocalFree(medium);
+    if let Some(error)=error{return Err(error);}
+    if !desktop_safe(restricted.as_raw_handle())? || sid(current)?!=sid(restricted.as_raw_handle())? || session(current)?!=session(restricted.as_raw_handle())? {
+        return Err("Restricted desktop token failed identity or privilege validation".into());
+    }
+    Ok(restricted)
 }}
 fn sid(handle:HANDLE)->Result<String,String>{unsafe{
     let mut size=0;GetTokenInformation(handle,TokenUser,ptr::null_mut(),0,&mut size);
@@ -44,6 +98,7 @@ pub fn database()->Result<std::path::PathBuf,String>{unsafe{
 }}
 pub fn report()->Result<serde_json::Value,String>{Ok(serde_json::json!({
     "sid":current_sid()?,"pid":std::process::id(),"elevation":elevation(token()?.as_raw_handle())?,
+    "adminEnabled":admin_enabled(token()?.as_raw_handle())?,"integrity":integrity(token()?.as_raw_handle())?,"session":session(token()?.as_raw_handle())?,
     "version":env!("CARGO_PKG_VERSION")
 }))}
 pub fn check()->Result<serde_json::Value,String>{
@@ -73,7 +128,8 @@ pub fn check_executable(executable:&Path)->Result<serde_json::Value,String>{
             std::thread::sleep(Duration::from_millis(20));
         }
         let value:serde_json::Value=serde_json::from_slice(&bytes).map_err(|_|"User-context IPC did not return JSON")?;
-        if value["pid"]!=child.pid || value["sid"]!=current_sid()? || value["elevation"]!=TokenElevationTypeLimited {
+        if value["pid"]!=child.pid || value["sid"]!=current_sid()? || value["adminEnabled"]!=false ||
+            value["session"]!=session(token()?.as_raw_handle())? || !value["integrity"].as_u64().is_some_and(|level|level<=SECURITY_MANDATORY_MEDIUM_RID as u64) {
             return Err("Child user identity or elevation is incorrect".into());
         }
         Ok(value)
@@ -85,7 +141,7 @@ pub fn check_executable(executable:&Path)->Result<serde_json::Value,String>{
 // lpApplicationName and lpCurrentDirectory, never through a command interpreter.
 pub fn limited(executable:&Path,args:&[&str])->Result<Option<(Process,File)>,String>{
     let current=token()?;
-    if elevation(current.as_raw_handle())?!=TokenElevationTypeFull{return Ok(None);}
+    if desktop_safe(current.as_raw_handle())? {return Ok(None);}
     if args.iter().any(|s|s.contains(['"','\\','\0','\r','\n',' '])) {return Err("Invalid desktop launch argument".into());}
     // Use a normal DOS spelling for Win32 process creation, even when callers
     // obtained an extended-length spelling from canonicalize.
@@ -98,6 +154,9 @@ pub fn limited(executable:&Path,args:&[&str])->Result<Option<(Process,File)>,Str
         // TokenLinkedToken can be identification-only. The interactive shell
         // supplies a primary token; bind both SID and session before using it.
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow,GetWindowThreadProcessId};
+        let linked=if elevation(current.as_raw_handle())?==TokenElevationTypeDefault {
+            restricted_desktop(current.as_raw_handle())?
+        }else{
         let shell=GetShellWindow();let mut shell_pid=0;
         if shell.is_null() || GetWindowThreadProcessId(shell,&mut shell_pid)==0 || shell_pid==0 {
             return Err("Original user's interactive shell is unavailable".into());
@@ -110,7 +169,7 @@ pub fn limited(executable:&Path,args:&[&str])->Result<Option<(Process,File)>,Str
             return Err(failure("Cannot inspect interactive user's token"));
         }
         let linked=OwnedHandle::from_raw_handle(linked);
-        if elevation(linked.as_raw_handle())?!=TokenElevationTypeLimited || sid(current.as_raw_handle())?!=sid(linked.as_raw_handle())? {
+        if !desktop_safe(linked.as_raw_handle())? || sid(current.as_raw_handle())?!=sid(linked.as_raw_handle())? {
             return Err("Desktop token does not match the original limited user".into());
         }
         let mut current_session=0u32;let mut shell_session=0u32;let mut size=0;
@@ -118,8 +177,15 @@ pub fn limited(executable:&Path,args:&[&str])->Result<Option<(Process,File)>,Str
             GetTokenInformation(linked.as_raw_handle(),TokenSessionId,(&mut shell_session as *mut u32).cast(),4,&mut size)==0 || current_session!=shell_session {
             return Err("Desktop token belongs to another Windows session".into());
         }
+        linked
+        };
+        launch_with_token(executable,directory,args,linked.as_raw_handle()).map(Some)
+    }
+}
+fn launch_with_token(executable:&Path,directory:&Path,args:&[&str],linked:HANDLE)->Result<(Process,File),String>{unsafe{
+        let executable_text=executable.to_str().ok_or("Invalid desktop executable path")?;
         let mut primary=ptr::null_mut();
-        if DuplicateTokenEx(linked.as_raw_handle(),TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY|TOKEN_ADJUST_DEFAULT|TOKEN_ADJUST_SESSIONID,
+        if DuplicateTokenEx(linked,TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY|TOKEN_ADJUST_DEFAULT|TOKEN_ADJUST_SESSIONID,
             ptr::null(),SecurityImpersonation,TokenPrimary,&mut primary)==0 {
             return Err(failure("Cannot create original user's primary process token"));
         }
@@ -150,6 +216,44 @@ pub fn limited(executable:&Path,args:&[&str])->Result<Option<(Process,File)>,Str
         DestroyEnvironmentBlock(environment);
         if let Some(error)=error{return Err(error);}
         CloseHandle(process.hThread);
-        Ok(Some((Process{handle:OwnedHandle::from_raw_handle(process.hProcess),pid:process.dwProcessId},read)))
+        Ok((Process{handle:OwnedHandle::from_raw_handle(process.hProcess),pid:process.dwProcessId},read))
+    }
+}
+
+#[cfg(test)] mod tests {
+    use super::*;
+    #[test] fn restricted_token_keeps_user_and_session_without_administrative_access() {
+        let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
+        assert_eq!(sid(current.as_raw_handle()).unwrap(),sid(reduced.as_raw_handle()).unwrap());
+        assert_eq!(session(current.as_raw_handle()).unwrap(),session(reduced.as_raw_handle()).unwrap());
+        assert!(!admin_enabled(reduced.as_raw_handle()).unwrap());
+        assert_eq!(integrity(reduced.as_raw_handle()).unwrap(),SECURITY_MANDATORY_MEDIUM_RID as u32);
+        assert!(desktop_safe(reduced.as_raw_handle()).unwrap());
+        let buffer=token_info(reduced.as_raw_handle(),TokenPrivileges).unwrap();
+        let privileges=unsafe{&*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>()};
+        // DISABLE_MAX_PRIVILEGE removes every privilege except traversal.
+        let mut traversal=LUID{LowPart:0,HighPart:0};
+        let name:Vec<u16>="SeChangeNotifyPrivilege".encode_utf16().chain(Some(0)).collect();
+        assert_ne!(unsafe{LookupPrivilegeValueW(ptr::null(),name.as_ptr(),&mut traversal)},0);
+        for privilege in unsafe{std::slice::from_raw_parts(privileges.Privileges.as_ptr(),privileges.PrivilegeCount as usize)} {
+            assert_eq!((privilege.Luid.LowPart,privilege.Luid.HighPart),(traversal.LowPart,traversal.HighPart));
+        }
+    }
+    #[test] #[ignore="Invoked in a real restricted child by restricted_process_runs_without_admin"]
+    fn restricted_child_driver() {
+        let current=token().unwrap();
+        assert!(!admin_enabled(current.as_raw_handle()).unwrap());
+        assert_eq!(integrity(current.as_raw_handle()).unwrap(),SECURITY_MANDATORY_MEDIUM_RID as u32);
+    }
+    #[test] #[ignore="Requires an administrative caller; mandatory separate CI invocation"]
+    fn restricted_process_runs_without_admin() {
+        let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
+        let executable=std::env::current_exe().unwrap();
+        let (child,_pipe)=launch_with_token(&executable,executable.parent().unwrap(),
+            &["--exact","update_user::tests::restricted_child_driver","--ignored"],reduced.as_raw_handle()).unwrap();
+        let status=unsafe{WaitForSingleObject(child.as_raw_handle(),15000)};
+        if status!=WAIT_OBJECT_0{child.terminate();panic!("Restricted child timed out");}
+        let mut exit=1;assert_ne!(unsafe{GetExitCodeProcess(child.as_raw_handle(),&mut exit)},0);
+        assert_eq!(exit,0,"Restricted child failed its real token assertions");
     }
 }

@@ -62,6 +62,9 @@ jobs:
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance --bin AtlasUpdater
 
+      - name: Verify actual restricted desktop process
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
+
       - name: Check whether the version is already released
         id: release-version
         shell: pwsh
