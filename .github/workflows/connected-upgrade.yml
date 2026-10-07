@@ -16,8 +16,8 @@ jobs:
           script: |
             // Reuse only this proven signed build, and only for changes to
             // this orchestration or its external acceptance harness.
-            const sha = 'f874270bb3f55ac56211dae34dd2dc5a8b45a918';
-            const run_id = 37653293318;
+            const sha = '3b0a0002850a2c64be96da5a29300a33b96a78a0';
+            const run_id = 37664177551;
             const allowed = new Set(['.github/workflows/connected-upgrade.yml', 'scripts/test-connected-upgrade.ps1']);
             const repo = context.repo;
             try {

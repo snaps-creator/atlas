@@ -22,6 +22,19 @@ $maintenance = Join-Path $candidateFiles 'AtlasMaintenance.exe'
 $transactional = Test-Path -LiteralPath (Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasUpdater.exe')
 if ($transactional) { $maintenance = Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasMaintenance.exe' }
 $activeRoot = $installRoot
+function Recovery-Root {
+    $registered = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
+    if ($registered.PathName -eq ('"' + (Join-Path $installRoot 'Atlas.Service.exe') + '" --network-service')) { return $installRoot }
+    $journalPath = Join-Path $installRoot 'current.json'
+    if (Test-Path -LiteralPath $journalPath) {
+        $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+        if ($journal.active.absent -ne $true -and $journal.active.id -match '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,99}$') {
+            $directory = Join-Path $installRoot ('versions/' + $journal.active.id)
+            if (Test-Path -LiteralPath (Join-Path $directory 'Atlas.Service.exe')) { return $directory }
+        }
+    }
+    return $installRoot
+}
 function Install-Checked([string]$path) {
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
@@ -34,12 +47,40 @@ function Install-Checked([string]$path) {
                 Get-Content -LiteralPath $nativeLog -Tail 60
             }
         }
+        # Never export incident contents. Emit only source locations of known
+        # literal messages found in the disposable runner's history.
+        $history = Join-Path $env:LOCALAPPDATA 'net.atlasvpn.desktop/incident-history.ndjson'
+        if (Test-Path -LiteralPath $history) {
+            $incidentText = (Get-Content -LiteralPath $history -Tail 100 -Encoding UTF8) -join "`n"
+            $categories = @('history_present')
+            foreach ($kind in @('application_start','frontend_event','incident_summary')) {
+                if ($incidentText.Contains('"kind":"' + $kind + '"')) { $categories += $kind }
+            }
+            foreach ($source in @('lib.rs','broker.rs','service.rs','update_process.rs')) {
+                $lineNumber = 0
+                foreach ($line in (Get-Content -LiteralPath (Join-Path $repo "src-tauri/src/$source") -Encoding UTF8)) {
+                    $lineNumber++
+                    foreach ($literal in [regex]::Matches($line, '"([^"\\]{16,})"')) {
+                        if ($incidentText.Contains($literal.Groups[1].Value)) {
+                            $categories += "${source}:$lineNumber"
+                        }
+                    }
+                }
+            }
+            $categories | Sort-Object -Unique | Tee-Object -FilePath (Join-Path $fixture 'candidate-health-categories.log')
+        }
+        $journalPath = Join-Path $installRoot 'current.json'
+        if (Test-Path -LiteralPath $journalPath) {
+            Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json |
+                Select-Object stage,sequence,network_state,health_state,migration_state |
+                ConvertTo-Json | Tee-Object -FilePath (Join-Path $fixture 'transaction-state.log')
+        }
         Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'" | Select-Object Name,State,PathName | Format-List
         Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('Atlas.exe','Atlas.Service.exe','Atlas.Core.exe','Atlas.Xray.exe') } |
             Select-Object ProcessId,ParentProcessId,Name,ExecutablePath | Format-List
         Get-Item (Join-Path $installRoot 'Atlas.exe') | ForEach-Object { $_.VersionInfo | Select-Object FileName,FileVersion,ProductVersion | Format-List }
         & $maintenance --inspect
-        & $maintenance --prepare-install $installRoot 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')
+        & $maintenance --prepare-install (Recovery-Root) 2>&1 | Tee-Object -FilePath (Join-Path $fixture 'recovery-after-error.log')
         Write-Output "Independent recovery exit: $LASTEXITCODE"
         throw "Installer failed: $($process.ExitCode)"
     }
@@ -183,6 +224,10 @@ rules:
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
     }
     # The guard above established that this disposable job created the service.
-    & $maintenance --prepare-install $installRoot
-    sc.exe delete AtlasNetworkService | Out-Null
+    if (Get-Service AtlasNetworkService -ErrorAction SilentlyContinue) {
+        & $maintenance --prepare-install (Recovery-Root)
+        if ($LASTEXITCODE -ne 0) { throw 'Disposable fixture cleanup failed' }
+        sc.exe delete AtlasNetworkService | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Disposable fixture service removal failed' }
+    }
 }
