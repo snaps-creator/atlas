@@ -492,6 +492,7 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             while std::time::Instant::now() < deadline {
                 if let Ok((mut socket, _)) = listener.accept() {
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();

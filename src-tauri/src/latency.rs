@@ -342,6 +342,7 @@ mod tests {
                     assert!(std::time::Instant::now() < deadline);
                     thread::sleep(Duration::from_millis(10));
                 };
+                connection.set_nonblocking(false).unwrap();
                 connection.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                 let _ = connection.read(&mut [0;2048]);
                 if !responds { continue; }

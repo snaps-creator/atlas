@@ -42,3 +42,9 @@ The legacy inventory contains uninstall.exe. Native uninstall replayed those rel
 NSIS now records the native uninstall result. The acceptance captures the process handle before waiting, reports the actual exit code, retains the diagnostic log on failure, and checks removal of launcher/helper, journal, version tree and uninstall registration in addition to service/network cleanup. No failure is converted to success.
 
 Local NSIS compilation (without installation), PowerShell syntax and 19 package/signature contracts passed. Full backend passed: 202 library, 47 maintenance, 58 updater tests; the opt-in provider test and child drivers remain separately scoped. The new signed CI cycle is pending; its final result must be checked before declaring system acceptance complete.
+
+## Follow-up: deterministic Windows test-socket failure
+
+The first PR check (37681617042, job 112998822232) failed in the auto-selected uplink probe fixture with WSAEWOULDBLOCK (10035). Its nonblocking listener yielded an accepted socket that was read immediately without resetting its mode. A read timeout does not clear the inherited nonblocking mode on Windows. An isolated Winsock reproduction returned 10035 immediately, then received the delayed request after explicitly switching the accepted socket to blocking mode.
+
+The uplink fixture and four analogous fixtures now explicitly set blocking mode before reading. These changes are confined to test code. The uplink regression passed 30 consecutive executions, and the complete backend suite passed again (202 library, 47 maintenance, 58 updater; unchanged explicitly scoped ignored tests). Final signed-system CI results are recorded in PR #58 after completion; this local result alone is not an installed-system acceptance claim.

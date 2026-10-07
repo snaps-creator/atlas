@@ -467,6 +467,7 @@ mod tests {
                     let wait=wait.clone();
                     let slow_finished=slow_finished.clone();
                     std::thread::spawn(move || {
+                        socket.set_nonblocking(false).unwrap();
                         socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                         let mut request=[0;4096]; let n=socket.read(&mut request).unwrap_or(0);
                         let request=String::from_utf8_lossy(&request[..n]);

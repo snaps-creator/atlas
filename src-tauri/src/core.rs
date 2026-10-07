@@ -1047,6 +1047,7 @@ mod integration_tests {
         let worker = thread::spawn(move || {
             while worker_alive.load(Ordering::SeqCst) {
                 if let Ok((mut stream, _)) = origin.accept() {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();

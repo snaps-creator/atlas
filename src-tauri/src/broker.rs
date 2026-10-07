@@ -1291,6 +1291,10 @@ mod tests {
                         Err(error)=>panic!("uplink fixture accept: {error}"),
                     }
                 };
+                // Winsock accepted sockets inherit the listener's nonblocking
+                // mode. A read timeout does not clear it: an early read would
+                // sporadically fail with WSAEWOULDBLOCK before the HTTP request.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut request=Vec::new(); let mut buffer=[0u8;1024];
                 while !request.windows(4).any(|w|w==b"\r\n\r\n") {
