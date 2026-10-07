@@ -19,6 +19,9 @@ $candidateFiles = Join-Path $fixture 'candidate'
 & $sevenZip x $candidate "-o$candidateFiles" -y | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Candidate extraction failed' }
 $maintenance = Join-Path $candidateFiles 'AtlasMaintenance.exe'
+$transactional = Test-Path -LiteralPath (Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasUpdater.exe')
+if ($transactional) { $maintenance = Join-Path $candidateFiles '$PLUGINSDIR/payload/AtlasMaintenance.exe' }
+$activeRoot = $installRoot
 function Install-Checked([string]$path) {
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
@@ -99,12 +102,24 @@ rules:
     if ($desktop.HasExited) { throw 'Old desktop fixture failed to remain open' }
     Install-Checked $candidate
     if (-not $core.WaitForExit(5000) -or -not $desktop.WaitForExit(5000)) { throw 'Update left old Atlas processes running' }
-    $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $null -ne $inspection.activeLuid) { throw 'Update left an active or unverified Atlas-TUN' }
+    if ($transactional) {
+        $journal = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+        if ($journal.stage -ne 'Committed') { throw 'Upgrade was not durably committed' }
+        $activeRoot = Join-Path $installRoot ('versions/' + $journal.active.id)
+        $expectedVersion = (Get-Content (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version
+        if ($journal.active.version -ne $expectedVersion) { throw 'Wrong active version after upgrade' }
+        # Commit already checked authenticated UI/service readiness. Stop this
+        # disposable runner's candidate before the independent TUN reuse test.
+        & $maintenance --prepare-install $installRoot
+        if ($LASTEXITCODE -ne 0) { throw 'Committed candidate did not quiesce' }
+    }
+    $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+    $baseline = if ($inspection.PSObject.Properties.Name -contains 'baselineReady') { $inspection.baselineReady } else { $null -eq $inspection.activeLuid }
+    if ($LASTEXITCODE -ne 0 -or -not $baseline) { throw 'Update left an active or unverified Atlas-TUN' }
     if ((Get-Service AtlasNetworkService).Status -ne 'Stopped') { throw 'Service still runs after update' }
-    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $installRoot 'Atlas.exe')
+    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe')
     Write-Output 'PASS: signed 2.2.3 -> candidate upgrade with real active Wintun, service and desktop; old processes exited, tunnel released, new UI rendered.'
-    $core = Start-Process -FilePath (Join-Path $installRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
+    $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
         if ($core.HasExited) { throw 'New core cannot reopen the released tunnel' }
@@ -113,31 +128,50 @@ rules:
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($adapter.Status -ne 'Up') { throw 'New core failed to reconnect after the upgrade' }
-    $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+    $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $inspection.verifiedWintunDriver) { throw 'Live Wintun driver identity was not verified' }
     $core.Kill()
     $core.WaitForExit(5000) | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
-        $inspection = & (Join-Path $installRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
+        $inspection = & (Join-Path $activeRoot 'AtlasMaintenance.exe') --inspect | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw 'Post-exit adapter inspection failed' }
-        if ($inspection.baselineReady -eq $true) { break }
+        $hasRecoveryBaseline = $inspection.PSObject.Properties.Name -contains 'baselineReady'
+        if (($hasRecoveryBaseline -and $inspection.baselineReady -eq $true) -or
+            (-not $hasRecoveryBaseline -and $null -eq $inspection.activeLuid)) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
-    if ($inspection.baselineReady -ne $true) { throw 'Exited core left an unverified recovery baseline' }
-    $handshake = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--check-network-service' -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $fixture 'ipc-reconnect.err')
-    if (-not $handshake.WaitForExit(25000)) { $handshake.Kill(); throw 'Service channel reconnect timed out' }
-    if ($handshake.ExitCode -ne 0) { throw 'Service channel reconnect changed process/session identity or failed' }
-    Write-Output 'PASS: control channel reconnect preserves SCM PID and network epoch.'
+    if (($hasRecoveryBaseline -and $inspection.baselineReady -ne $true) -or
+        (-not $hasRecoveryBaseline -and $null -ne $inspection.activeLuid)) { throw 'Exited core left an unverified recovery baseline' }
+    if ($hasRecoveryBaseline) {
+        $handshake = Start-Process -FilePath (Join-Path $activeRoot 'Atlas.exe') -ArgumentList '--check-network-service' -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $fixture 'ipc-reconnect.err')
+        if (-not $handshake.WaitForExit(25000)) { $handshake.Kill(); throw 'Service channel reconnect timed out' }
+        if ($handshake.ExitCode -ne 0) { throw 'Service channel reconnect changed process/session identity or failed' }
+        Write-Output 'PASS: control channel reconnect preserves SCM PID and network epoch.'
+    }
     Write-Output 'PASS: new core can reopen Atlas-TUN after the upgrade.'
+    $start.FileName = Join-Path $activeRoot 'Atlas.exe'
     $desktop = [Diagnostics.Process]::Start($start)
     Start-Sleep -Milliseconds 300
     if ($desktop.HasExited) { throw 'Disconnected desktop fixture failed to remain open' }
     Install-Checked $candidate
-    if (-not $desktop.WaitForExit(5000)) { throw 'Update left the disconnected desktop running' }
+    if (-not $transactional -and -not $desktop.WaitForExit(5000)) { throw 'Update left the disconnected desktop running' }
+    if (-not $desktop.HasExited) { $desktop.Kill(); $desktop.WaitForExit(5000) | Out-Null }
     Write-Output 'PASS: installation succeeds with Atlas open and tunnel disconnected.'
     Install-Checked $candidate
     Write-Output 'PASS: installation also succeeds with Atlas closed and tunnel disconnected.'
+    if ($transactional) {
+        foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
+            $uninstaller = Join-Path $installRoot 'uninstall.exe'
+            $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
+            if (-not $remove.WaitForExit(180000) -or $remove.ExitCode -ne 0) { throw "Failed $cycle" }
+            if (Get-Service AtlasNetworkService -ErrorAction SilentlyContinue) { throw 'Uninstall left the Atlas service' }
+            $inspection = & $maintenance --inspect | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Uninstall did not restore the network baseline' }
+            Write-Output "PASS: $cycle; service removed and network baseline restored."
+            if ($cycle -eq 'upgrade uninstall') { Install-Checked $candidate }
+        }
+    }
 } finally {
     foreach ($process in @($core,$desktop)) {
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }

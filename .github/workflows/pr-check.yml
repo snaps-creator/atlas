@@ -24,11 +24,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 22.23.3
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -36,13 +36,15 @@ jobs:
           workspaces: src-tauri -> ../t
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          npm install --global npm@11.16.0
+          npm ci
 
       - name: Test frontend
         run: npm test
 
       - name: Test updater signature verification
-        run: node --test scripts/verify-installer.check.cjs
+        run: node --test scripts/*.check.cjs
 
       - name: Verify offline source-archive installer
         shell: pwsh
@@ -63,7 +65,7 @@ jobs:
           }
 
       - name: Test backend
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance --bin AtlasUpdater
 
       - name: Check production build
         run: npm run build

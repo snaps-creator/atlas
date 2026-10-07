@@ -1,8 +1,14 @@
 param([Parameter(Mandatory=$true)][string]$Installer)
 $ErrorActionPreference = 'Stop'
+& node (Join-Path $PSScriptRoot 'check-updater-readiness.cjs')
+if ($LASTEXITCODE -ne 0) { throw 'Updater readiness blocks publication' }
 if (-not $env:GITHUB_TOKEN -or -not $env:GITHUB_REPOSITORY -or -not $env:GITHUB_SHA) { throw 'GitHub publication context is missing' }
 & (Join-Path $PSScriptRoot 'test-packaged-installer.ps1') -Installer $Installer
 $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+$signedManifest = Join-Path (Split-Path $Installer -Parent) 'update-manifest.json'
+foreach ($required in @($signedManifest,"$signedManifest.sig")) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw 'Signed transactional manifest is missing' }
+}
 $name = Split-Path $Installer -Leaf
 $tag = "v$version"
 $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
@@ -18,10 +24,11 @@ $manifest = @{
 }
 $manifestPath = Join-Path (Split-Path $Installer -Parent) 'latest.json'
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
-# Keep the previous channel live until all three assets are uploaded.
+# Keep the previous channel live until both discovery and authenticated native
+# update metadata have been uploaded with the complete installer.
 $body = @{tag_name=$tag;target_commitish=$env:GITHUB_SHA;name="Atlas $version";body=$manifest.notes;draft=$true;prerelease=$false} | ConvertTo-Json
 $release = Invoke-RestMethod -Method Post "$base/releases" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
-foreach ($file in @($Installer,"$Installer.sig",$manifestPath)) {
+foreach ($file in @($Installer,"$Installer.sig",$manifestPath,$signedManifest,"$signedManifest.sig")) {
     $assetName = [Uri]::EscapeDataString((Split-Path $file -Leaf))
     $url = $release.upload_url.Split('{')[0] + '?name=' + $assetName
     Invoke-RestMethod -Method Post $url -Headers $headers -ContentType 'application/octet-stream' -InFile $file | Out-Null
