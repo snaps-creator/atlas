@@ -92,6 +92,21 @@ impl Windows {
         }
         Ok(self.path(version))
     }
+    // Validate all durable SCM fields before allowing a recovery start. Never
+    // repair a foreign service by changing its ImagePath or account here.
+    fn configured_service(&self,version:&Version,writable:bool)->Result<Option<Service>,String>{
+        if version.absent{return if Service::exists()?{Err("Rollback left a newly created Atlas service".into())}else{Ok(None)};}
+        let service=Service::open(writable)?;
+        let configuration=service.configuration()?;
+        let expected=crate::update_service::command(&self.service_directory(version)?)?;
+        if self.state.service.as_ref().is_some_and(|snapshot|configuration!=snapshot.with_binary(expected.clone())) || configuration.binary!=expected {
+            return Err("Active service configuration differs from the transaction".into());
+        }
+        if self.state.service.is_none() && (configuration.service_type!=16 || configuration.start_type!=3 || !configuration.account.eq_ignore_ascii_case("LocalSystem")) {
+            return Err("New Atlas service has unexpected account or start configuration".into());
+        }
+        Ok(Some(service))
+    }
     fn roots(&self)->Vec<PathBuf>{vec![self.root.clone(),self.path(&self.previous),self.path(&self.candidate)]}
     fn allowed(&self)->Result<Vec<String>,String>{self.roots().iter().map(|p|crate::update_service::command(p)).collect()}
 }
@@ -139,16 +154,7 @@ impl Platform for Windows {
         Ok(())
     }
     fn inspect_service(&mut self,version:&Version)->Result<(),String>{
-        if version.absent{return if Service::exists()?{Err("Rollback left a newly created Atlas service".into())}else{Ok(())};}
-        let service=Service::open(false)?;
-        let configuration=service.configuration()?;
-        let expected=crate::update_service::command(&self.service_directory(version)?)?;
-        if self.state.service.as_ref().is_some_and(|snapshot|configuration!=snapshot.with_binary(expected.clone())) || configuration.binary!=expected {
-            return Err("Active service configuration differs from the transaction".into());
-        }
-        if self.state.service.is_none() && (configuration.service_type!=16 || configuration.start_type!=3 || !configuration.account.eq_ignore_ascii_case("LocalSystem")) {
-            return Err("New Atlas service has unexpected account or start configuration".into());
-        }
+        let Some(service)=self.configured_service(version,false)? else {return Ok(());};
         let status=service.status()?;
         if status.dwCurrentState!=windows_sys::Win32::System::Services::SERVICE_RUNNING || status.dwProcessId==0 {
             return Err(format!("Active Atlas service is not running: state={}, pid={}, win32={}, service={}",status.dwCurrentState,status.dwProcessId,status.dwWin32ExitCode,status.dwServiceSpecificExitCode));
@@ -160,6 +166,13 @@ impl Platform for Windows {
             return Err("Atlas service process changed during activation".into());
         }
         Ok(())
+    }
+    fn resume_service(&mut self,version:&Version)->Result<(),String>{
+        let Some(service)=self.configured_service(version,true)? else {return Ok(());};
+        // start() preserves a running PID and waits through an idle STOP_PENDING.
+        // Activation/health keep their stricter uninterrupted-PID checks.
+        self.service_pid=Some(service.start(Duration::from_secs(30))?);
+        self.inspect_service(version)
     }
     fn health(&mut self,tx:&Transaction)->Result<(),String>{
         let version=&tx.journal.candidate;

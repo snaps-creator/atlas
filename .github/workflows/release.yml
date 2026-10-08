@@ -13,7 +13,11 @@ permissions:
   contents: write
 
 jobs:
+  release-readiness:
+    uses: ./.github/workflows/updater-readiness.yml
+
   publish-windows:
+    needs: release-readiness
     runs-on: windows-latest
     env:
       ATLAS_BUILD_ID: ${{ github.sha }}
@@ -57,7 +61,7 @@ jobs:
         run: npm test
 
       - name: Test updater verification contracts
-        run: node --test scripts/verify-update-contract.check.cjs scripts/updater-safety.check.cjs scripts/verify-package-content.check.cjs scripts/create-update-manifest.check.cjs
+        run: node --test scripts/*.check.cjs
 
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance --bin AtlasUpdater

@@ -296,6 +296,11 @@ rules:
     Install-Checked $candidate
     Write-Output 'PASS: installation also succeeds with Atlas closed and tunnel disconnected.'
     if ($transactional) {
+        & (Join-Path $PSScriptRoot 'test-installed-recovery.ps1') -InstallRoot $installRoot -Maintenance $maintenance
+        Install-Checked $candidate
+        $reinstalled = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+        if ($reinstalled.stage -ne 'Committed' -or $reinstalled.active.id -ne $journal.candidate.id) { throw 'Reinstall after recovery did not commit the candidate' }
+        Write-Output 'PASS: candidate reinstalls successfully after installed rollback and repeated recovery.'
         foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
             $uninstaller = Join-Path $installRoot 'uninstall.exe'
             $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru

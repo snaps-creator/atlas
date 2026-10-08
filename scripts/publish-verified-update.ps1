@@ -1,32 +1,29 @@
-param([Parameter(Mandatory=$true)][string]$Installer)
+param([Parameter(Mandatory=$true)][string]$Installer, [switch]$VerifyOnly)
 $ErrorActionPreference = 'Stop'
 & node (Join-Path $PSScriptRoot 'check-updater-readiness.cjs')
-if ($LASTEXITCODE -ne 0) { throw 'Updater readiness blocks publication' }
-if (-not $env:GITHUB_TOKEN -or -not $env:GITHUB_REPOSITORY -or -not $env:GITHUB_SHA) { throw 'GitHub publication context is missing' }
-& (Join-Path $PSScriptRoot 'test-packaged-installer.ps1') -Installer $Installer
-$version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-$signedManifest = Join-Path (Split-Path $Installer -Parent) 'update-manifest.json'
-foreach ($required in @($signedManifest,"$signedManifest.sig")) {
-    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw 'Signed transactional manifest is missing' }
+if ($LASTEXITCODE -ne 0) { throw 'Updater publication policy blocks preparation' }
+if (-not $env:GITHUB_REPOSITORY -or -not $env:ATLAS_BUILD_ID) { throw 'GitHub build/repository context is missing' }
+if (-not $VerifyOnly -and (-not $env:GITHUB_TOKEN -or $env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_REF -ne 'refs/heads/main' -or $env:ATLAS_BUILD_ID -ne $env:GITHUB_SHA)) {
+    throw 'Publication requires the verified main CI build and GitHub authorization'
 }
-$name = Split-Path $Installer -Leaf
-$tag = "v$version"
+& (Join-Path $PSScriptRoot 'test-packaged-installer.ps1') -Installer $Installer
+& node (Join-Path $PSScriptRoot 'prepare-release.cjs') $Installer
+if ($LASTEXITCODE -ne 0) { throw 'Signed release metadata preparation failed' }
+$directory = Split-Path $Installer -Parent
+$prepared = Get-Content -LiteralPath (Join-Path $directory 'release-preparation.json') -Raw | ConvertFrom-Json
+$manifestPath = Join-Path $directory 'latest.json'
+$signedManifest = Join-Path $directory 'update-manifest.json'
+if ($VerifyOnly) {
+    Write-Output 'PASS: complete signed publication preparation; no GitHub release or upload performed.'
+    return
+}
+# PR dry-run and actual publication use identical validation and metadata above.
+# GitHub mutations are confined to this branch, after all preparation succeeds.
+$tag = $prepared.tag
+$manifest = $prepared.latest
 $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
 $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'Atlas-release' }
-$manifest = @{
-    version = $version
-    notes = 'Восстановление сети Atlas: повторная проверка очистки, переподключение канала службы, проверка подписки до применения и точные ошибки URL. Подробности — в docs/UPDATES.md.'
-    pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    platforms = @{ 'windows-x86_64' = @{
-        signature = (Get-Content -LiteralPath "$Installer.sig" -Raw).Trim()
-        url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$name"
-    }}
-}
-$manifestPath = Join-Path (Split-Path $Installer -Parent) 'latest.json'
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
-# Keep the previous channel live until both discovery and authenticated native
-# update metadata have been uploaded with the complete installer.
-$body = @{tag_name=$tag;target_commitish=$env:GITHUB_SHA;name="Atlas $version";body=$manifest.notes;draft=$true;prerelease=$false} | ConvertTo-Json
+$body = @{tag_name=$tag;target_commitish=$env:GITHUB_SHA;name="Atlas $($manifest.version)";body=$manifest.notes;draft=$true;prerelease=$false} | ConvertTo-Json
 $release = Invoke-RestMethod -Method Post "$base/releases" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
 foreach ($file in @($Installer,"$Installer.sig",$manifestPath,$signedManifest,"$signedManifest.sig")) {
     $assetName = [Uri]::EscapeDataString((Split-Path $file -Leaf))

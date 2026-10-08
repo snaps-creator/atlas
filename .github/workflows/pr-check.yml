@@ -7,6 +7,9 @@ permissions:
   contents: read
 
 jobs:
+  release-readiness:
+    uses: ./.github/workflows/updater-readiness.yml
+
   test:
     runs-on: windows-latest
     env:

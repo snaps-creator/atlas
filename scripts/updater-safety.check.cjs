@@ -1,11 +1,15 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const cp=require('node:child_process');
 const {check}=require('./check-updater-readiness.cjs');
-test('readiness refuses every incomplete gate, including signed artifact',()=>{
-  const value={phase0:Object.fromEntries(['P0-A','P0-B','P0-C','P0-D'].map(k=>[k,'PASS'])),releaseReady:true};
-  for(const k of ['buildProvenance','packageVerification','signatureVerification','transactionSafety','rollback','crashRecovery','networkRecovery','integrationTests'])value[k]='PASS';
-  check(value);for(const k of Object.keys(value).filter(k=>!['phase0','releaseReady'].includes(k))){assert.throws(()=>check({...value,[k]:'NOT VERIFIED'}));}
-  assert.throws(()=>check({...value,phase0:{...value.phase0,'P0-C':'BLOCKED'}}));
-  assert.throws(()=>check({...value,releaseReady:false}));
+test('publication policy cannot omit automated checks or conceal untested reboot',()=>{
+  const value=JSON.parse(fs.readFileSync('updater-readiness.json'));
+  check(value,value.version);
+  for(const required of value.requiredChecks) assert.throws(()=>check({...value,requiredChecks:value.requiredChecks.filter(k=>k!==required)}));
+  assert.throws(()=>check({...value,schema:1,releaseReady:true}));
+  assert.throws(()=>check({...value,releaseReady:true}));
+  assert.throws(()=>check(value,'9.9.9'));
+  assert.throws(()=>check({...value,acceptedRisks:[]}));
+  assert.throws(()=>check({...value,acceptedRisks:value.acceptedRisks.map(r=>({...r,status:'PASS'}))}));
+  assert.throws(()=>check({...value,acceptedRisks:value.acceptedRisks.map(r=>({...r,accepted:false}))}));
 });
 test('unverified legacy installation cannot be invoked by frontend',()=>{
   const safe=c=>!c.permissions.some(p=>['updater:default','updater:allow-install','updater:allow-download-and-install'].includes(p));

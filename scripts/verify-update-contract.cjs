@@ -7,7 +7,8 @@ function verifyUpdate({ manifestBytes, manifestSignature, artifact, publicKey, e
   // Authenticate the exact manifest bytes before interpreting its destinations.
   verifySignature(manifestBytes, manifestSignature, publicKey);
   const manifest = JSON.parse(manifestBytes.toString('utf8'));
-  if (manifest.schema !== 1 || manifest.version !== expected.version ||
+  if (![1, 2].includes(manifest.schema) || (manifest.schema === 2 && manifest.installer_kind !== 'transactional-v1') ||
+      (expected.schema !== undefined && manifest.schema !== expected.schema) || manifest.version !== expected.version ||
       manifest.build !== expected.build || manifest.platform !== 'windows-x86_64' ||
       manifest.asset !== expected.asset || manifest.url !== expected.url ||
       manifest.version !== expected.installerVersion) throw Error('Manifest identity mismatch');
