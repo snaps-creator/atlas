@@ -76,20 +76,26 @@ $cases = @(
     @{name='D';windows=$false;auto=$true;tray=$false;restore=$false;was=$false;explicit=$false;connect=$true},
     @{name='E';windows=$false;auto=$true;tray=$true;restore=$false;was=$false;explicit=$false;connect=$true},
     @{name='F';windows=$false;auto=$false;tray=$true;restore=$true;was=$true;explicit=$false;connect=$true},
-    @{name='G';windows=$false;auto=$false;tray=$false;restore=$true;was=$false;explicit=$true;connect=$false}
+    @{name='G';windows=$false;auto=$false;tray=$false;restore=$true;was=$false;explicit=$true;connect=$false},
+    @{name='H';windows=$false;auto=$false;tray=$true;restore=$false;was=$false;explicit=$true;connect=$false}
 )
 try {
     Quiesce
     Fixture verify | Write-Output
     foreach ($case in $cases) {
         $patch=@{startup=@{launchWithWindows=$case.windows;autoConnect=$case.auto;startInTray=$case.tray;restoreConnection=$case.restore;delaySeconds=1};wasConnected=$case.was;userDisconnected=$case.explicit;lastWindowHidden=$case.tray}
+        if ($case.name -eq 'H') { $patch.startup.startInTray=$false } # Manual restart retains recorded hidden state.
         Fixture patch ($patch | ConvertTo-Json -Compress) | Out-Null
         if (Test-Path -LiteralPath $history) { Clear-Content -LiteralPath $history }
         [AtlasWindowHistory]::Start()
         try {
             $arguments=@('--launch'); if ($case.windows) { $arguments+='--autostart' }
-            $launch=Start-Process -FilePath (Join-Path $InstallRoot 'AtlasUpdater.exe') -ArgumentList $arguments -PassThru -WindowStyle Hidden
-            if (-not $launch.WaitForExit(30000) -or $launch.ExitCode -ne 0) { throw 'Stable launcher failed' }
+            if ($case.name -eq 'H') {
+                $launch=Start-Process -FilePath $desktopExe -ArgumentList '--manual-restart' -PassThru -WindowStyle Hidden
+            } else {
+                $launch=Start-Process -FilePath (Join-Path $InstallRoot 'AtlasUpdater.exe') -ArgumentList $arguments -PassThru -WindowStyle Hidden
+                if (-not $launch.WaitForExit(30000) -or $launch.ExitCode -ne 0) { throw 'Stable launcher failed' }
+            }
             $deadline=[DateTime]::UtcNow.AddSeconds(55)
             do {
                 $owners=@(Get-CimInstance Win32_Process -Filter "Name='Atlas.exe'" | Where-Object { $_.ExecutablePath -eq $desktopExe -and $_.CommandLine -notmatch '--type=' })
@@ -120,6 +126,21 @@ try {
             }
             Fixture verify | Write-Output
             Write-Output "PASS installed startup $($case.name): $expected; tray=$($case.tray); connect count=$($connected.Count); visible events=$($shown.Count)"
+            if ($case.name -eq 'D') {
+                foreach ($step in @(@{button='Отключить VPN';connected=$false},@{button='Подключить VPN';connected=$true},@{button='Отключить VPN';connected=$false})) {
+                    # UIAutomation uses the real React action and backend IPC.
+                    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-button.ps1') -ProcessId $owners[0].ProcessId -Name $step.button
+                    if ($LASTEXITCODE -ne 0) { throw 'Installed connect/disconnect interaction failed' }
+                    $deadline=[DateTime]::UtcNow.AddSeconds(30)
+                    do {
+                        $saved=Fixture state | ConvertFrom-Json
+                        if ($saved.wasConnected -eq $step.connected -and $saved.userDisconnected -eq (-not $step.connected)) { break }
+                        Start-Sleep -Milliseconds 250
+                    } while ([DateTime]::UtcNow -lt $deadline)
+                    if ($saved.wasConnected -ne $step.connected -or $saved.userDisconnected -ne (-not $step.connected)) { throw 'Explicit connection intent was not persisted' }
+                }
+                Write-Output 'PASS: real UI disconnect, reconnect, explicit disconnect persisted'
+            }
         } finally { [AtlasWindowHistory]::Stop(); Quiesce }
     }
 } finally { Quiesce }
