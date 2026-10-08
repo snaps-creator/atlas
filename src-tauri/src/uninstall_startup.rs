@@ -1,7 +1,7 @@
 //! Remove only startup registrations owned by this installation. The elevated
 //! helper may run under a different account, so inspect loaded user hives.
 use std::path::Path;
-use winreg::{enums::*, RegKey};
+use winreg::{enums::*, types::FromRegValue, RegKey};
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 fn normalized(path: &str) -> String {
@@ -43,11 +43,17 @@ fn cleanup_user(user: &RegKey, root: &Path) -> Result<(), String> {
     let Some(run) = optional_key(user, RUN)? else {
         return Ok(());
     };
-    let command = match run.get_value::<String, _>("Atlas") {
+    let value = match run.get_raw_value("Atlas") {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("Cannot read Atlas startup registration: {error}")),
     };
+    // Unknown value types cannot be a command registered by Atlas. Preserve
+    // them instead of letting another user's unrelated entry block uninstall.
+    if !matches!(value.vtype, REG_SZ | REG_EXPAND_SZ) {
+        return Ok(());
+    }
+    let command = String::from_reg_value(&value).map_err(|error| error.to_string())?;
     if !owned(&command, root) {
         return Ok(());
     }
@@ -106,6 +112,12 @@ mod tests {
         }
         let _cleanup = Cleanup(name);
         let root = Path::new(r"C:\Atlas");
+        let (foreign, _) = fixture.create_subkey("foreign-non-string").unwrap();
+        let (foreign_run, _) = foreign.create_subkey(RUN).unwrap();
+        foreign_run.set_value("Atlas", &7u32).unwrap();
+        cleanup_user(&foreign, root).unwrap();
+        assert_eq!(foreign_run.get_value::<u32, _>("Atlas").unwrap(), 7);
+
         for (account, command) in [
             (
                 "interactive",
