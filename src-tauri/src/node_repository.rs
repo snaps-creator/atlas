@@ -16,17 +16,7 @@ pub fn identity(node: &Value) -> String {
 }
 pub fn node_id(node: &Value) -> Option<&str> {node["atlas"]["nodeId"].as_str()}
 
-fn logical_name(name: &str) -> &str {
-    let Some((prefix,suffix))=name.rsplit_once('-') else {return name};
-    let digest=suffix.len()==16 && suffix.bytes().all(|b|b.is_ascii_hexdigit());
-    let legacy=!suffix.is_empty() && suffix.bytes().all(|b|b.is_ascii_digit());
-    if prefix.contains(" · ") && (digest||legacy) {prefix} else {name}
-}
-pub fn remap_name<'a>(selected:&str,available:&[&'a str])->Option<&'a str> {
-    if let Some(exact)=available.iter().copied().find(|n|*n==selected) {return Some(exact);}
-    let mut matches=available.iter().copied().filter(|n|logical_name(n)==logical_name(selected));
-    let first=matches.next()?;matches.next().is_none().then_some(first)
-}
+pub use crate::node_name::remap_name;
 
 pub fn normalize(settings:&mut Settings) {
     let mut used=std::collections::HashSet::new();

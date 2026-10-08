@@ -243,6 +243,7 @@ impl Store {
     }
     /// SQLite takes a consistent snapshot including WAL contents. Copying only
     /// atlas.db would silently omit recently committed subscriptions/settings.
+    #[cfg(test)]
     pub fn update_snapshot(&self, destination: &Path) -> Result<(), String> {
         if destination.exists() {
             return Err("Snapshot destination already exists".into());
@@ -279,6 +280,16 @@ impl Store {
         tx.execute("INSERT INTO state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![data]).map_err(|e|e.to_string())?;
         tx.execute("DELETE FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY id DESC LIMIT 20)",[]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+    /// Durable runtime fields must not consume a user configuration checkpoint.
+    pub fn save_runtime(&mut self, settings: &Settings) -> Result<(), String> {
+        let mut persisted = self.load()?;
+        persisted.last_window_hidden = settings.last_window_hidden;
+        persisted.was_connected = settings.was_connected;
+        persisted.user_disconnected = settings.user_disconnected;
+        let data = crypt(&serde_json::to_vec(&persisted).map_err(|e|e.to_string())?, true)?;
+        self.db.execute("INSERT INTO state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![data]).map_err(|e|e.to_string())?;
+        Ok(())
     }
     pub fn previous(&self) -> Result<Settings, String> {
         let data: Vec<u8> = self
@@ -330,6 +341,38 @@ mod tests {
         db.query_row("SELECT payload FROM state WHERE id=1", [], |r| r.get(0))
             .unwrap()
     }
+    #[test]
+    fn window_visibility_does_not_evict_configuration_history() {
+        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let mut settings=Settings::default();store.save(&settings).unwrap();
+        settings.theme="dark".into();store.save(&settings).unwrap();
+        for index in 0..30 {settings.last_window_hidden=index%2==0;store.save_runtime(&settings).unwrap();}
+        assert_eq!(store.previous().unwrap().theme,"system");
+        assert_eq!(store.load().unwrap().theme,"dark");
+        assert_eq!(store.load().unwrap().last_window_hidden,settings.last_window_hidden);
+        assert_eq!(store.db.query_row("SELECT COUNT(*) FROM backups",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[test]
+    fn delete_source_then_rollback_refuses_missing_credential_without_mutation() {
+        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let before=decode_settings(&serde_json::to_vec(&legacy_fixture()).unwrap()).unwrap();
+        store.save(&before).unwrap();
+        let deleted_id=before.subscriptions[0].id.clone();
+        let mut after=before.clone(); after.subscriptions.remove(0);
+        crate::model::repository::reconcile_references(&before,&mut after);
+        store.save(&after).unwrap();
+        let encrypted=payload(&store.db);
+        let backup=store.previous().unwrap();
+        let credentials=after.subscriptions.iter().map(|s|s.id.clone()).collect::<std::collections::HashSet<_>>();
+        let result=crate::settings_write::require_credentials(&backup,|id|credentials.contains(id));
+        assert!(result.is_err());
+        assert!(!credentials.contains(&deleted_id));
+        assert_eq!(payload(&store.db),encrypted);
+        assert_eq!(store.load().unwrap().subscriptions.len(),after.subscriptions.len());
+        assert_eq!(store.load().unwrap().selected_node_id,after.selected_node_id);
+        assert_eq!(store.load().unwrap().favorites,after.favorites);
+    }
+
     #[test]
     fn schema3_migrates_all_sources_and_preserves_encrypted_original() {
         let fixture = legacy_fixture();

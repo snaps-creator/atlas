@@ -1,6 +1,6 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { SubscriptionCard } from "./SubscriptionCard";
-import { allSubscriptions, sourceLabels, validSubscriptionInput, serverSelectionPayload, isServerSelected, isFavorite, toggleFavorite } from "./subscriptionSource";
+import { allSubscriptions, sourceLabels, validSubscriptionInput, serverSelectionPayload, isServerSelected, isFavorite } from "./subscriptionSource";
 import type { SubscriptionSource } from "./types";
 import { diagnosticEvent } from "./diagnosticEvents";
 import React, { useEffect, useState, useCallback, useRef } from "react";
@@ -318,7 +318,7 @@ function App() {
     }
   }
   async function save(s: Settings) {
-    await act("save", s);
+    await act("save", { settings: s, revision: data?.revision });
   }
   function run(f: () => Promise<unknown>) {
     void f().catch(() => {});
@@ -523,7 +523,7 @@ function App() {
           {nav.map(([p, Icon]) => (
             <button
               key={p}
-              className={page === p ? "active" : ""}
+              className={`${page === p ? "active" : ""}${p === "Updates" ? " update-attention" : ""}`}
               onClick={() => setPage(p)}
             >
               <Icon size={18} strokeWidth={1.7} />
@@ -946,7 +946,7 @@ function App() {
                             testing={latencies[n.name]?.status === "testing"}
                             onSelect={() => s && run(() => act("select", serverSelectionPayload(n)))}
                             onTest={() => run(() => test(n.name))}
-                            onFavorite={() => s && run(() => save({ ...s, favorites: toggleFavorite(s.favorites, n) }))}
+                            onFavorite={() => s && run(() => act("favorite", { nodeId: n.nodeId, enabled: !isFavorite(s.favorites, n) }))}
                           />
                         ))}
                     </div>

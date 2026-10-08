@@ -40,6 +40,7 @@ fn committed_for(value:&serde_json::Value,transaction:&str,directory:&str)->bool
     value["active"]["version"]==env!("CARGO_PKG_VERSION") && value["active"]["build"]==env!("ATLAS_BUILD_ID")
 }
 impl Report {
+#[allow(dead_code, reason = "Used by the native updater target; shared with the desktop target")]
     pub fn validate(&self,transaction:&str,nonce:&str,version:&str,build:&str,pid:u32)->Result<(),String> {
         if self.transaction_id!=transaction || self.nonce!=nonce || self.version!=version || self.build!=build || self.pid!=pid || pid==0 || self.service_pid==0 ||
             !self.ui_ready || !self.settings_readable || !self.subscriptions_readable || !self.service_ready || self.helper_protocol!=1 {return Err("Candidate health contract failed".into());}Ok(())

@@ -1,21 +1,6 @@
 use serde_json::Value;
 
-// Subscription reconciliation appends a source ID and configuration digest.
-// Preserve a logical node across credential rotation only when unambiguous.
-fn logical_name(name: &str) -> &str {
-    let Some((prefix, suffix)) = name.rsplit_once('-') else { return name };
-    let digest=suffix.len()==16 && suffix.bytes().all(|b|b.is_ascii_hexdigit());
-    let legacy_index=!suffix.is_empty() && suffix.bytes().all(|b|b.is_ascii_digit());
-    if prefix.contains(" · ") && (digest || legacy_index) {
-        prefix
-    } else { name }
-}
-pub(crate) fn remap_name<'a>(selected: &str, available: &[&'a str]) -> Option<&'a str> {
-    if let Some(exact)=available.iter().copied().find(|n| *n==selected) { return Some(exact); }
-    let mut matches=available.iter().copied().filter(|n|logical_name(n)==logical_name(selected));
-    let first=matches.next()?;
-    matches.next().is_none().then_some(first)
-}
+pub(crate) use crate::node_name::remap_name;
 
 pub(super) fn restore_plan(before: &Value, after: &Value) -> Vec<(String, String)> {
     ["AUTO", "FAILOVER"].into_iter().filter_map(|group| {

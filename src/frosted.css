@@ -129,3 +129,21 @@ nav button.active svg { color:#a88cff; }
 .subscription-entry:last-child { border-bottom: 0; }
 .subscription-type-badge { display: inline-block; margin-left: 25px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 11px; }
 .subscription-entry > .subscription { padding-top: 12px; }
+
+nav button.update-attention {
+  background: #ffd43b;
+  border-color: #ffd43b;
+  color: #000;
+  font-weight: 700;
+  box-shadow: none;
+}
+nav button.update-attention:hover {
+  background: #ffe066;
+  border-color: #ffe066;
+  color: #000;
+}
+nav button.update-attention:focus-visible {
+  outline: 2px solid #ffd43b;
+  outline-offset: 3px;
+}
+nav button.update-attention svg { color: #000; }

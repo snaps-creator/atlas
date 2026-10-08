@@ -51,6 +51,8 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 mod startup;
+mod node_name;
+mod settings_write;
 mod startup_coordinator;
 type StartupState = Arc<Mutex<startup_coordinator::StartupCoordinator>>;
 struct WindowVisibility(Arc<std::sync::atomic::AtomicBool>);
@@ -410,7 +412,7 @@ impl App {
     }
     fn persist_visibility(&mut self,hidden:bool)->Result<(),String> {
         self.settings.last_window_hidden=hidden;
-        self.store.save(&self.settings)
+        self.store.save_runtime(&self.settings)
     }
     fn prepare_restart(&mut self) -> Result<(), String> {
         self.stop_session(false)?;
@@ -517,15 +519,16 @@ impl App {
                 let reference=p["nodeId"].as_str().or_else(||p["name"].as_str()).ok_or("Не выбран сервер")?;
                 let mut next=self.settings.clone();next.select_node(reference)?;self.save(next)?;
             }
+            "favorite" => {
+                let id=p["nodeId"].as_str().ok_or("Нет nodeId")?;
+                let enabled=p["enabled"].as_bool().ok_or("Нет состояния избранного")?;
+                self.save(settings_write::favorite(&self.settings,id,enabled)?)?;
+            }
             "connect" => self.connect()?,
             "disconnect" => self.disconnect()?,
             "save" => {
-                let mut next: Settings =
-                    serde_json::from_value(p).map_err(|_| "Некорректные настройки")?;
-                next.subscriptions = self.settings.subscriptions.clone();
-                next.was_connected=self.settings.was_connected;
-                next.user_disconnected=self.settings.user_disconnected;
-                next.last_window_hidden=self.settings.last_window_hidden;
+                let write: settings_write::Write = serde_json::from_value(p).map_err(|_| "Некорректные настройки или revision")?;
+                let next = write.apply(&self.settings, self.revision)?;
                 let enabled = next.startup.launch_with_windows;
                 let previous = self.settings.startup.launch_with_windows;
                 self.save(next)?;
@@ -548,6 +551,7 @@ impl App {
                 // Download metadata does not alter the active network configuration.
                 self.store.save(&next)?;
                 self.settings = next;
+                self.revision = self.revision.wrapping_add(1);
             }
             "subscription_delete" => {
                 let id = p["id"].as_str().ok_or("Нет ID")?;
@@ -574,8 +578,18 @@ impl App {
                 self.save(next)?;
             }
             "rollback" => {
-                let s = self.store.previous()?;
-                self.save(s)?;
+                let mut s = self.store.previous()?;
+                settings_write::require_credentials(&s, |id| keyring::Entry::new("AtlasVPN",id).and_then(|entry|entry.get_password()).is_ok())?;
+                s.was_connected=self.settings.was_connected;
+                s.user_disconnected=self.settings.user_disconnected;
+                s.last_window_hidden=self.settings.last_window_hidden;
+                let enabled=s.startup.launch_with_windows;
+                let previous=self.settings.startup.launch_with_windows;
+                startup::configure(enabled,false)?;
+                if let Err(error)=self.save(s) {
+                    startup::configure(previous,false).map_err(|rollback|format!("{error}; автозапуск не восстановлен: {rollback}"))?;
+                    return Err(error);
+                }
                 self.log("INFO", "Настройки восстановлены из резервной копии");
             }
             "connections" => return self.core.api("GET", "/connections", None),
@@ -627,6 +641,7 @@ impl App {
 }
 type Shared = Arc<Mutex<App>>;
 struct ConnectionIntent(Arc<std::sync::atomic::AtomicBool>);
+struct ManualRestart(std::sync::atomic::AtomicBool);
 type ShuttingDown = Arc<std::sync::atomic::AtomicBool>;
 pub fn cleanup() -> Result<(), String> {
     let dir = std::path::PathBuf::from(
@@ -1071,9 +1086,10 @@ async fn request_inner(
         }).await.map_err(|e|e.to_string())?;
     }
     let settings_change = if action == "save" {
-        // Reject malformed requests before yielding a connection attempt.
-        serde_json::from_value::<Settings>(payload.clone().unwrap_or(Value::Null))
+        // Reject malformed/stale requests before yielding a connection attempt.
+        let write=serde_json::from_value::<settings_write::Write>(payload.clone().unwrap_or(Value::Null))
             .map_err(|_| "Некорректные настройки")?;
+        write.validate_revision(app.state::<published_state::ReadState>().get()?.revision)?;
         Some(app.state::<cancellation::Cancellation>().settings_change())
     } else { None };
     tauri::async_runtime::spawn_blocking(move || {
@@ -1108,7 +1124,7 @@ fn persist_window_hidden(app:&tauri::AppHandle,hidden:bool) {
     tauri::async_runtime::spawn_blocking(move || {
         if let Ok(mut a)=shared.lock() {
             a.settings.last_window_hidden=visibility.load(std::sync::atomic::Ordering::SeqCst);
-            let settings=a.settings.clone();let _=a.store.save(&settings);
+            let settings=a.settings.clone();let _=a.store.save_runtime(&settings);
         }
     });
 }
@@ -1120,6 +1136,7 @@ fn show_main(app:&tauri::AppHandle) {
 }
 pub fn run() {
     tauri::Builder::default()
+        .manage(ManualRestart(std::sync::atomic::AtomicBool::new(false)))
         .runtime(tauri_runtime_cef::Cef::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
@@ -1334,7 +1351,9 @@ pub fn run() {
                                     let saved=a.persist_visibility(handle.state::<WindowVisibility>().0.load(std::sync::atomic::Ordering::SeqCst));
                                     if saved.and_then(|_|a.prepare_restart()).is_ok() {
                                         drop(a);
-                                        handle.restart()
+                                        handle.state::<ShuttingDown>().store(true,std::sync::atomic::Ordering::SeqCst);
+                                        handle.state::<ManualRestart>().0.store(true,std::sync::atomic::Ordering::SeqCst);
+                                        handle.exit(0)
                                     }
                                 } else {
                                     let _ = a.dispatch(&handle, &action, Value::Null);
@@ -1502,8 +1521,17 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![request,update_health_ready])
-        .run(tauri::generate_context!())
-        .expect("Atlas failed to initialize");
+        .build(tauri::generate_context!())
+        .expect("Atlas failed to initialize")
+        .run(|handle,event| {
+            if matches!(event,tauri::RunEvent::Exit) && handle.state::<ManualRestart>().0.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut environment=handle.env();
+                environment.args_os=startup_coordinator::manual_restart_args(environment.args_os[0].clone());
+                // Same plugin/runtime cleanup as Tauri restart, with fresh arguments.
+                handle.cleanup_before_exit();
+                tauri::process::restart(&environment);
+            }
+        });
 }
 
 pub fn network_service() -> Result<(), String> {

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchReason {
     ManualLaunch,
+    ManualRestart,
     WindowsStartup,
     UpdaterRestart,
     InstallerFirstLaunch,
@@ -20,7 +21,9 @@ impl LaunchReason {
     /// readiness gating belong to the owner, not this argument classifier.
     pub fn from_args(args: &[String]) -> Self {
         let has = |flag: &str| args.iter().any(|arg| arg == flag);
-        if has("--recovery-restart") {
+        if has("--manual-restart") {
+            Self::ManualRestart
+        } else if has("--recovery-restart") {
             Self::RecoveryRestart
         } else if has("--updater-restart") {
             Self::UpdaterRestart
@@ -34,6 +37,11 @@ impl LaunchReason {
             Self::ManualLaunch
         }
     }
+}
+
+/// A manual restart must not replay one-shot autostart or updater challenges.
+pub fn manual_restart_args(executable: std::ffi::OsString) -> Vec<std::ffi::OsString> {
+    vec![executable, "--manual-restart".into()]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +94,7 @@ impl StartupCoordinator {
             state,
             restore_eligible,
             show_window: match reason {
-                LaunchReason::UpdaterRestart | LaunchReason::RecoveryRestart => !previous_hidden,
+                LaunchReason::ManualRestart | LaunchReason::UpdaterRestart | LaunchReason::RecoveryRestart => !previous_hidden,
                 _ => !settings.start_in_tray,
             },
         }
@@ -145,8 +153,8 @@ impl StartupCoordinator {
 mod tests {
     use super::*;
 
-    const REASONS: [LaunchReason; 5] = [
-        LaunchReason::ManualLaunch, LaunchReason::WindowsStartup,
+    const REASONS: [LaunchReason; 6] = [
+        LaunchReason::ManualLaunch, LaunchReason::ManualRestart, LaunchReason::WindowsStartup,
         LaunchReason::UpdaterRestart, LaunchReason::InstallerFirstLaunch,
         LaunchReason::RecoveryRestart,
     ];
@@ -158,6 +166,20 @@ mod tests {
             start_in_tray: bits & 4 != 0,
             restore_connection: bits & 8 != 0,
             delay_seconds,
+        }
+    }
+
+    #[test]
+    fn manual_restart_cannot_replay_windows_startup_or_update_challenge() {
+        let args=manual_restart_args("Atlas.exe".into()).into_iter().map(|a|a.into_string().unwrap()).collect::<Vec<_>>();
+        assert_eq!(args,vec!["Atlas.exe","--manual-restart"]);
+        let reason=LaunchReason::from_args(&args);
+        assert_eq!(reason,LaunchReason::ManualRestart);
+        let mut s=settings(0,0); s.launch_with_windows=false;
+        for hidden in [false,true] {
+            let c=StartupCoordinator::new(reason,&s,false,false,hidden);
+            assert_eq!(c.should_show_window(),!hidden);
+            assert_ne!(reason,LaunchReason::WindowsStartup);
         }
     }
 
@@ -206,7 +228,7 @@ mod tests {
                         for reason in REASONS {
                             let s = settings(bits, 2);
                             let mut c = StartupCoordinator::new(reason, &s, connected, disconnected, hidden);
-                            let show = if matches!(reason, LaunchReason::UpdaterRestart | LaunchReason::RecoveryRestart) {
+                            let show = if matches!(reason, LaunchReason::ManualRestart | LaunchReason::UpdaterRestart | LaunchReason::RecoveryRestart) {
                                 !hidden
                             } else { !s.start_in_tray };
                             assert_eq!(c.should_show_window(), show);
@@ -229,6 +251,7 @@ mod tests {
         let classify = |args: &[&str]| LaunchReason::from_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         for (flag, reason) in [
             ("--autostart", LaunchReason::WindowsStartup),
+            ("--manual-restart", LaunchReason::ManualRestart),
             ("--updater-restart", LaunchReason::UpdaterRestart),
             ("--update-health", LaunchReason::UpdaterRestart),
             ("--installer-first-launch", LaunchReason::InstallerFirstLaunch),

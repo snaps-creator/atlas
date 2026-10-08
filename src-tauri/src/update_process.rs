@@ -1,6 +1,7 @@
 use std::{io::Read,path::Path,process::{Command,Stdio},time::{Duration,Instant}};
 use std::os::windows::{io::AsRawHandle,process::CommandExt};
 use windows_sys::Win32::{System::{Pipes::PeekNamedPipe,Threading::WaitForSingleObject},Foundation::WAIT_OBJECT_0};
+#[allow(dead_code, reason = "Used by the native updater target; shared with the desktop target")]
 pub fn status(executable:&Path,args:&[&str],timeout:Duration)->Result<(),String>{
     let mut child=Command::new(executable).args(args).current_dir(executable.parent().ok_or("Missing helper directory")?)
         .creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
