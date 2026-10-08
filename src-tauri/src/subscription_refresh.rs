@@ -50,7 +50,7 @@ fn failed_active_path(failed: HashSet<String>, proxies: &serde_json::Value) -> H
 }
 pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, done: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let initial: HashSet<_> = reads.get().map(|v|v.settings.subscriptions.iter().map(|s|s.id.clone()).collect()).unwrap_or_default();
+        let initial: HashSet<_> = reads.get().map(|v|v.settings.subscriptions.iter().filter(|s|s.source==model::SubscriptionSource::Url).map(|s|s.id.clone()).collect()).unwrap_or_default();
         let mut outstanding = initial.clone();
         let mut attempts = HashMap::new();
         let (tx,rx) = std::sync::mpsc::channel();
@@ -77,8 +77,9 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
             }
             for sub in &snapshot.settings.subscriptions {
                 if in_flight.len()>=2 { break; }
-                let failed = sub.source==snapshot.settings.active_source && (sub.servers.iter().any(|n|n["name"].as_str().is_some_and(|n|failed.contains(n)))
-                    || (snapshot.status=="Error" && shared.try_lock().is_ok_and(|a|a.reconnect.load(Ordering::SeqCst))));
+                if sub.source!=model::SubscriptionSource::Url {continue;}
+                let failed = sub.servers.iter().any(|n|n["name"].as_str().is_some_and(|n|failed.contains(n)))
+                    || (snapshot.status=="Error" && shared.try_lock().is_ok_and(|a|a.reconnect.load(Ordering::SeqCst)));
                 let Some(trigger)=reason(outstanding.contains(&sub.id),sub.updated_at,attempts.get(&sub.id).copied(),now,failed,sub.options.refresh_interval_seconds()) else { continue; };
                 let Some(lease)=Lease::take(&sub.id) else { continue; };
                 let id=sub.id.clone(); attempts.insert(id.clone(),now); in_flight.insert(id.clone());

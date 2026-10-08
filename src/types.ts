@@ -8,7 +8,19 @@ export type Group = {
   route: Route;
   rules: Rule[];
 };
-export type Server = { name: string; type: string; protocol?: string | null; country?: string | null; probeId: string };
+export type Server = {
+  name: string;
+  type: string;
+  protocol?: string | null;
+  country?: string | null;
+  probeId: string;
+  sourceId?: string;
+  sourceName?: string;
+  sourceType?: SubscriptionSource;
+  nodeId?: string;
+  stableIdentity?: string;
+  transport?: string | null;
+};
 export type Subscription = {
   source?: SubscriptionSource;
   options?: { userAgent: string | null; userAgentOverride: string | null; updateIntervalHours: number | null };
@@ -20,11 +32,10 @@ export type Subscription = {
   servers: Server[];
 };
 export type Settings = {
-  activeSource?: SubscriptionSource;
-  sourceSelections?: Partial<Record<SubscriptionSource, string>>;
   groups: Group[];
   subscriptions: Subscription[];
   selected: string;
+  selectedNodeId?: string | null;
   defaultRoute: Route;
   rulesSemanticsVersion: number;
   mode: string;

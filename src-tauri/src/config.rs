@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 /// UI preferences must never cause TUN reconfiguration.
 pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
     let runtime_nodes=|settings:&Settings| settings.servers().into_iter().map(|mut node| {
-        if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");}
+        if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");fields.remove("atlas");}
         node
     }).collect::<Vec<_>>();
     if runtime_nodes(previous)!=runtime_nodes(next) {return false;}
@@ -32,7 +32,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     // loopback endpoints before any generated configuration can be launched.
     for node in &mut proxies {
         if node["type"]=="xray" {*node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":9});}
-        if let Some(object)=node.as_object_mut() {object.remove("atlas-xray-bridge");object.remove("extraParams");}
+        if let Some(object)=node.as_object_mut() {object.remove("atlas-xray-bridge");object.remove("extraParams");object.remove("atlas");}
     }
     if proxies.is_empty() {
         return Err("Сначала добавьте подписку с серверами".into());

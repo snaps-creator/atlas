@@ -217,7 +217,7 @@ pub struct Downloaded {
 /// nodes. Presentation names and provider metadata do not change runtime identity.
 pub(crate) fn reconcile_nodes(id: &str, nodes: Vec<Value>, previous: &[Value]) -> Vec<Value> {
     use sha2::{Digest,Sha256};
-    let identity=|node: &Value| { let mut value=node.clone(); if let Some(map)=value.as_object_mut() {map.remove("name");map.remove("extraParams");} value.to_string() };
+    let identity=|node: &Value| { let mut value=node.clone(); if let Some(map)=value.as_object_mut() {map.remove("name");map.remove("extraParams");map.remove("atlas");} value.to_string() };
     let old: std::collections::HashMap<_,_>=previous.iter().map(|node|(identity(node),node["name"].clone())).collect();
     let mut seen=std::collections::HashSet::new();
     nodes.into_iter().filter_map(|mut node| {
@@ -229,16 +229,6 @@ pub(crate) fn reconcile_nodes(id: &str, nodes: Vec<Value>, previous: &[Value]) -
         });
         Some(node)
     }).collect()
-}
-pub(crate) fn retain_selection_on_refresh(settings: &mut crate::model::Settings, source: crate::model::SubscriptionSource) {
-    let names=settings.subscriptions.iter().filter(|s|s.source==source)
-        .flat_map(|s|s.servers.iter()).filter_map(|n|n["name"].as_str()).collect::<Vec<_>>();
-    let selected=(settings.active_source==source).then(||
-        crate::core::selector_state::remap_name(&settings.selected,&names).map(str::to_owned)).flatten();
-    let remembered=settings.source_selections.get(&source).and_then(|old|
-        crate::core::selector_state::remap_name(old,&names).map(str::to_owned));
-    if let Some(selected)=selected {settings.selected=selected;}
-    if let Some(selected)=remembered {settings.source_selections.insert(source,selected);}
 }
 pub fn download(raw: &str, connected: bool, options: &crate::subscription_options::Options) -> Result<Downloaded, String> {
     if raw.trim().starts_with("vless://") {
@@ -354,7 +344,7 @@ pub(crate) fn parse_response(body: &str, headers: &std::collections::BTreeMap<St
 mod tests {
     use super::*;
     #[test]
-    fn provider_rotation_preserves_manual_and_inactive_source_selection() {
+    fn provider_rotation_preserves_source_scoped_selection_and_favorite() {
         use crate::model::{Settings,Subscription,SubscriptionSource};
         let original=json!({"name":"London","type":"vless","server":"192.0.2.1","port":443,"sni":"old.example"});
         for legacy in [false,true] {
@@ -366,15 +356,14 @@ mod tests {
             // This is the 2.4.2 regression trigger: exact-name lookup loses the pin.
             assert!(!nodes.iter().any(|n|n["name"]==chosen));
             let expected=nodes[0]["name"].as_str().unwrap().to_owned();
-            let mut settings=Settings::default(); settings.selected=chosen.clone();
-            settings.source_selections.insert(SubscriptionSource::Url,chosen);
-            settings.subscriptions.push(Subscription {source:SubscriptionSource::Url,options:Default::default(),id:"provider".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,servers:nodes});
-            let mut inactive=settings.clone();inactive.active_source=SubscriptionSource::Vless;inactive.selected="AUTO".into();
-            retain_selection_on_refresh(&mut settings,SubscriptionSource::Url);settings.reconcile_selection();
-            assert_eq!(settings.selected,expected);
-            retain_selection_on_refresh(&mut inactive,SubscriptionSource::Url);
-            assert_eq!(inactive.selected,"AUTO");
-            inactive.switch_source(SubscriptionSource::Url);assert_eq!(inactive.selected,expected);
+            let mut settings=Settings::default();
+            settings.subscriptions.push(Subscription {source:SubscriptionSource::Url,options:Default::default(),id:"provider".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,servers:old});
+            crate::model::repository::normalize(&mut settings);
+            settings.select_node(&chosen).unwrap();settings.favorites=vec![settings.selected_node_id.clone()];
+            let mut next=settings.clone();next.subscriptions[0].servers=nodes;
+            crate::model::repository::reconcile_references(&settings,&mut next);
+            assert_eq!(next.selected,expected);
+            assert_eq!(next.favorites,vec![next.selected_node_id.clone()]);
         }
     }
     fn provider_fixture() -> String {

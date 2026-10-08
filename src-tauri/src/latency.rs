@@ -12,7 +12,7 @@ const DISPLAY_WORKERS: usize = 6;
 pub fn node_identity(node: &Value) -> String {
     use sha2::{Digest, Sha256};
     let mut node=node.clone();
-    if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");}
+    if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");fields.remove("atlas");}
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
 // Match Clash Verge's per-node measurement without saturating the controller.

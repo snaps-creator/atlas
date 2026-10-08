@@ -4,14 +4,17 @@ use winreg::{RegKey,RegValue,enums::*};
 const RUN:&str=r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED:&str=r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 fn command(executable:&Path)->Result<String,String>{
+    if !executable.is_absolute()||executable.to_string_lossy().contains(['"','\r','\n','\0']) {
+        return Err("Invalid startup executable".into());
+    }
     let directory=executable.parent().ok_or("Missing application directory")?;
-    let launcher=if directory.parent().and_then(|p|p.file_name()).is_some_and(|n|n=="versions") {
+    let launcher=if directory.parent().and_then(|p|p.file_name()).is_some_and(|n|n.to_string_lossy().eq_ignore_ascii_case("versions")) {
         let root=directory.parent().and_then(|p|p.parent()).ok_or("Invalid version installation")?;
         Some(root.join("AtlasUpdater.exe"))
     }else{None};
     let target=launcher.as_deref().unwrap_or(executable);
-    if !target.is_absolute()||target.to_string_lossy().contains(['"','\r','\n']){return Err("Invalid startup executable".into());}
-    Ok(format!("\"{}\" {}--autostart",target.display(),if launcher.is_some(){"--launch "}else{""}))
+    let needs_launch=launcher.is_some()||target.file_name().is_some_and(|n|n.to_string_lossy().eq_ignore_ascii_case("AtlasUpdater.exe"));
+    Ok(format!("\"{}\" {}--autostart",target.display(),if needs_launch{"--launch "}else{""}))
 }
 pub fn configure(enabled:bool,explicit:bool)->Result<(),String>{
     let user=RegKey::predef(HKEY_CURRENT_USER);
@@ -44,5 +47,19 @@ pub fn configure(enabled:bool,explicit:bool)->Result<(),String>{
         }
         assert_eq!(command(Path::new(r"C:\Program Files\Atlas\Atlas.exe")).unwrap(),r#""C:\Program Files\Atlas\Atlas.exe" --autostart"#);
         assert!(command(Path::new("relative/Atlas.exe")).is_err());
+    }
+    #[test]fn startup_recognizes_windows_case_and_direct_updater(){
+        assert_eq!(command(Path::new(r"C:\Atlas\Versions\2.4.2\Atlas.exe")).unwrap(),r#""C:\Atlas\AtlasUpdater.exe" --launch --autostart"#);
+        assert_eq!(command(Path::new(r"C:\Atlas\ATLASUPDATER.EXE")).unwrap(),r#""C:\Atlas\ATLASUPDATER.EXE" --launch --autostart"#);
+    }
+    #[test]fn startup_preserves_unc_unicode_and_non_versioned_paths(){
+        assert_eq!(command(Path::new(r"\\server\Apps\Atlas\versions\2.4.2\Atlas.exe")).unwrap(),r#""\\server\Apps\Atlas\AtlasUpdater.exe" --launch --autostart"#);
+        assert_eq!(command(Path::new(r"C:\Приложения\Atlas\versions\2.4.2\Atlas.exe")).unwrap(),r#""C:\Приложения\Atlas\AtlasUpdater.exe" --launch --autostart"#);
+        assert_eq!(command(Path::new(r"C:\Atlas\notversions\2.4.2\Atlas.exe")).unwrap(),r#""C:\Atlas\notversions\2.4.2\Atlas.exe" --autostart"#);
+    }
+    #[test]fn startup_rejects_unrooted_paths_and_command_injection(){
+        for path in [r"C:Atlas.exe",r"\Atlas.exe",r"Atlas.exe",r#"C:\Atlas\bad"name\Atlas.exe"#,"C:\\Atlas\\bad\nname\\Atlas.exe","C:\\Atlas\\bad\rname\\Atlas.exe","C:\\Atlas\\bad\0name\\Atlas.exe",r#"C:\Atlas\versions\bad"version\Atlas.exe"#] {
+            assert!(command(Path::new(path)).is_err(),"{path:?}");
+        }
     }
 }

@@ -62,6 +62,8 @@ fn supplied_vless_subscription_reaches_https_after_refresh_and_restart() {
     alternative.source=crate::model::SubscriptionSource::Vless;alternative.id="vless-test".into();
     alternative.servers=crate::subscriptions::reconcile_nodes("vless-test",fetch().expect("Second source download").nodes,&[]);
     settings.subscriptions.push(alternative);
+    crate::model::repository::normalize(&mut settings);
+    settings.select_node(&settings.selected.clone()).unwrap();
     let db=directory.join("acceptance.db");
     {let mut store=crate::storage::Store::open(&db).unwrap();store.save(&settings).unwrap();}
     let loaded=crate::storage::Store::open(&db).unwrap().load().unwrap();
@@ -93,20 +95,10 @@ fn supplied_vless_subscription_reaches_https_after_refresh_and_restart() {
     core.select("AUTO").unwrap();core.select(&loaded.selected).unwrap();check();
     let mut refreshed=loaded.clone();
     refreshed.subscriptions[0].servers=crate::subscriptions::reconcile_nodes("live-test",fetch().expect("Refresh download").nodes,&loaded.servers());
+    crate::model::repository::reconcile_references(&loaded,&mut refreshed);
     assert!(refreshed.servers()==loaded.servers());core.apply(&refreshed).unwrap();check();
     core.stop().unwrap();assert!(core.owned_processes_released());
     core.start(&refreshed).unwrap_or_else(|_|panic!("Restart failed"));check();core.stop().unwrap();
-    let url_selection=refreshed.selected.clone();
-    for source in [crate::model::SubscriptionSource::Vless,crate::model::SubscriptionSource::Url,crate::model::SubscriptionSource::Vless] {
-        assert!(core.owned_processes_released(),"A source must not change while its core is alive");
-        refreshed.switch_source(source);
-        if refreshed.selected=="AUTO" {refreshed.selected=refreshed.servers()[0]["name"].as_str().unwrap().into();}
-        if source==crate::model::SubscriptionSource::Url {assert!(refreshed.selected==url_selection);}
-        core.start(&refreshed).unwrap_or_else(|_|panic!("Source start failed"));check();core.stop().unwrap();
-        {let mut store=crate::storage::Store::open(&db).unwrap();store.save(&refreshed).unwrap();}
-        refreshed=crate::storage::Store::open(&db).unwrap().load().unwrap();
-        assert_eq!(refreshed.active_source,source);
-    }
     println!("Live VLESS acceptance passed; REALITY={reality}; HTTPS, selection, refresh, encrypted persistence, stop/restart");
     if let Some(mut publisher)=publisher {crate::process_stop::stop(&mut publisher,||drop(publisher_job),Duration::from_secs(5)).unwrap();}
     drop(core);std::fs::remove_dir_all(directory).unwrap();
@@ -186,6 +178,8 @@ fn xray_vless_transports_reach_a_real_loopback_server() {
     let refreshed=crate::subscriptions::download_test_https(&url,&certificate).unwrap();
     assert_eq!(refreshed.nodes,settings.subscriptions[0].servers);
     core.stop().unwrap();
+    crate::model::repository::normalize(&mut settings);
+    settings.select_node(&settings.selected.clone()).unwrap();
     let db=core.directory.join("acceptance.db");
     {let mut store=crate::storage::Store::open(&db).unwrap();store.save(&settings).unwrap();}
     let loaded=crate::storage::Store::open(&db).unwrap().load().unwrap();

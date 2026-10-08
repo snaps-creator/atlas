@@ -23,7 +23,7 @@ fn confirmed_probe(client: &ApiClient, name: &str) -> Result<Value, String> {
     })
 }
 pub(crate) fn node_key(node: &Value) -> String {
-    format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
+    format!("{:x}", Sha256::digest(crate::model::repository::runtime_node(node).to_string().as_bytes()))
 }
 fn endpoint(node: &Value) -> String {
     format!("{}:{}",node["server"].as_str().unwrap_or(""),node["port"].as_u64().unwrap_or(0))

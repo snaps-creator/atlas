@@ -1,4 +1,4 @@
-import { activeSubscriptions } from "./subscriptionSource";
+import { allSubscriptions } from "./subscriptionSource";
 import { useEffect, useRef, useState } from "react";
 import { request } from "./api";
 import type { Snapshot } from "./types";
@@ -52,7 +52,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
       const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");
       if (!valid(revision)) return;
       const settings = latest.current!.settings;
-      publish(observedHealth(activeSubscriptions(settings).flatMap(sub => sub.servers.map(server => server.name)), proxies,
+      publish(observedHealth(allSubscriptions(settings).flatMap(sub => sub.servers.map(server => server.name)), proxies,
         Math.max(30000, (settings.autoTestIntervalSeconds ?? 300) * 2000)));
     };
     const check = async (force = false) => {
@@ -62,7 +62,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
       if (!initial?.running) { pending = false; return; }
       let revision = initial.revision;
       try {
-        const names = activeSubscriptions(initial.settings).flatMap(sub => sub.servers.map(server => server.name));
+        const names = allSubscriptions(initial.settings).flatMap(sub => sub.servers.map(server => server.name));
         if (!names.length) return;
         if (!force) {
           const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");

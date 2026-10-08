@@ -14,7 +14,14 @@ pub fn challenge()->Option<(String,String)> {
 }
 /// A health candidate may render/read settings but cannot refresh subscriptions
 /// or accept mutations until its own transaction is durably committed.
+static ADMITTED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+fn admission_pending(admitted:&std::sync::atomic::AtomicBool,committed:impl FnOnce()->bool)->bool {
+    use std::sync::atomic::Ordering;
+    if admitted.load(Ordering::SeqCst) {return false;}
+    if committed() {admitted.store(true,Ordering::SeqCst);false} else {true}
+}
 pub fn pending()->bool {
+    if ADMITTED.load(std::sync::atomic::Ordering::SeqCst) {return false;}
     let Some((transaction,_))=challenge() else{return false;};
     let committed=(||->Option<bool>{
         use std::io::Read;
@@ -25,7 +32,7 @@ pub fn pending()->bool {
         let value:serde_json::Value=serde_json::from_slice(&bytes).ok()?;
         Some(committed_for(&value,&transaction,directory.file_name()?.to_str()?))
     })();
-    committed!=Some(true)
+    admission_pending(&ADMITTED,||committed==Some(true))
 }
 fn committed_for(value:&serde_json::Value,transaction:&str,directory:&str)->bool {
     value["schema"]==1 && value["transaction_id"]==transaction && value["stage"]=="Committed" &&
@@ -40,6 +47,13 @@ impl Report {
 }
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]
+    fn admitted_process_stays_ready_when_next_update_replaces_journal() {
+        let admitted=std::sync::atomic::AtomicBool::new(false);
+        assert!(admission_pending(&admitted,||false));
+        assert!(!admission_pending(&admitted,||true));
+        assert!(!admission_pending(&admitted,||panic!("A later transaction cannot revoke this process admission")));
+    }
     #[test]fn only_own_durable_commit_releases_candidate_mutations(){
         use serde_json::json;let active=json!({"id":"candidate","version":env!("CARGO_PKG_VERSION"),"build":env!("ATLAS_BUILD_ID")});
         let mut value=json!({"schema":1,"transaction_id":"tx","stage":"HealthPending","active":active,"candidate":active});

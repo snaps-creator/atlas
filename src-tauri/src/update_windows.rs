@@ -182,7 +182,7 @@ impl Platform for Windows {
         // verifies that reconnect preserves this process and network epoch.
         self.service_pid=None;
         self.desktop=Some(Candidate::launch(&self.path(version).join("Atlas.exe"),
-            &tx.journal.transaction_id,&uuid::Uuid::new_v4().to_string(),&version.version,&version.build)?);
+            &tx.journal.transaction_id,&uuid::Uuid::new_v4().to_string(),&version.version,&version.build,tx.journal.previous.absent)?);
         self.service_pid=self.desktop.as_ref().map(|desktop|desktop.report.service_pid);
         self.inspect_service(version)
     }
@@ -198,10 +198,10 @@ impl Platform for Windows {
         if version.absent{return Ok(());}
         use std::process::{Command,Stdio};
         let directory=self.service_directory(version)?;
-        if let Some((child,pipe))=crate::update_user::limited(&directory.join("Atlas.exe"),&[])? {
+        if let Some((child,pipe))=crate::update_user::limited(&directory.join("Atlas.exe"),&["--recovery-restart"])? {
             drop(pipe);drop(child);return Ok(());
         }
-        Command::new(directory.join("Atlas.exe")).current_dir(directory)
+        Command::new(directory.join("Atlas.exe")).arg("--recovery-restart").current_dir(directory)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
             .map_err(|e|format!("Cannot restart restored Atlas: {e}"))?;
         Ok(())
