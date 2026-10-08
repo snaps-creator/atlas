@@ -9,6 +9,19 @@ fn remote_probe_failure(error: &str) -> bool {
     matches!(error,"Mihomo API: HTTP 503"|"Mihomo API: HTTP 504")
         || error.contains("Контрольный URL не подтвердил")
 }
+fn confirm_remote_failure<T>(first: Result<T, String>, confirmation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if first.as_ref().err().is_some_and(|error| remote_probe_failure(error)) {
+        confirmation()
+    } else { first }
+}
+fn confirmed_probe(client: &ApiClient, name: &str) -> Result<Value, String> {
+    confirm_remote_failure(crate::latency::verified_probe(client,name,crate::latency::DISPLAY_URL), || {
+        let result=crate::latency::verified_probe(client,name,crate::latency::SECONDARY_URL);
+        client.event(json!({"at":crate::model::now(),"kind":"active_node_confirmation",
+            "name":name,"responded":result.is_ok(),"control":"https"}));
+        result
+    })
+}
 pub(crate) fn node_key(node: &Value) -> String {
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
@@ -130,7 +143,9 @@ impl Recovery {
                 }
             } else { Some(settings.selected) };
             let results = name.into_iter().filter_map(|name| {
-                let probe=crate::latency::verified_probe(&client,&name,crate::latency::DISPLAY_URL);
+                // A failed plain-HTTP control URL is not proof that the tunnel
+                // is dead. Confirm remote failures over TLS before quarantine.
+                let probe=confirmed_probe(&client,&name);
                 if let Err(error)=&probe {
                     if !remote_probe_failure(error) {
                         client.event(json!({"at":crate::model::now(),"kind":"active_monitor_error","error":error}));
@@ -373,7 +388,7 @@ fn verify_replacement(client: &ApiClient, settings: &Settings, blocked: &HashSet
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) && !cancelled.load(Ordering::SeqCst) {
                 let Some(name)=names.get(next.fetch_add(1,Ordering::SeqCst)) else { break; };
-                let result=crate::latency::verified_probe(&client,name,crate::latency::DISPLAY_URL);
+                let result=confirmed_probe(&client,name);
                 let passed=result.is_ok();
                 let remote_failure=result.as_ref().err().is_some_and(|e|remote_probe_failure(e));
                 if passed { stop.store(true,Ordering::SeqCst); }
@@ -394,7 +409,7 @@ fn verify_replacement(client: &ApiClient, settings: &Settings, blocked: &HashSet
     // original node must not leave the client searching forever.
     if !cancelled.load(Ordering::SeqCst) {
         if let Some(name)=previous {
-            if let Ok(result)=crate::latency::verified_probe(client,name,crate::latency::DISPLAY_URL) {
+            if let Ok(result)=confirmed_probe(client,name) {
                 results.push(json!({"name":name,"passed":true,"result":result}));
                 return json!({"candidate":name,"results":results});
             }
@@ -448,6 +463,13 @@ pub(crate) fn verify_names(client: &ApiClient, names: &[String], controls: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn http_failure_with_working_https_is_not_a_dead_node() {
+        assert_eq!(confirm_remote_failure(Err("Mihomo API: HTTP 504".into()), || Ok(98)),Ok(98));
+        assert_eq!(confirm_remote_failure(Err("Mihomo API: HTTP 504".into()), || Err::<u64,_>("Mihomo API: HTTP 504".into())),Err("Mihomo API: HTTP 504".into()));
+        assert_eq!(confirm_remote_failure(Ok(60), || panic!("healthy path needs no retry")),Ok(60));
+        assert_eq!(confirm_remote_failure(Err::<u64,_>("controller unavailable".into()), || panic!("local errors must not probe remote nodes")),Err("controller unavailable".into()));
+    }
     #[test]
     fn replacement_is_returned_before_the_slow_candidate_finishes() {
         use std::{io::{Read,Write}, net::TcpListener, sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};

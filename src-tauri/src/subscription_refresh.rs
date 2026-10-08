@@ -39,6 +39,15 @@ fn failed_nodes(lines: &[String], now: u64) -> HashSet<String> {
     }
     failures.into_iter().filter_map(|(name,failed)|failed.then_some(name)).collect()
 }
+fn failed_active_path(failed: HashSet<String>, proxies: &serde_json::Value) -> HashSet<String> {
+    let mut current="ATLAS";
+    for _ in 0..8 {
+        let Some(proxy)=proxies["proxies"].get(current) else { return HashSet::new() };
+        if let Some(next)=proxy["now"].as_str() { current=next; }
+        else { return failed.into_iter().filter(|name|name==current).collect(); }
+    }
+    HashSet::new()
+}
 pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, done: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let initial: HashSet<_> = reads.get().map(|v|v.settings.subscriptions.iter().map(|s|s.id.clone()).collect()).unwrap_or_default();
@@ -57,7 +66,12 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
             let now=model::now();
             if now.saturating_sub(last_logs)>=10 {
                 failed = if matches!(snapshot.status.as_str(),"Connected"|"ProtectedPause") {
-                    failed_nodes(&snapshot.client.logs().unwrap_or_default(),now)
+                    // A recovered alternate path must not be replaced because
+                    // the abandoned node still has a failure in the log window.
+                    let failures=failed_nodes(&snapshot.client.logs().unwrap_or_default(),now);
+                    if failures.is_empty() { failures } else {
+                        failed_active_path(failures,&snapshot.client.api("GET","/proxies",None).unwrap_or_default())
+                    }
                 } else { HashSet::new() };
                 last_logs=now;
             }
@@ -116,6 +130,14 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovered_alternate_does_not_refresh_a_healthy_active_subscription() {
+        let failed=HashSet::from(["old".to_owned()]);
+        let healthy=json!({"proxies":{"ATLAS":{"now":"AUTO"},"AUTO":{"now":"replacement"},"replacement":{}}});
+        assert!(failed_active_path(failed.clone(),&healthy).is_empty());
+        let broken=json!({"proxies":{"ATLAS":{"now":"old"},"old":{}}});
+        assert!(failed_active_path(failed,&broken).contains("old"));
+    }
     #[test]
     fn independent_schedules_retry_without_reloading_healthy_subscriptions() {
         assert_eq!(reason(true,100,None,101,false,1800),Some("startup"));

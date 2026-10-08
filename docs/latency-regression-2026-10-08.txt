@@ -1,0 +1,95 @@
+Atlas live regression investigation / hotfix
+2026-10-08, timestamps below Europe/Moscow
+
+Status: three recovery/configuration defects reproduced and patched. The first
+bad release and cause of the initial remote timeout are NOT proven. No measured
+post-install website improvement is claimed. This is not a completed bisect.
+
+Observed installed version: 2.4.2, 365b91279f5b7c1a9fd49fd49ab42f1b5f986c69.
+User-reported fast versions: 2.3.1 / 2.3.2. Local original checkout: 4a6ed36;
+pre-existing core.rs and network_guard.rs edits preserved in that checkout.
+Patches prepared in a separate codex/latency-regression worktree from 2.4.2.
+
+Evidence collected without changing active network configuration
+15:14:14-15:19:14 passive observation: controller selection/health, process IDs,
+runtime config modification time, application incident log, core warning stream.
+No diagnostic URL probes were issued during this passive observation window.
+
+15:15:09 Amsterdam HTTP control probe timed out (configured timeout 10000 ms).
+15:15:11 Atlas automatically selected Fujairah, fresh control response 255 ms.
+15:15:17 subscription refresh started with trigger=recovery.
+15:15:26 runtime config replaced; new Xray worker, same Mihomo PID.
+15:15:27 AUTO reverted from Fujairah to Amsterdam, with a new node digest.
+15:15:29 refresh finished, elapsed 11927 ms. Two UI/service commands timed out
+after 6203/6201 ms while this refresh was in progress.
+15:16:00 Amsterdam control timed out again; 15:16:02 Fujairah selected again.
+15:17:05 automatic optimization selected Vienna (not a process crash).
+15:19:09 Vienna HTTP control timed out; 15:19:10 Bucharest selected, 115 ms.
+Core PID 20284 and service processes persisted through the observation window.
+
+The quarantine recheck recorded an HTTP failure for Amsterdam while HTTPS in
+the same recheck series returned 98/394 ms. These were separate requests, not
+an atomic measurement: this proves endpoint-dependent outcomes, not universal
+server availability or the reason for the original dropped request.
+Mihomo also warned that a second HTTP HEAD response was missing for Fujairah.
+Warnings for cdn4.telesco.pe showed actual DIRECT routing and TCP timeouts;
+this is a separate routing observation, not proof of an update regression.
+
+Confirmed defects and fixes
+1. core.apply_verified only restored top-level ATLAS after configuration reload.
+   AUTO/FAILOVER reverted to their first listed node. An isolated instance of
+   the identical Mihomo binary reproduced this with both stable and changed
+   node names. Restore nested selection and verify it on apply AND rollback.
+   When a subscription rotates the configuration digest, retain the logical
+   name/source only if the candidate is unique. Never guess across sources or
+   ambiguous matches; deleted nodes retain normal new-config selection.
+2. Active monitor treated a single plain-HTTP endpoint failure as a dead node.
+   Confirm remote failures using the HTTPS control before quarantine; apply
+   the same confirmation to replacement candidates and old-path rechecks.
+   Controller/local errors remain distinct and do not condemn remote nodes.
+3. Subscription recovery consumed failures for abandoned nodes for 60 seconds,
+   even after a healthy replacement was selected. Restrict recovery-triggered
+   refresh to the currently selected terminal proxy. Periodic/manual refresh
+   and genuine active-node failure recovery remain enabled.
+
+Regression boundary / limitations
+The top-level-only reload restoration already exists in 2.3.1 (4a6ed36).
+It is a demonstrated defect, NOT a proven newly introduced 2.4.2 regression.
+Installed previous/current Mihomo and Xray binaries have identical SHA256.
+Generator modules from 2.3.2 (9d54431) and 2.4.2 generated identical output for
+the same sanitized 186-node runtime-derived fixture and synthetic raw REALITY
+transport: SHA256 17bbec0ed2ab2e4258e3842af85278a531bd265f384ddee3c820471adf2593ff.
+This is generator parity for that fixture, not a previous-app runtime A/B.
+The active subscription rotated REALITY SNI/shortId and node digests during
+measurements. These changes prevent attribution to application version alone.
+
+Current connection check BEFORE installation of the hotfix
+After the user switched subscription/source, a new session had 2 VLESS nodes
+and a manual selected node. At 15:29:54-15:29:56, 3 requests per site through
+Atlas mixed proxy gave median TTFB / full response (ms):
+chatgpt.com       72.902 / 73.447 (HTTP 403, not successful authenticated access)
+grok.com        664.848 / 857.647 (HTTP 200)
+gemini.google.com 218.797 / 315.251 (HTTP 200)
+www.youtube.com  147.564 / 323.291 (HTTP 200)
+web.telegram.org 131.488 / 131.539 (HTTP 200)
+These are NOT a hotfix before/after comparison and not the same selected server.
+Proxy curl connect measures loopback; appconnect includes downstream work.
+Do not label these as isolated upstream DNS/TCP/TLS phase measurements.
+
+Validation
+Real Mihomo integration: nested AUTO/FAILOVER selection survives reload,
+configuration digest rotation, and injected candidate failure with rollback.
+Unit cases: ambiguous/source-mismatched selection is not guessed; HTTP failure
+plus HTTPS success remains healthy; controller failure does not trigger remote
+confirmation; healthy replacement suppresses abandoned-node subscription refresh.
+Full native library suite: 207 passed, 1 external-subscription test ignored.
+Frontend: 39 passed. Build/update contracts: 26 passed.
+Frontend production build and cargo Release binaries completed successfully.
+Maintenance/updater tests and installer packaging are recorded in the task report.
+
+Outstanding acceptance
+Install/test hotfix on the originally problematic source with automatic rollback;
+repeat fixed-server phase measurements, reconnect/server switch, and monitor
+stability. Old-version runtime comparison/bisect, packet-level timeout cause,
+MTU/QUIC/mux interventions and exhaustive Windows DIRECT baseline are incomplete.
+No permanent DNS/routes/MTU/firewall/proxy changes were made by this investigation.

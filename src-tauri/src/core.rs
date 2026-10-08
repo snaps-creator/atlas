@@ -10,6 +10,8 @@ use std::{
 #[cfg(test)]
 #[path = "multi_client_tests.rs"]
 mod multi_client_tests;
+#[path = "selector_state.rs"]
+mod selector_state;
 pub struct Core {
     pub continue_running: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub binary: PathBuf,
@@ -27,6 +29,17 @@ pub struct Core {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl Core {
+    fn restore_nested_selectors(&self, before: &Value) -> Result<Value, String> {
+        let after = self.api("GET", "/proxies", None)?;
+        for (group, selected) in selector_state::restore_plan(before, &after) {
+            let path = format!("/proxies/{group}");
+            self.api("PUT", &path, Some(json!({"name":selected})))?;
+            if self.api("GET", &path, None)?["now"] != selected {
+                return Err(format!("Ядро не восстановило выбранный узел группы {group}"));
+            }
+        }
+        Ok(Value::Null)
+    }
     pub(crate) fn owned_processes_released(&self) -> bool {
         self.child.is_none() && self.xray.is_none() && self.draining_xray.is_empty() && self.broker.is_none()
     }
@@ -461,10 +474,12 @@ impl Core {
         let next_xray=prepared.map(|p|p.start_logged(self.logs.clone())).transpose()?;
         let old = self.directory.join("last-working.yaml");
         let previous = std::fs::read(&old).map_err(|e| format!("Не удалось сохранить конфигурацию для отката: {e}"))?;
-        let selected = self.api("GET", "/proxies/ATLAS", None)?["now"]
+        let selectors = self.api("GET", "/proxies", None)?;
+        let selected = selectors["proxies"]["ATLAS"]["now"]
             .as_str().ok_or("Не удалось сохранить выбранный сервер для отката")?.to_owned();
         let result = self
             .api("PUT", "/configs?force=true", Some(json!({"path":path})))
+            .and_then(|_| self.restore_nested_selectors(&selectors))
             .and_then(|_| self.api("PUT", "/proxies/ATLAS", Some(json!({"name":s.selected}))))
             .and_then(|_| self.api("GET", "/configs", None))
             .and_then(|config| {
@@ -483,6 +498,7 @@ impl Core {
                 let rollback_path = self.directory.join("rollback.yaml");
                 std::fs::write(&rollback_path, &previous).map_err(|e| e.to_string())?;
                 self.api("PUT", "/configs?force=true", Some(json!({"path":rollback_path})))?;
+                self.restore_nested_selectors(&selectors)?;
                 self.api("PUT", "/proxies/ATLAS", Some(json!({"name":selected})))?;
                 self.api("GET", "/version", None)?;
                 let restored = self.api("GET", "/configs", None)?;
@@ -944,6 +960,27 @@ mod integration_tests {
         }
         drop(core);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn nested_selectors_survive_real_reload_rotation_and_rollback() {
+        let directory=std::env::temp_dir().join(format!("atlas-selector-test-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
+        let mut core=Core::new(binary,directory.clone());
+        core.use_ephemeral_ports().unwrap();
+        let mut settings=Settings::default(); settings.mode="system".into();
+        settings.subscriptions.push(Subscription { source:Default::default(), options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:"hidden".into(),updated_at:0,error:None,
+            servers:vec![json!({"name":"first","type":"direct"}),json!({"name":"chosen · source-1111111111111111","type":"direct"})] });
+        core.start(&settings).unwrap();
+        for group in ["AUTO","FAILOVER"] { core.api("PUT",&format!("/proxies/{group}"),Some(json!({"name":"chosen · source-1111111111111111"}))).unwrap(); }
+        core.apply(&settings).unwrap();
+        for group in ["AUTO","FAILOVER"] { assert_eq!(core.api("GET",&format!("/proxies/{group}"),None).unwrap()["now"],"chosen · source-1111111111111111"); }
+        settings.subscriptions[0].servers[1]["name"]=json!("chosen · source-2222222222222222");
+        core.apply(&settings).unwrap();
+        let mut candidate=settings.clone();candidate.subscriptions[0].servers[1]["name"]=json!("chosen · source-3333333333333333");
+        assert!(core.apply_verified(&candidate,|_,rollback| if rollback {Ok(())} else {Err("injected failure".into())}).is_err());
+        for group in ["AUTO","FAILOVER"] { assert_eq!(core.api("GET",&format!("/proxies/{group}"),None).unwrap()["now"],"chosen · source-2222222222222222"); }
+        core.stop().unwrap();drop(core);std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn real_mihomo_validation_reload_selector_and_rollback() {
