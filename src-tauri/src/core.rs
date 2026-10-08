@@ -11,7 +11,7 @@ use std::{
 #[path = "multi_client_tests.rs"]
 mod multi_client_tests;
 #[path = "selector_state.rs"]
-mod selector_state;
+pub(crate) mod selector_state;
 pub struct Core {
     pub continue_running: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub binary: PathBuf,

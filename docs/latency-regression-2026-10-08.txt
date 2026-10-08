@@ -1,7 +1,7 @@
 Atlas live regression investigation / hotfix
 2026-10-08, timestamps below Europe/Moscow
 
-Status: three recovery/configuration defects reproduced and patched. The first
+Status: four recovery/configuration defects reproduced and patched. The first
 bad release and cause of the initial remote timeout are NOT proven. No measured
 post-install website improvement is claimed. This is not a completed bisect.
 
@@ -51,6 +51,13 @@ Confirmed defects and fixes
    even after a healthy replacement was selected. Restrict recovery-triggered
    refresh to the currently selected terminal proxy. Periodic/manual refresh
    and genuine active-node failure recovery remain enabled.
+4. Commit 495157b changed positional names to runtime-configuration digests.
+   Rotating SNI/credentials therefore removes the selected name; subscription
+   installation then changes a manual pin to AUTO. A fixture reproduces this
+   for both migrated legacy names and new digest names. Remap active and saved
+   source selections to the unique same logical node before checking presence.
+   This proves a selection regression introduced in 2.4.2, not the cause of
+   every initial network timeout. Duplicate candidates are never guessed.
 
 Regression boundary / limitations
 The top-level-only reload restoration already exists in 2.3.1 (4a6ed36).

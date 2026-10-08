@@ -230,6 +230,16 @@ pub(crate) fn reconcile_nodes(id: &str, nodes: Vec<Value>, previous: &[Value]) -
         Some(node)
     }).collect()
 }
+pub(crate) fn retain_selection_on_refresh(settings: &mut crate::model::Settings, source: crate::model::SubscriptionSource) {
+    let names=settings.subscriptions.iter().filter(|s|s.source==source)
+        .flat_map(|s|s.servers.iter()).filter_map(|n|n["name"].as_str()).collect::<Vec<_>>();
+    let selected=(settings.active_source==source).then(||
+        crate::core::selector_state::remap_name(&settings.selected,&names).map(str::to_owned)).flatten();
+    let remembered=settings.source_selections.get(&source).and_then(|old|
+        crate::core::selector_state::remap_name(old,&names).map(str::to_owned));
+    if let Some(selected)=selected {settings.selected=selected;}
+    if let Some(selected)=remembered {settings.source_selections.insert(source,selected);}
+}
 pub fn download(raw: &str, connected: bool, options: &crate::subscription_options::Options) -> Result<Downloaded, String> {
     if raw.trim().starts_with("vless://") {
         if raw.trim().lines().count()!=1 { return Err("Вставьте один VLESS-ключ".into()); }
@@ -343,6 +353,30 @@ pub(crate) fn parse_response(body: &str, headers: &std::collections::BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_rotation_preserves_manual_and_inactive_source_selection() {
+        use crate::model::{Settings,Subscription,SubscriptionSource};
+        let original=json!({"name":"London","type":"vless","server":"192.0.2.1","port":443,"sni":"old.example"});
+        for legacy in [false,true] {
+            let mut old=reconcile_nodes("provider",vec![original.clone()],&[]);
+            if legacy {old[0]["name"]=json!("London · provider-1");}
+            let chosen=old[0]["name"].as_str().unwrap().to_owned();
+            let mut rotated=original.clone();rotated["sni"]=json!("new.example");
+            let nodes=reconcile_nodes("provider",vec![rotated],&old);
+            // This is the 2.4.2 regression trigger: exact-name lookup loses the pin.
+            assert!(!nodes.iter().any(|n|n["name"]==chosen));
+            let expected=nodes[0]["name"].as_str().unwrap().to_owned();
+            let mut settings=Settings::default(); settings.selected=chosen.clone();
+            settings.source_selections.insert(SubscriptionSource::Url,chosen);
+            settings.subscriptions.push(Subscription {source:SubscriptionSource::Url,options:Default::default(),id:"provider".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,servers:nodes});
+            let mut inactive=settings.clone();inactive.active_source=SubscriptionSource::Vless;inactive.selected="AUTO".into();
+            retain_selection_on_refresh(&mut settings,SubscriptionSource::Url);settings.reconcile_selection();
+            assert_eq!(settings.selected,expected);
+            retain_selection_on_refresh(&mut inactive,SubscriptionSource::Url);
+            assert_eq!(inactive.selected,"AUTO");
+            inactive.switch_source(SubscriptionSource::Url);assert_eq!(inactive.selected,expected);
+        }
+    }
     fn provider_fixture() -> String {
         (0..34).map(|i|format!("vless://00000000-0000-0000-0000-{:012}@node{i}.example:8443?encryption=none&{}&x-durev-block=whitelist&x-durev-prio={}&provider-secret=sanitized#Germany%20{}%20🇩🇪%20→%20[📃%20Белые%20списки]",
             i+1,if i%2==0 {"type=xhttp&security=reality&sni=tls.example&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&sid=aabb&fp=chrome&mode=stream-one&path=%2Fxhttp&concurrency=4"}

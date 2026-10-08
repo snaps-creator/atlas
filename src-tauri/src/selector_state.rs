@@ -4,22 +4,25 @@ use serde_json::Value;
 // Preserve a logical node across credential rotation only when unambiguous.
 fn logical_name(name: &str) -> &str {
     let Some((prefix, suffix)) = name.rsplit_once('-') else { return name };
-    if prefix.contains(" · ") && suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let digest=suffix.len()==16 && suffix.bytes().all(|b|b.is_ascii_hexdigit());
+    let legacy_index=!suffix.is_empty() && suffix.bytes().all(|b|b.is_ascii_digit());
+    if prefix.contains(" · ") && (digest || legacy_index) {
         prefix
     } else { name }
+}
+pub(crate) fn remap_name<'a>(selected: &str, available: &[&'a str]) -> Option<&'a str> {
+    if let Some(exact)=available.iter().copied().find(|n| *n==selected) { return Some(exact); }
+    let mut matches=available.iter().copied().filter(|n|logical_name(n)==logical_name(selected));
+    let first=matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 pub(super) fn restore_plan(before: &Value, after: &Value) -> Vec<(String, String)> {
     ["AUTO", "FAILOVER"].into_iter().filter_map(|group| {
         let selected = before["proxies"][group]["now"].as_str()?;
         let available = after["proxies"][group]["all"].as_array()?;
-        let exact = available.iter().filter_map(Value::as_str).find(|n| *n == selected);
-        let target = exact.or_else(|| {
-            let mut matches = available.iter().filter_map(Value::as_str)
-                .filter(|n| logical_name(n) == logical_name(selected));
-            let first = matches.next()?;
-            matches.next().is_none().then_some(first)
-        })?;
+        let names=available.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        let target=remap_name(selected,&names)?;
         Some((group.into(), target.into()))
     }).collect()
 }

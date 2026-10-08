@@ -139,6 +139,7 @@ impl App {
                 } else {
                     next.subscriptions.push(sub)
                 }
+                subscriptions::retain_selection_on_refresh(&mut next,source);
                 if !next.servers().iter().any(|s| s["name"] == next.selected)
                     && !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
                 {
