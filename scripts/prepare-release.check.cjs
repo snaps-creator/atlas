@@ -38,8 +38,10 @@ test('actual PowerShell VerifyOnly prepares all assets without any GitHub API ca
   fs.mkdirSync(path.join(root,'scripts'));fs.mkdirSync(path.join(root,'src-tauri'));fs.mkdirSync(path.join(root,'artifacts'));
   for(const name of ['publish-verified-update.ps1','check-updater-readiness.cjs','prepare-release.cjs','verify-update-contract.cjs','verify-installer.cjs']) fs.copyFileSync(path.join('scripts',name),path.join(root,'scripts',name));
   fs.writeFileSync(path.join(root,'scripts/test-packaged-installer.ps1'),"param([string]$Installer)\n# UI execution is tested separately with the real signed installer on CI.\n");
-  fs.copyFileSync('updater-readiness.json',path.join(root,'updater-readiness.json'));
   const {input}=fixture();
+  const policy=JSON.parse(fs.readFileSync('updater-readiness.json'));
+  policy.version=input.version; // This isolated signed fixture deliberately remains 2.4.2.
+  fs.writeFileSync(path.join(root,'updater-readiness.json'),JSON.stringify(policy));
   fs.writeFileSync(path.join(root,'src-tauri/tauri.conf.json'),JSON.stringify({version:input.version,plugins:{updater:{pubkey:input.publicKey}}}));
   const installer=path.join(root,'artifacts',input.asset);
   fs.writeFileSync(installer,input.artifact);fs.writeFileSync(installer+'.sig',input.artifactSignature);

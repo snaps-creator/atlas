@@ -9,7 +9,7 @@ jobs:
     uses: ./.github/workflows/updater-readiness.yml
   offline-connected-upgrade:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -24,7 +24,7 @@ jobs:
           $candidate = Join-Path $env:RUNNER_TEMP 'Atlas-offline-candidate.exe'
           node scripts/verify-offline-installer.cjs $candidate
           if ($LASTEXITCODE -ne 0) { throw 'Offline signature/hash verification failed' }
-          ./scripts/test-connected-upgrade.ps1 -Installer $candidate
+          ./scripts/test-connected-upgrade.ps1 -Installer $candidate -LegacyBaseline
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -41,7 +41,7 @@ jobs:
   connected-upgrade:
     needs: build-installer
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:

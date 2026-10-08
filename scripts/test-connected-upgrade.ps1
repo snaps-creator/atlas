@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Installer)
+param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline)
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.
@@ -173,13 +173,16 @@ function Install-Checked([string]$path) {
         throw "Installer failed: $($process.ExitCode)"
     }
 }
-$previousName = 'Atlas_2.2.3-alpha.47.1_x64-setup.exe'
+$previousVersion = if ($LegacyBaseline) { '2.2.3-alpha.47.1' } else { '2.4.2' }
+$previousName = "Atlas_${previousVersion}_x64-setup.exe"
 $previous = Join-Path $fixture $previousName
-$base = 'https://github.com/snaps-creator/atlas/releases/download/v2.2.3-alpha.47.1/'
+$base = "https://github.com/snaps-creator/atlas/releases/download/v$previousVersion/"
 Invoke-WebRequest ($base + $previousName) -OutFile $previous
 Invoke-WebRequest ($base + $previousName + '.sig') -OutFile "$previous.sig"
 node (Join-Path $PSScriptRoot 'verify-installer.cjs') $previous
 if ($LASTEXITCODE -ne 0) { throw 'Old release signature does not match Atlas trust' }
+$previousRoot = $installRoot
+if ($LegacyBaseline) {
 # Seed the actual signed old binaries and register their real service. The
 # regression concerns upgrading an EXISTING old installation, not whether its
 # obsolete cleanup hook can provision a fresh Windows Server CI image.
@@ -192,6 +195,16 @@ if (Test-Path -LiteralPath (Join-Path $installRoot '$PLUGINSDIR')) { throw 'NSIS
 Copy-Item (Join-Path $installRoot 'Atlas.exe') (Join-Path $installRoot 'Atlas.Service.exe')
 $register = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--install-service' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'register.log') -RedirectStandardError (Join-Path $fixture 'register.err')
 if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old service registration failed: $(Get-Content (Join-Path $fixture 'register.err') -Raw)" }
+} else {
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') seed
+    if ($LASTEXITCODE -ne 0) { throw 'Mixed-source fixture initialization failed' }
+    Install-Checked $previous
+    $oldJournal=Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+    if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne '2.4.2') { throw 'Real 2.4.2 installation was not committed' }
+    $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
+    & $maintenance --prepare-install $previousRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
+}
 $core = $null
 $desktop = $null
 try {
@@ -217,7 +230,7 @@ rules:
   - MATCH,DIRECT
 '@ | Set-Content -LiteralPath $config -Encoding utf8
     Start-Service AtlasNetworkService
-    $core = Start-Process -FilePath (Join-Path $installRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'core.log') -RedirectStandardError (Join-Path $fixture 'core.err')
+    $core = Start-Process -FilePath (Join-Path $previousRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'core.log') -RedirectStandardError (Join-Path $fixture 'core.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
         if ($core.HasExited) { throw "Old core exited: $(Get-Content (Join-Path $fixture 'core.log') -Raw)" }
@@ -227,7 +240,7 @@ rules:
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($adapter.Status -ne 'Up') { throw 'Fixture did not establish a real active Atlas-TUN' }
     # Keep an actual old Atlas desktop host open without user settings/UI/VPN.
-    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $installRoot 'Atlas.exe'), '--identity-owner')
+    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $previousRoot 'Atlas.exe'), '--identity-owner')
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardInput = $true
@@ -241,7 +254,7 @@ rules:
         $journal = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
         if ($journal.stage -ne 'Committed') { throw 'Upgrade was not durably committed' }
         $activeRoot = Join-Path $installRoot ('versions/' + $journal.active.id)
-        $expectedVersion = (Get-Content (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version
+        $expectedVersion = if ($LegacyBaseline) { '2.4.2' } else { (Get-Content (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version }
         if ($journal.active.version -ne $expectedVersion) { throw 'Wrong active version after upgrade' }
         # Commit already checked authenticated UI/service readiness. Stop this
         # disposable runner's candidate before the independent TUN reuse test.
@@ -253,7 +266,12 @@ rules:
     if ($LASTEXITCODE -ne 0 -or -not $baseline) { throw 'Update left an active or unverified Atlas-TUN' }
     if ((Get-Service AtlasNetworkService).Status -ne 'Stopped') { throw 'Service still runs after update' }
     & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe')
-    Write-Output 'PASS: signed 2.2.3 -> candidate upgrade with real active Wintun, service and desktop; old processes exited, tunnel released, new UI rendered.'
+    Write-Output "PASS: signed $previousVersion -> candidate upgrade with real active Wintun, service and desktop."
+    if (-not $LegacyBaseline) {
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
+        if ($LASTEXITCODE -ne 0) { throw 'Upgrade lost mixed sources or persisted references/credentials' }
+        & (Join-Path $PSScriptRoot 'test-installed-startup.ps1') -InstallRoot $installRoot -Maintenance $maintenance
+    }
     $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
@@ -302,6 +320,13 @@ rules:
         if ($reinstalled.stage -ne 'Committed' -or $reinstalled.active.id -ne $journal.candidate.id) { throw 'Reinstall after recovery did not commit the candidate' }
         Write-Output 'PASS: candidate reinstalls successfully after installed rollback and repeated recovery.'
         foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
+            $runKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+            $approvedKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+            if (-not $LegacyBaseline) {
+                New-Item -Path $runKey,$approvedKey -Force | Out-Null
+                New-ItemProperty -Path $runKey -Name Atlas -PropertyType String -Value ('"'+(Join-Path $installRoot 'AtlasUpdater.exe')+'" --launch --autostart') -Force | Out-Null
+                New-ItemProperty -Path $approvedKey -Name Atlas -PropertyType Binary -Value ([byte[]](2,0,0,0,0,0,0,0,0,0,0,0)) -Force | Out-Null
+            }
             $uninstaller = Join-Path $installRoot 'uninstall.exe'
             $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
             $null = $remove.Handle
@@ -324,7 +349,14 @@ rules:
             }
             $inspection = & $maintenance --inspect | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Uninstall did not restore the network baseline' }
-            Write-Output "PASS: $cycle; service removed and network baseline restored."
+            if (-not $LegacyBaseline) {
+                foreach ($key in @($runKey,$approvedKey)) {
+                    if ((Get-Item -LiteralPath $key).GetValueNames() -contains 'Atlas') { throw 'Uninstall left Atlas startup registration' }
+                }
+            }
+            & curl.exe --fail --silent --max-time 20 https://example.com/ --output NUL
+            if ($LASTEXITCODE -ne 0) { throw 'Direct network control failed after uninstall' }
+            Write-Output "PASS: $cycle; service removed, startup cleaned and network baseline restored."
             if ($cycle -eq 'upgrade uninstall') { Install-Checked $candidate }
         }
     }

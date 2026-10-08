@@ -1,0 +1,101 @@
+name: Atlas remediation acceptance
+on:
+  push:
+    branches: [codex/unified-sources-startup]
+permissions:
+  contents: read
+concurrency:
+  group: atlas-remediation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  candidate:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      ATLAS_BUILD_ID: ${{ github.sha }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/t/release-clean
+      CARGO_INCREMENTAL: "0"
+      RUST_TEST_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.3
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: npm install --global npm@11.16.0
+      - run: npm ci
+      - run: npm test
+      - run: node --test scripts/*.check.cjs
+      - run: node scripts/check-updater-readiness.cjs
+      - name: Clean signed candidate from this commit
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/build-release-installer.ps1 -Clean -Signed -TargetDirectory t/release-clean -OutputDirectory artifacts/release
+      - name: Backend and real restricted-process regression suite
+        shell: pwsh
+        run: |
+          . ./scripts/initialize-msvc.ps1
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance --bin AtlasUpdater
+          if ($LASTEXITCODE -ne 0) { throw 'Backend regression suite failed' }
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
+          if ($LASTEXITCODE -ne 0) { throw 'Restricted desktop regression failed' }
+      - name: Verify packaged interface and publication preparation without publishing
+        shell: pwsh
+        run: |
+          $version=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          ./scripts/test-packaged-installer.ps1 -Installer "artifacts/release/Atlas_${version}_x64-setup.exe"
+          ./scripts/publish-verified-update.ps1 -Installer "artifacts/release/Atlas_${version}_x64-setup.exe" -VerifyOnly
+      - uses: actions/upload-artifact@v7
+        with:
+          name: remediation-candidate-${{ github.sha }}
+          path: |
+            artifacts/release/*setup.exe
+            artifacts/release/*setup.exe.sig
+            artifacts/release/update-manifest.json*
+            artifacts/release/build.json
+            artifacts/release/verification/verification.json
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: remediation-build-evidence
+          path: ${{ runner.temp }}/atlas-ui-acceptance-*/**
+  installed:
+    needs: candidate
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.3
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: remediation-candidate-${{ github.sha }}
+          path: candidate
+      - name: Actual signed 2.4.2 upgrade, startup matrix, recovery and uninstall
+        shell: pwsh
+        run: |
+          $version=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          node scripts/verify-installer.cjs "candidate/Atlas_${version}_x64-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed' }
+          ./scripts/test-connected-upgrade.ps1 -Installer "candidate/Atlas_${version}_x64-setup.exe"
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: remediation-installed-evidence
+          path: |
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
+          retention-days: 7
