@@ -110,6 +110,7 @@ pub fn uninstall(root:&Path)->Result<(),String>{
     crate::update_service::Service::remove()?;
     crate::network_guard::wait_for_clean_baseline(std::time::Duration::from_secs(5))?;
     for name in ["Atlas.exe","Atlas.Service.exe","AtlasUpdater.exe","AtlasMaintenance.exe"]{files.insert(name.into());}
+    crate::uninstall_startup::cleanup(&root)?;
     remove_root_payload(&root,files)?;
     for directory in states.into_iter().chain([root.join("versions")]) {
         if directory.exists(){std::fs::remove_dir_all(&directory).map_err(|e|format!("Cannot remove Atlas installation state: {e}"))?;}
