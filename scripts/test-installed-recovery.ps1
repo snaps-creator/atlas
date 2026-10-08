@@ -29,6 +29,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # pretend to kill the kernel, reboot Windows or reproduce physical power loss.
 Write-InterruptedRecoveryFixture -Root $root -Journal $journal
 foreach ($attempt in 1..2) {
+    if ($attempt -eq 2) {
+        # Reproduce an idle service/closed desktop deterministically before retry.
+        & $Maintenance --prepare-install $previousRoot
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce restored fixture before recovery retry' }
+    }
     $process = Start-Process -FilePath (Join-Path $root 'AtlasUpdater.exe') -ArgumentList '--recover' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root "recovery-$attempt.log") -RedirectStandardError (Join-Path $root "recovery-$attempt.err")
     $null = $process.Handle
     if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'Installed recovery timed out' }
