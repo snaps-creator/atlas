@@ -8,7 +8,7 @@ permissions:
 jobs:
   installed-diagnostic:
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
         with:
@@ -21,15 +21,15 @@ jobs:
           python-version: '3.13'
       - uses: actions/download-artifact@v4
         with:
-          name: remediation-candidate-253e2ed4f5c5efb407a7e255a0900c26bc886b37
-          run-id: 37853071368
+          name: remediation-candidate-ff10f54b4306e323da63fbd144163536933b78de
+          run-id: 37875396482
           github-token: ${{ github.token }}
           path: candidate
       - name: Diagnose existing signed candidate; not a final-SHA gate
         shell: pwsh
         run: |
           $candidate='candidate/Atlas_2.4.3_x64-setup.exe'
-          if ((Get-FileHash $candidate -Algorithm SHA256).Hash -ne 'a144f9b1d4e932fcf5cc67d5ed5bbd4a06ea2b6812ceca3ebb417ded21ae3446') { throw 'Diagnostic candidate identity mismatch' }
+          if ((Get-FileHash $candidate -Algorithm SHA256).Hash -ne '66f3168a2a51184665a2cb004af719954023555581b77abc3d479f67c267d72b') { throw 'Diagnostic candidate identity mismatch' }
           node scripts/verify-installer.cjs $candidate
           if ($LASTEXITCODE -ne 0) { throw 'Signature verification failed' }
           ./scripts/test-connected-upgrade.ps1 -Installer $candidate
@@ -42,3 +42,4 @@ jobs:
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
             ${{ runner.temp }}/atlas-ui-acceptance-*/**
+
