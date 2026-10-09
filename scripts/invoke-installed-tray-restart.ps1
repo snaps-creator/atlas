@@ -41,6 +41,16 @@ public static class AtlasTrayAcceptance {
     }
 }
 '@
+$desktop=[System.Windows.Automation.AutomationElement]::RootElement
+$buttons=$desktop.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button))
+foreach($b in $buttons) {
+ if($b.Current.ProcessId -eq $ProcessId) {continue}
+ Write-Output ("Shell button: " + $b.Current.Name + " owner=" + $b.Current.ProcessId)
+ if($b.Current.Name -in @('Show hidden icons','Notification Chevron','Show Hidden Icons')) {
+  $pattern=$null
+  if($b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) {$pattern.Invoke();Start-Sleep -Milliseconds 300}
+ }
+}
 [AtlasTrayAcceptance]::Open([uint32]$ProcessId)
 $menuName=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
 $owner=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$ProcessId)
@@ -64,4 +74,5 @@ do {
 $matches=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$menuName)
 $matches | ForEach-Object { [pscustomobject]@{menuOwner=$_.Current.ProcessId;control=$_.Current.ControlType.ProgrammaticName;patterns=@($_.GetSupportedPatterns() | ForEach-Object ProgrammaticName)} } | ConvertTo-Json -Depth 3 | Write-Output
 throw 'Installed Atlas Restart menu item was not accessible'
+
 
