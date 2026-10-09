@@ -354,23 +354,46 @@ mod tests {
     }
     #[test]
     fn delete_source_then_rollback_refuses_missing_credential_without_mutation() {
+        struct Credentials(Vec<keyring::Entry>);
+        impl Drop for Credentials {
+            fn drop(&mut self) {
+                for entry in &self.0 { let _=entry.delete_credential(); }
+            }
+        }
+        let mut fixture=legacy_fixture();
+        let mut credentials=Credentials(Vec::new());
+        for source in fixture["subscriptions"].as_array_mut().unwrap() {
+            // Real WinCred entries, isolated from every user source even if an
+            // assertion fails. No existing Atlas credentials are read or changed.
+            let id=format!("atlas-rollback-test-{}",uuid::Uuid::new_v4());
+            source["id"]=serde_json::json!(id);
+            let entry=keyring::Entry::new("AtlasVPN",&id).unwrap();
+            credentials.0.push(entry);
+            credentials.0.last().unwrap().set_password("https://example.test/rollback-fixture").unwrap();
+        }
         let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        let before=decode_settings(&serde_json::to_vec(&legacy_fixture()).unwrap()).unwrap();
+        let before=decode_settings(&serde_json::to_vec(&fixture).unwrap()).unwrap();
         store.save(&before).unwrap();
-        let deleted_id=before.subscriptions[0].id.clone();
         let mut after=before.clone(); after.subscriptions.remove(0);
         crate::model::repository::reconcile_references(&before,&mut after);
         store.save(&after).unwrap();
+        credentials.0[0].delete_credential().unwrap();
+        assert!(matches!(credentials.0[0].get_password(),Err(keyring::Error::NoEntry)));
         let encrypted=payload(&store.db);
         let backup=store.previous().unwrap();
-        let credentials=after.subscriptions.iter().map(|s|s.id.clone()).collect::<std::collections::HashSet<_>>();
-        let result=crate::settings_write::require_credentials(&backup,|id|credentials.contains(id));
+        let exists=|id:&str| keyring::Entry::new("AtlasVPN",id).unwrap().get_password().is_ok();
+        let result=crate::settings_write::require_credentials(&backup,exists);
         assert!(result.is_err());
-        assert!(!credentials.contains(&deleted_id));
         assert_eq!(payload(&store.db),encrypted);
         assert_eq!(store.load().unwrap().subscriptions.len(),after.subscriptions.len());
         assert_eq!(store.load().unwrap().selected_node_id,after.selected_node_id);
         assert_eq!(store.load().unwrap().favorites,after.favorites);
+        // Only a real replacement credential makes the previous source usable.
+        credentials.0[0].set_password("https://example.test/reentered-fixture").unwrap();
+        crate::settings_write::require_credentials(&backup,exists).unwrap();
+        store.save(&backup).unwrap();
+        assert_eq!(store.load().unwrap().subscriptions.len(),before.subscriptions.len());
+        assert_eq!(credentials.0[0].get_password().unwrap(),"https://example.test/reentered-fixture");
     }
 
     #[test]
