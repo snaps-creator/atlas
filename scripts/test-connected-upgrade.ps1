@@ -300,7 +300,9 @@ rules:
     if (-not $LegacyBaseline) {
         & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
         if ($LASTEXITCODE -ne 0) { throw 'Upgrade lost mixed sources or persisted references/credentials' }
-        Write-Output 'DIAGNOSTIC ONLY: startup matrix was independently exercised; focusing this run on recovery and uninstall'
+        & (Join-Path $PSScriptRoot 'test-installed-startup.ps1') -InstallRoot $installRoot -Maintenance $maintenance
+        Write-Output 'DIAGNOSTIC ONLY: completed focused installed Restart regression'
+        return
     }
     $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
