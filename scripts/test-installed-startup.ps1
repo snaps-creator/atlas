@@ -118,7 +118,9 @@ try {
             if (-not $case.tray -and $shown.Count -eq 0) { throw "Startup $($case.name): window never became visible" }
             $saved=Fixture state | ConvertFrom-Json
             if ($saved.wasConnected -ne $case.connect -or $saved.lastWindowHidden -ne $case.tray) { throw 'Runtime state was not persisted correctly' }
-            $run=Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Atlas -ErrorAction SilentlyContinue
+            $runKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+            try { $run=if ($runKey) { $runKey.GetValue('Atlas',$null) } else { $null } }
+            finally { if ($runKey) { $runKey.Dispose() } }
             if ($case.windows -and $run -ne ('"'+(Join-Path $InstallRoot 'AtlasUpdater.exe')+'" --launch --autostart')) { throw 'Startup registration does not use the current stable launcher' }
             if (-not $case.windows -and $run) { throw 'Disabled startup still registered' }
             if ($case.connect) {
