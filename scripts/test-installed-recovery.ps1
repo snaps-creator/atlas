@@ -22,6 +22,23 @@ $previousRoot = Join-Path $root ('versions/' + $previous)
 $candidateRoot = Join-Path $root ('versions/' + $journal.candidate.id)
 $service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
 if ($service.PathName -ne ('"' + (Join-Path $candidateRoot 'Atlas.Service.exe') + '" --network-service')) { throw 'Refusing recovery of a service outside this candidate fixture' }
+# A same-version installer returns after launching the desktop. Its setup holds
+# the production update lease briefly; recovery must begin after that hand-off,
+# not race it with a zero-timeout maintenance request. Never bypass the lease.
+$lease = $null
+try { $lease = [Threading.Mutex]::OpenExisting('Global\Atlas.Update.Transaction.v1') }
+catch [Threading.WaitHandleCannotBeOpenedException] { } # No remaining owner/handle.
+if ($lease) {
+    $acquired = $false
+    try {
+        try { $acquired = $lease.WaitOne(30000) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw 'Installed startup did not release the update lease within 30 seconds' }
+    } finally {
+        if ($acquired) { $lease.ReleaseMutex() }
+        $lease.Dispose()
+    }
+}
 & $Maintenance --prepare-install $candidateRoot
 if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # Inject a persisted interrupted-activation state into this disposable fixture.

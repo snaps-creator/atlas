@@ -79,6 +79,7 @@ $cases = @(
     @{name='G';windows=$false;auto=$false;tray=$false;restore=$true;was=$false;explicit=$true;connect=$false},
     @{name='H';windows=$false;auto=$false;tray=$true;restore=$false;was=$false;explicit=$true;connect=$false}
 )
+$failures = [System.Collections.Generic.List[string]]::new()
 try {
     Quiesce
     Fixture verify | Write-Output
@@ -117,7 +118,9 @@ try {
             if (-not $case.tray -and $shown.Count -eq 0) { throw "Startup $($case.name): window never became visible" }
             $saved=Fixture state | ConvertFrom-Json
             if ($saved.wasConnected -ne $case.connect -or $saved.lastWindowHidden -ne $case.tray) { throw 'Runtime state was not persisted correctly' }
-            $run=Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Atlas -ErrorAction SilentlyContinue
+            $runKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+            try { $run=if ($runKey) { $runKey.GetValue('Atlas',$null) } else { $null } }
+            finally { if ($runKey) { $runKey.Dispose() } }
             if ($case.windows -and $run -ne ('"'+(Join-Path $InstallRoot 'AtlasUpdater.exe')+'" --launch --autostart')) { throw 'Startup registration does not use the current stable launcher' }
             if (-not $case.windows -and $run) { throw 'Disabled startup still registered' }
             if ($case.connect) {
@@ -147,7 +150,9 @@ try {
             @(Events | Where-Object { $_.kind -in @('application_event','passive_sample') } | Select-Object -Last 20 |
                 ForEach-Object { [pscustomobject]@{kind=$_.kind;status=$_.value.status;message=$_.value.message;error=$_.value.error} }) |
                 ConvertTo-Json -Depth 3 | Write-Output
-            throw
+            $failures.Add("Startup $($case.name): $($_.Exception.Message)")
+            Write-Warning $failures[$failures.Count-1]
         } finally { [AtlasWindowHistory]::Stop(); Quiesce }
     }
+    if ($failures.Count) { throw ($failures -join '; ') }
 } finally { Quiesce }

@@ -182,6 +182,10 @@ Invoke-WebRequest ($base + $previousName + '.sig') -OutFile "$previous.sig"
 node (Join-Path $PSScriptRoot 'verify-installer.cjs') $previous
 if ($LASTEXITCODE -ne 0) { throw 'Old release signature does not match Atlas trust' }
 $previousRoot = $installRoot
+$core = $null
+$desktop = $null
+$fixtureServer = $null
+try {
 if ($LegacyBaseline) {
 # Seed the actual signed old binaries and register their real service. The
 # regression concerns upgrading an EXISTING old installation, not whether its
@@ -196,18 +200,40 @@ Copy-Item (Join-Path $installRoot 'Atlas.exe') (Join-Path $installRoot 'Atlas.Se
 $register = Start-Process -FilePath (Join-Path $installRoot 'Atlas.exe') -ArgumentList '--install-service' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'register.log') -RedirectStandardError (Join-Path $fixture 'register.err')
 if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old service registration failed: $(Get-Content (Join-Path $fixture 'register.err') -Raw)" }
 } else {
-    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') seed
+    # Use a real authenticated VLESS peer on the disposable runner. A closed
+    # synthetic port correctly fails Atlas's pinned-path validation even in
+    # DIRECT routing mode. No production validation is disabled for acceptance.
+    $network = Get-NetIPConfiguration | Where-Object IPv4DefaultGateway | Select-Object -First 1
+    $peerAddress = @($network.IPv4Address)[0].IPAddress
+    if (-not $peerAddress) { throw 'No IPv4 interface for the disposable VLESS peer' }
+    $reservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse($peerAddress),0)
+    $reservation.Start()
+    $peerPort = $reservation.LocalEndpoint.Port
+    $reservation.Stop()
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') seed $peerPort $peerAddress
     if ($LASTEXITCODE -ne 0) { throw 'Mixed-source fixture initialization failed' }
+    $peerExecutable = Join-Path $fixture 'fixture-vless-server.exe'
+    Copy-Item (Join-Path $candidateFiles '$PLUGINSDIR/payload/resources/Atlas.Xray.exe') $peerExecutable
+    $peerConfig = Join-Path $env:RUNNER_TEMP 'atlas-acceptance-vless.json'
+    $fixtureServer = Start-Process -FilePath $peerExecutable -ArgumentList @('run','-config',"`"$peerConfig`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'peer.log') -RedirectStandardError (Join-Path $fixture 'peer.err')
+    $peerReady = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        if ($fixtureServer.HasExited) { throw 'Disposable VLESS peer failed to start' }
+        $socket = [Net.Sockets.TcpClient]::new()
+        try { $peerReady = $socket.ConnectAsync($peerAddress,$peerPort).Wait(500) -and $socket.Connected } catch {} finally { $socket.Dispose() }
+        if (-not $peerReady) { Start-Sleep -Milliseconds 100 }
+    } while (-not $peerReady -and [DateTime]::UtcNow -lt $deadline)
+    if (-not $peerReady) { throw 'Disposable VLESS peer did not open its listener' }
     Install-Checked $previous
     $oldJournal=Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
     if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne '2.4.2') { throw 'Real 2.4.2 installation was not committed' }
     $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
     & $maintenance --prepare-install $previousRoot
     if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') prepare-upgrade
+    if ($LASTEXITCODE -ne 0) { throw 'Valid installed 2.4.2 references were not established' }
 }
-$core = $null
-$desktop = $null
-try {
     # A real tunnel, but deliberately NO automatic/default routes, no system DNS
     # and no external VPN server. This cannot route the CI control connection.
     $config = Join-Path $fixture 'tun.yaml'
@@ -266,12 +292,16 @@ rules:
     if ($LASTEXITCODE -ne 0 -or -not $baseline) { throw 'Update left an active or unverified Atlas-TUN' }
     if ((Get-Service AtlasNetworkService).Status -ne 'Stopped') { throw 'Service still runs after update' }
     Write-Output "PASS: signed $previousVersion -> candidate upgrade with real active Wintun, service and desktop."
+    # Retain the original first-post-upgrade smoke position. A failure remains
+    # fatal at the end, but must not hide independent installed acceptance.
+    $isolatedUiError = $null
+    try { & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe') }
+    catch { $isolatedUiError = $_.Exception.Message; Write-Warning "Isolated UI failure retained: $isolatedUiError" }
     if (-not $LegacyBaseline) {
         & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
         if ($LASTEXITCODE -ne 0) { throw 'Upgrade lost mixed sources or persisted references/credentials' }
         & (Join-Path $PSScriptRoot 'test-installed-startup.ps1') -InstallRoot $installRoot -Maintenance $maintenance
     }
-    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe')
     $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
@@ -360,8 +390,13 @@ rules:
             if ($cycle -eq 'upgrade uninstall') { Install-Checked $candidate }
         }
     }
+    if ($isolatedUiError) { throw "Installed checks completed, but isolated UI lifecycle failed: $isolatedUiError" }
+} catch {
+    # Keep the primary failure visible even if the independent cleanup fails.
+    Write-Output "Installed acceptance failure: $($_.Exception.Message)"
+    throw
 } finally {
-    foreach ($process in @($core,$desktop)) {
+    foreach ($process in @($core,$desktop,$fixtureServer)) {
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
     }
     # The guard above established that this disposable job created the service.
