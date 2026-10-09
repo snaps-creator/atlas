@@ -13,6 +13,7 @@ try {
     $env:ATLAS_UI_SMOKE_REPORT = $report
     $process = Start-Process -FilePath $exe -WorkingDirectory $directory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $evidence 'stdout.log') -RedirectStandardError (Join-Path $evidence 'stderr.log')
     $null = $process.Handle
+    $observer = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $PSScriptRoot 'observe-ui-waits.ps1')+'"'),'-ObservedPid',$process.Id,'-Executable',('"'+$exe+'"'),'-Evidence',('"'+$evidence+'"')) -WindowStyle Hidden -PassThru
     $exited = $process.WaitForExit(25000)
     $renderAcknowledged = $false
     if (Test-Path -LiteralPath $report) {
@@ -65,3 +66,4 @@ try {
     $env:ATLAS_UI_SMOKE_REPORT = $previousReport
     # Keep the render acknowledgement and logs for CI failure artifacts.
 }
+
