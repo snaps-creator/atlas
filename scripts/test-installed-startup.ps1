@@ -53,6 +53,7 @@ public static class AtlasWindowHistory {
     public static void Stop() { PostThreadMessage(threadId,0x12,UIntPtr.Zero,IntPtr.Zero); if(!worker.Join(5000)) throw new Exception("Window observer failed to stop"); }
 }
 '@
+& (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot
 function Quiesce {
     & $Maintenance --prepare-install $active
     if ($LASTEXITCODE -ne 0) { throw 'Candidate did not quiesce safely' }
@@ -129,6 +130,41 @@ try {
             }
             Fixture verify | Write-Output
             Write-Output "PASS installed startup $($case.name): $expected; tray=$($case.tray); connect count=$($connected.Count); visible events=$($shown.Count)"
+            if ($case.name -eq 'A') {
+                $oldPid=$owners[0].ProcessId
+                if ($owners[0].CommandLine -notmatch '--autostart') { throw 'Restart regression must begin with a real Windows startup process' }
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-button.ps1') -ProcessId $oldPid -Name 'Настройки'
+                if ($LASTEXITCODE -ne 0) { throw 'Cannot open installed settings' }
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-button.ps1') -ProcessId $oldPid -Name 'Запускать с Windows' -ToggleOff
+                if ($LASTEXITCODE -ne 0) { throw 'Cannot disable Windows startup through installed UI' }
+                $deadline=[DateTime]::UtcNow.AddSeconds(10)
+                do {
+                    $saved=Fixture state | ConvertFrom-Json
+                    if (-not $saved.startup.launchWithWindows) { break }
+                    Start-Sleep -Milliseconds 100
+                } while ([DateTime]::UtcNow -lt $deadline)
+                if ($saved.startup.launchWithWindows) { throw 'Installed UI did not persist disabled startup' }
+                $startsBefore=@(Events | Where-Object kind -eq 'application_start').Count
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1') -ProcessId $oldPid -Name 'Перезагрузить'
+                if ($LASTEXITCODE -ne 0) { throw 'Real installed tray restart failed' }
+                $deadline=[DateTime]::UtcNow.AddSeconds(30)
+                do {
+                    $restarted=@(Get-CimInstance Win32_Process -Filter "Name='Atlas.exe'" | Where-Object { $_.ExecutablePath -eq $desktopExe -and $_.CommandLine -notmatch '--type=' })
+                    if ($restarted.Count -eq 1 -and $restarted[0].ProcessId -ne $oldPid -and $restarted[0].CommandLine -match '--manual-restart') { break }
+                    Start-Sleep -Milliseconds 200
+                } while ([DateTime]::UtcNow -lt $deadline)
+                if ($restarted.Count -ne 1 -or $restarted[0].ProcessId -eq $oldPid -or $restarted[0].CommandLine -notmatch '--manual-restart' -or $restarted[0].CommandLine -match '--autostart') { throw 'Restart did not create exactly one process with fresh launch arguments' }
+                Start-Sleep -Seconds 16
+                if (-not (Get-Process -Id $restarted[0].ProcessId -ErrorAction SilentlyContinue)) { throw 'Restarted application exited after Windows startup was disabled' }
+                $restartEvents=@(Events)
+                $restartSamples=@($restartEvents | Where-Object kind -eq 'passive_sample')
+                if (@($restartEvents | Where-Object kind -eq 'application_start').Count -le $startsBefore -or $restartSamples.Count -eq 0 -or $restartSamples[-1].value.status -ne 'Disconnected') { throw 'Restarted application did not complete initialization' }
+                if (-not (@([AtlasWindowHistory]::VisiblePids.ToArray()) -contains $restarted[0].ProcessId)) { throw 'Manual restart failed to restore the visible window' }
+                $saved=Fixture state | ConvertFrom-Json
+                if ($saved.startup.launchWithWindows) { throw 'Restart reverted disabled startup' }
+                Fixture verify | Write-Output
+                Write-Output 'PASS: real --autostart launch -> UI disables Windows startup -> tray Restart -> fresh process stays alive'
+            }
             if ($case.name -eq 'D') {
                 foreach ($step in @(@{button='Отключить VPN';connected=$false},@{button='Подключить VPN';connected=$true},@{button='Отключить VPN';connected=$false})) {
                     # UIAutomation uses the real React action and backend IPC.

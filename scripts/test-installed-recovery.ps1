@@ -26,20 +26,20 @@ if ($service.PathName -ne ('"' + (Join-Path $candidateRoot 'Atlas.Service.exe') 
 # the production update lease briefly; recovery must begin after that hand-off,
 # not race it with a zero-timeout maintenance request. Never bypass the lease.
 function Wait-RecoveryStartup {
-$lease = $null
-try { $lease = [Threading.Mutex]::OpenExisting('Global\Atlas.Update.Transaction.v1') }
-catch [Threading.WaitHandleCannotBeOpenedException] { } # No remaining owner/handle.
-if ($lease) {
-    $acquired = $false
-    try {
-        try { $acquired = $lease.WaitOne(30000) }
-        catch [Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) { throw 'Installed startup did not release the update lease within 30 seconds' }
-    } finally {
-        if ($acquired) { $lease.ReleaseMutex() }
-        $lease.Dispose()
+    $lease = $null
+    try { $lease = [Threading.Mutex]::OpenExisting('Global\Atlas.Update.Transaction.v1') }
+    catch [Threading.WaitHandleCannotBeOpenedException] { } # No remaining owner/handle.
+    if ($lease) {
+        $acquired = $false
+        try {
+            try { $acquired = $lease.WaitOne(30000) }
+            catch [Threading.AbandonedMutexException] { $acquired = $true }
+            if (-not $acquired) { throw 'Installed startup did not release the update lease within 30 seconds' }
+        } finally {
+            if ($acquired) { $lease.ReleaseMutex() }
+            $lease.Dispose()
+        }
     }
-}
 }
 Wait-RecoveryStartup
 & $Maintenance --prepare-install $candidateRoot
