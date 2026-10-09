@@ -7,6 +7,7 @@ permissions:
   actions: read
 jobs:
   installed-diagnostic:
+    if: ${{ false }}
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
@@ -42,3 +43,39 @@ jobs:
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
             ${{ runner.temp }}/atlas-ui-acceptance-*/**
+
+  ui-wait-diagnostic:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: remediation-candidate-253e2ed4f5c5efb407a7e255a0900c26bc886b37
+          run-id: 37853071368
+          github-token: ${{ github.token }}
+          path: candidate
+      - name: Compare blocking wait with polling using unchanged signed bytes
+        shell: pwsh
+        run: |
+          $candidate='candidate/Atlas_2.4.3_x64-setup.exe'
+          if ((Get-FileHash $candidate -Algorithm SHA256).Hash -ne 'a144f9b1d4e932fcf5cc67d5ed5bbd4a06ea2b6812ceca3ebb417ded21ae3446') { throw 'Diagnostic candidate mismatch' }
+          & 7z x $candidate -oui-fixture -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Extraction failed' }
+          $exe='ui-fixture/$PLUGINSDIR/payload/Atlas.exe'
+          $results=@()
+          foreach ($poll in @($false,$true,$false,$true)) {
+            $watch=[Diagnostics.Stopwatch]::StartNew()
+            try { ./scripts/test-ui-startup.ps1 -Executable $exe -Poll:$poll; $result='PASS' }
+            catch { $result=$_.Exception.Message }
+            $results += [pscustomobject]@{poll=$poll;seconds=$watch.Elapsed.TotalSeconds;result=$result}
+          }
+          $results | ConvertTo-Json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ui-wait-diagnostic-evidence
+          retention-days: 7
+          path: ${{ runner.temp }}/atlas-ui-acceptance-*/**

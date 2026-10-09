@@ -1,5 +1,11 @@
-param([Parameter(Mandatory=$true)][string]$Executable)
+param([Parameter(Mandatory=$true)][string]$Executable,[switch]$Poll)
 $ErrorActionPreference = 'Stop'
+function Wait-Observed($Observed) {
+    if (-not $Poll) { return $Observed.WaitForExit(25000) }
+    $limit=[DateTime]::UtcNow.AddSeconds(25)
+    while (-not $Observed.HasExited -and [DateTime]::UtcNow -lt $limit) { Start-Sleep -Milliseconds 100 }
+    return $Observed.HasExited
+}
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Split-Path $exe -Parent
 $evidenceRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
@@ -14,7 +20,7 @@ try {
     $process = Start-Process -FilePath $exe -WorkingDirectory $directory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $evidence 'stdout.log') -RedirectStandardError (Join-Path $evidence 'stderr.log')
     $null = $process.Handle
     $observer = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $PSScriptRoot 'observe-ui-waits.ps1')+'"'),'-ObservedPid',$process.Id,'-Executable',('"'+$exe+'"'),'-Evidence',('"'+$evidence+'"')) -WindowStyle Hidden -PassThru
-    $exited = $process.WaitForExit(25000)
+    $exited = Wait-Observed $process
     $renderAcknowledged = $false
     if (Test-Path -LiteralPath $report) {
         $ack = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
@@ -25,7 +31,7 @@ try {
         # a separate lifecycle stage, including in immutable historical fixtures.
         # Do not retry or kill-and-pass: require a normal bounded process exit.
         Write-Output 'Render/IPC acknowledged within startup deadline; awaiting normal CEF shutdown.'
-        $exited = $process.WaitForExit(25000)
+        $exited = Wait-Observed $process
     }
     if (-not $exited) {
         Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe } |
@@ -66,4 +72,5 @@ try {
     $env:ATLAS_UI_SMOKE_REPORT = $previousReport
     # Keep the render acknowledgement and logs for CI failure artifacts.
 }
+
 
