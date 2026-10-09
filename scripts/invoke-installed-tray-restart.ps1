@@ -19,6 +19,7 @@ public static class AtlasTrayAcceptance {
     [DllImport("user32.dll",SetLastError=true)] static extern bool GetCursorPos(out Point point);
     [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref Icon icon,out Rect rect);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string name,string title);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern uint RegisterWindowMessage(string name);
     public static void Open(uint pid) {
         IntPtr found=IntPtr.Zero;
         EnumWindows((window,state)=> {
@@ -30,6 +31,8 @@ public static class AtlasTrayAcceptance {
             return true;
         },IntPtr.Zero);
         if(found==IntPtr.Zero) throw new Exception("Installed Atlas tray window not found");
+        PostMessage(found,RegisterWindowMessage("TaskbarCreated"),UIntPtr.Zero,IntPtr.Zero);
+        System.Threading.Thread.Sleep(500);
         Point cursor; bool cursorOk=GetCursorPos(out cursor);
         Console.WriteLine("Tray probe cursor="+cursorOk+" error="+Marshal.GetLastWin32Error());
         for(uint id=1;id<=8;id++) {
@@ -75,6 +78,7 @@ do {
 $matches=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$menuName)
 $matches | ForEach-Object { [pscustomobject]@{menuOwner=$_.Current.ProcessId;control=$_.Current.ControlType.ProgrammaticName;patterns=@($_.GetSupportedPatterns() | ForEach-Object ProgrammaticName)} } | ConvertTo-Json -Depth 3 | Write-Output
 throw 'Installed Atlas Restart menu item was not accessible'
+
 
 
 
