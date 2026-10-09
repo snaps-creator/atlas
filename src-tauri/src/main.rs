@@ -33,7 +33,11 @@ fn run_application() {
         let result = tauri::Builder::default()
             .runtime(tauri_runtime_cef::Cef::default().root_cache_path(smoke_cache))
             .invoke_handler(tauri::generate_handler![ui_smoke_ready])
-            .on_page_load(|webview, _| {
+            .on_page_load(|webview, payload| {
+                ui_smoke_stage(match payload.event() {
+                    tauri::webview::PageLoadEvent::Started => "PageLoadStarted",
+                    tauri::webview::PageLoadEvent::Finished => "PageLoadFinished",
+                });
                 let _ = webview.eval(r#"(() => { const timer = setInterval(() => { if (document.querySelector('main') && document.querySelectorAll('button').length >= 5) { clearInterval(timer); window.__TAURI_INTERNALS__.invoke('ui_smoke_ready', { title: document.title, buttons: document.querySelectorAll('button').length }); } }, 100); })()"#);
             })
             .setup(|app| {
@@ -45,7 +49,15 @@ fn run_application() {
                 });
                 Ok(())
             })
-            .run(tauri::generate_context!());
+            .build(tauri::generate_context!());
+        let result = result.map(|app| app.run(|_, event| {
+            match event {
+                tauri::RunEvent::ExitRequested { .. } => ui_smoke_stage("ExitRequested"),
+                tauri::RunEvent::Exit => ui_smoke_stage("Exit"),
+                _ => {}
+            }
+        }));
+        ui_smoke_stage("RunReturned");
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     let args: Vec<String> = std::env::args().collect();
@@ -117,8 +129,21 @@ fn run_application() {
 #[tauri::command]
 fn ui_smoke_ready(app: tauri::AppHandle, title: String, buttons: usize) {
     if buttons < 5 { return; }
+    ui_smoke_stage("RenderAcknowledged");
     if let Some(path) = std::env::var_os("ATLAS_UI_SMOKE_REPORT") {
         if std::fs::write(path, serde_json::json!({"rendered":true,"title":title,"buttons":buttons,"version":env!("CARGO_PKG_VERSION")}).to_string()).is_err() { app.exit(2); return; }
     }
     std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(500)); app.exit(0); });
+}
+
+// Diagnostics belong only to the isolated smoke mode; no application settings,
+// URLs, credentials or network state are included.
+fn ui_smoke_stage(stage: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("ATLAS_UI_SMOKE_REPORT") {
+        let path = format!("{}.lifecycle.log", std::path::Path::new(&path).display());
+        if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(log, "{:?} {stage}", std::time::SystemTime::now());
+        }
+    }
 }

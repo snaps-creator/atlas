@@ -31,6 +31,7 @@ try {
             Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json |
             Set-Content (Join-Path $evidence 'processes.json')
         if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
+        if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
         Get-Content (Join-Path $evidence 'stderr.log') -Tail 40
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         if ($renderAcknowledged) { throw 'Atlas UI rendered but did not exit within the additional 25-second shutdown deadline' }

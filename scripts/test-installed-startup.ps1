@@ -141,6 +141,13 @@ try {
                 }
                 Write-Output 'PASS: real UI disconnect, reconnect, explicit disconnect persisted'
             }
+        } catch {
+            # Only synthetic runner data is used. Restrict failure output to the
+            # lifecycle fields; never dump credentials, configs or traffic logs.
+            @(Events | Where-Object { $_.kind -in @('application_event','passive_sample') } | Select-Object -Last 20 |
+                ForEach-Object { [pscustomobject]@{kind=$_.kind;status=$_.value.status;message=$_.value.message;error=$_.value.error} }) |
+                ConvertTo-Json -Depth 3 | Write-Output
+            throw
         } finally { [AtlasWindowHistory]::Stop(); Quiesce }
     }
 } finally { Quiesce }
