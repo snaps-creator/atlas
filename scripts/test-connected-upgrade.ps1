@@ -391,6 +391,10 @@ rules:
         }
     }
     if ($isolatedUiError) { throw "Installed checks completed, but isolated UI lifecycle failed: $isolatedUiError" }
+} catch {
+    # Keep the primary failure visible even if the independent cleanup fails.
+    Write-Output "Installed acceptance failure: $($_.Exception.Message)"
+    throw
 } finally {
     foreach ($process in @($core,$desktop,$fixtureServer)) {
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
