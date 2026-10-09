@@ -25,6 +25,7 @@ if ($service.PathName -ne ('"' + (Join-Path $candidateRoot 'Atlas.Service.exe') 
 # A same-version installer returns after launching the desktop. Its setup holds
 # the production update lease briefly; recovery must begin after that hand-off,
 # not race it with a zero-timeout maintenance request. Never bypass the lease.
+function Wait-RecoveryStartup {
 $lease = $null
 try { $lease = [Threading.Mutex]::OpenExisting('Global\Atlas.Update.Transaction.v1') }
 catch [Threading.WaitHandleCannotBeOpenedException] { } # No remaining owner/handle.
@@ -39,6 +40,8 @@ if ($lease) {
         $lease.Dispose()
     }
 }
+}
+Wait-RecoveryStartup
 & $Maintenance --prepare-install $candidateRoot
 if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # Inject a persisted interrupted-activation state into this disposable fixture.
@@ -48,6 +51,7 @@ Write-InterruptedRecoveryFixture -Root $root -Journal $journal
 foreach ($attempt in 1..2) {
     if ($attempt -eq 2) {
         # Reproduce an idle service/closed desktop deterministically before retry.
+        Wait-RecoveryStartup
         & $Maintenance --prepare-install $previousRoot
         if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce restored fixture before recovery retry' }
     }
