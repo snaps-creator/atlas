@@ -98,6 +98,15 @@ with sqlite3.connect(database, timeout=10) as db:
             state.update(patch)
             db.execute("UPDATE state SET payload=? WHERE id=1", (dpapi(json.dumps(state).encode(), True),))
         elif action == "verify":
+            def references(snapshot):
+                nodes = [n for source in snapshot["subscriptions"] for n in source["servers"]]
+                return dict(nodeNames=[n.get("name") for n in nodes],
+                    favorites=snapshot["favorites"], selected=snapshot.get("selected"),
+                    sourceTypes=[s["source"] for s in snapshot["subscriptions"]])
+            print("AFTER " + json.dumps(references(state), ensure_ascii=False))
+            old = db.execute("SELECT payload FROM migration_backups3 WHERE version=3").fetchone()
+            if old:
+                print("BEFORE " + json.dumps(references(json.loads(dpapi(old[0], False))), ensure_ascii=False))
             assert db.execute("PRAGMA user_version").fetchone()[0] == 3
             assert "activeSource" not in state and "sourceSelections" not in state
             assert len(state["subscriptions"]) == 2
