@@ -2,6 +2,7 @@
 import ctypes as c
 from ctypes import wintypes as w
 import json
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -61,12 +62,14 @@ def credential(source, value=None):
 directory = Path(os.environ["LOCALAPPDATA"]) / "net.atlasvpn.desktop"
 directory.mkdir(exist_ok=True)
 database = directory / "atlas.db"
+credential_hashes = Path(os.environ["RUNNER_TEMP"]) / "atlas-acceptance-credential-hashes.json"
 action = sys.argv[1]
 with sqlite3.connect(database, timeout=10) as db:
     if action == "seed":
         if db.execute("SELECT name FROM sqlite_master WHERE name='state'").fetchone():
             raise SystemExit("Refusing to replace existing application state")
         sources = []
+        expected_credentials = {}
         for kind in ["URL", "VLESS"]:
             identity = "acceptance-" + str(uuid.uuid4())
             client = str(uuid.uuid4())
@@ -74,6 +77,7 @@ with sqlite3.connect(database, timeout=10) as db:
             uri = f"vless://{client}@127.0.0.1:9?security=none&type=tcp#{kind}"
             value = "https://example.test/acceptance-only" if kind == "URL" else uri
             credential(identity, value)
+            expected_credentials[identity] = hashlib.sha256(value.encode()).hexdigest()
             sources.append(dict(id=identity, name=name, source=kind,
                 maskedUrl="https://example.test/***" if kind == "URL" else "vless://***",
                 updatedAt=int(time.time()), error=None,
@@ -90,6 +94,7 @@ with sqlite3.connect(database, timeout=10) as db:
                          "CREATE TABLE backups(id INTEGER PRIMARY KEY AUTOINCREMENT,created INTEGER NOT NULL,payload BLOB NOT NULL);"
                          "PRAGMA user_version=2;")
         db.execute("INSERT INTO state VALUES(1,?)", (dpapi(json.dumps(state).encode(), True),))
+        credential_hashes.write_text(json.dumps(expected_credentials), encoding="utf-8")
         print("Synthetic encrypted URL + VLESS state and two user credentials seeded")
     else:
         state = json.loads(dpapi(db.execute("SELECT payload FROM state WHERE id=1").fetchone()[0], False))
@@ -126,13 +131,18 @@ with sqlite3.connect(database, timeout=10) as db:
             assert original["selected"] == chosen["name"]
             assert set(original["favorites"]) == {n["name"] for n in nodes}
             assert {s["id"] for s in original["subscriptions"]} == {s["id"] for s in state["subscriptions"]}
+            expected_credentials = json.loads(credential_hashes.read_text(encoding="utf-8"))
+            assert set(expected_credentials) == {s["id"] for s in state["subscriptions"]}
             for source in state["subscriptions"]:
                 assert source["options"]["userAgentOverride"] == "AtlasAcceptance/1"
                 assert source["options"]["updateIntervalHours"] == 24
                 assert source["name"] == "Acceptance " + source["source"]
                 value = credential(source["id"])
+                assert hashlib.sha256(value.encode()).hexdigest() == expected_credentials[source["id"]]
                 if source["source"] == "VLESS":
-                    assert source["servers"][0]["uuid"] in value and value.startswith("vless://")
+                    node = source["servers"][0]
+                    client = node.get("uuid") if node["type"] != "xray" else node["xray"]["outbounds"][0]["settings"]["vnext"][0]["users"][0]["id"]
+                    assert client in value and value.startswith("vless://")
                 else:
                     assert value == "https://example.test/acceptance-only"
             print("PASS: schema, mixed sources, names, source IDs, selection, favorites, options and credentials")
