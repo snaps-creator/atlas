@@ -203,9 +203,7 @@ if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old
     # Use a real authenticated VLESS peer on the disposable runner. A closed
     # synthetic port correctly fails Atlas's pinned-path validation even in
     # DIRECT routing mode. No production validation is disabled for acceptance.
-    $network = Get-NetIPConfiguration | Where-Object IPv4DefaultGateway | Select-Object -First 1
-    $peerAddress = @($network.IPv4Address)[0].IPAddress
-    if (-not $peerAddress) { throw 'No IPv4 interface for the disposable VLESS peer' }
+    $peerAddress = & (Join-Path $PSScriptRoot 'select-installed-peer-address.ps1')
     $reservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse($peerAddress),0)
     $reservation.Start()
     $peerPort = $reservation.LocalEndpoint.Port
