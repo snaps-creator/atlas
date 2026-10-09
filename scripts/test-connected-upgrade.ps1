@@ -204,6 +204,8 @@ if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old
     $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
     & $maintenance --prepare-install $previousRoot
     if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') prepare-upgrade
+    if ($LASTEXITCODE -ne 0) { throw 'Valid installed 2.4.2 references were not established' }
 }
 $core = $null
 $desktop = $null
@@ -266,12 +268,16 @@ rules:
     if ($LASTEXITCODE -ne 0 -or -not $baseline) { throw 'Update left an active or unverified Atlas-TUN' }
     if ((Get-Service AtlasNetworkService).Status -ne 'Stopped') { throw 'Service still runs after update' }
     Write-Output "PASS: signed $previousVersion -> candidate upgrade with real active Wintun, service and desktop."
+    # Retain the original first-post-upgrade smoke position. A failure remains
+    # fatal at the end, but must not hide independent installed acceptance.
+    $isolatedUiError = $null
+    try { & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe') }
+    catch { $isolatedUiError = $_.Exception.Message; Write-Warning "Isolated UI failure retained: $isolatedUiError" }
     if (-not $LegacyBaseline) {
         & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
         if ($LASTEXITCODE -ne 0) { throw 'Upgrade lost mixed sources or persisted references/credentials' }
         & (Join-Path $PSScriptRoot 'test-installed-startup.ps1') -InstallRoot $installRoot -Maintenance $maintenance
     }
-    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe')
     $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
@@ -360,6 +366,7 @@ rules:
             if ($cycle -eq 'upgrade uninstall') { Install-Checked $candidate }
         }
     }
+    if ($isolatedUiError) { throw "Installed checks completed, but isolated UI lifecycle failed: $isolatedUiError" }
 } finally {
     foreach ($process in @($core,$desktop)) {
         if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }

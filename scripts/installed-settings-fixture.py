@@ -93,20 +93,26 @@ with sqlite3.connect(database, timeout=10) as db:
         print("Synthetic encrypted URL + VLESS state and two user credentials seeded")
     else:
         state = json.loads(dpapi(db.execute("SELECT payload FROM state WHERE id=1").fetchone()[0], False))
-        if action == "patch":
+        if action == "prepare-upgrade":
+            # The real 2.4.2 startup reparses VLESS and assigns its runtime name.
+            # Establish user references AFTER that load, while 2.4.2 is stopped;
+            # a seed-only name is not a valid installed user selection.
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert {s["source"] for s in state["subscriptions"]} == {"URL", "VLESS"}
+            nodes = [n for source in state["subscriptions"] for n in source["servers"]]
+            assert len(nodes) == 2 and len({n["name"] for n in nodes}) == 2
+            source = next(s for s in state["subscriptions"] if s["source"] == "VLESS")
+            state["activeSource"] = "VLESS"
+            state["selected"] = source["servers"][0]["name"]
+            state["sourceSelections"] = {s["source"]:s["servers"][0]["name"] for s in state["subscriptions"]}
+            state["favorites"] = [n["name"] for n in nodes]
+            db.execute("UPDATE state SET payload=? WHERE id=1", (dpapi(json.dumps(state).encode(), True),))
+            print("PASS: stopped real 2.4.2 has two valid favorites and an explicit VLESS selection before upgrade")
+        elif action == "patch":
             patch = json.loads(sys.argv[2])
             state.update(patch)
             db.execute("UPDATE state SET payload=? WHERE id=1", (dpapi(json.dumps(state).encode(), True),))
         elif action == "verify":
-            def references(snapshot):
-                nodes = [n for source in snapshot["subscriptions"] for n in source["servers"]]
-                return dict(nodeNames=[n.get("name") for n in nodes],
-                    favorites=snapshot["favorites"], selected=snapshot.get("selected"),
-                    sourceTypes=[s["source"] for s in snapshot["subscriptions"]])
-            print("AFTER " + json.dumps(references(state), ensure_ascii=False))
-            old = db.execute("SELECT payload FROM migration_backups3 WHERE version=3").fetchone()
-            if old:
-                print("BEFORE " + json.dumps(references(json.loads(dpapi(old[0], False))), ensure_ascii=False))
             assert db.execute("PRAGMA user_version").fetchone()[0] == 3
             assert "activeSource" not in state and "sourceSelections" not in state
             assert len(state["subscriptions"]) == 2
@@ -114,7 +120,12 @@ with sqlite3.connect(database, timeout=10) as db:
             ids = {n["atlas"]["nodeId"] for n in nodes}
             assert len(ids) == 2 and set(state["favorites"]) == ids
             chosen = next(n for n in nodes if n["atlas"]["nodeId"] == state["selectedNodeId"])
-            assert chosen["name"] == "Acceptance VLESS"
+            vless = next(s for s in state["subscriptions"] if s["source"] == "VLESS")
+            assert chosen["atlas"]["sourceId"] == vless["id"] and chosen["name"] == state["selected"]
+            original = json.loads(dpapi(db.execute("SELECT payload FROM migration_backups3 WHERE version=3").fetchone()[0], False))
+            assert original["selected"] == chosen["name"]
+            assert set(original["favorites"]) == {n["name"] for n in nodes}
+            assert {s["id"] for s in original["subscriptions"]} == {s["id"] for s in state["subscriptions"]}
             for source in state["subscriptions"]:
                 assert source["options"]["userAgentOverride"] == "AtlasAcceptance/1"
                 assert source["options"]["updateIntervalHours"] == 24
