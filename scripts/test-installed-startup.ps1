@@ -30,6 +30,8 @@ public static class AtlasWindowHistory {
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder text,int max);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int cmd);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr FindWindow(string name,string title);
+    public static bool ShellReady() { return FindWindow("Shell_TrayWnd",null)!=IntPtr.Zero; }
     public static void Start() {
         uint ignored; while(VisiblePids.TryDequeue(out ignored)) {}
         var ready=new ManualResetEventSlim();
@@ -53,6 +55,14 @@ public static class AtlasWindowHistory {
     public static void Stop() { PostThreadMessage(threadId,0x12,UIntPtr.Zero,IntPtr.Zero); if(!worker.Join(5000)) throw new Exception("Window observer failed to stop"); }
 }
 '@
+# A hosted runner may start without Explorer. A real notification area is a
+# prerequisite for invoking the installed tray menu, unlike policy-only tests.
+if (-not [AtlasWindowHistory]::ShellReady()) {
+    Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -WindowStyle Hidden | Out-Null
+    $shellDeadline=[DateTime]::UtcNow.AddSeconds(15)
+    while (-not [AtlasWindowHistory]::ShellReady() -and [DateTime]::UtcNow -lt $shellDeadline) { Start-Sleep -Milliseconds 100 }
+}
+if (-not [AtlasWindowHistory]::ShellReady()) { throw 'Installed tray acceptance requires the Windows notification area' }
 function Quiesce {
     & $Maintenance --prepare-install $active
     if ($LASTEXITCODE -ne 0) { throw 'Candidate did not quiesce safely' }
