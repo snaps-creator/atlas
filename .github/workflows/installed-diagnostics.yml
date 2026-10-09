@@ -58,6 +58,7 @@ jobs:
           github-token: ${{ github.token }}
           path: candidate
       - name: Compare blocking wait with polling using unchanged signed bytes
+        timeout-minutes: 6
         shell: pwsh
         run: |
           $candidate='candidate/Atlas_2.4.3_x64-setup.exe'
@@ -73,9 +74,13 @@ jobs:
             $results += [pscustomobject]@{poll=$poll;seconds=$watch.Elapsed.TotalSeconds;result=$result}
           }
           $results | ConvertTo-Json
+          $results | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'atlas-ui-acceptance-results.json')
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ui-wait-diagnostic-evidence
           retention-days: 7
-          path: ${{ runner.temp }}/atlas-ui-acceptance-*/**
+          path: |
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
+            ${{ runner.temp }}/atlas-ui-acceptance-results.json
+

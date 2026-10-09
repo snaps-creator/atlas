@@ -19,7 +19,6 @@ try {
     $env:ATLAS_UI_SMOKE_REPORT = $report
     $process = Start-Process -FilePath $exe -WorkingDirectory $directory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $evidence 'stdout.log') -RedirectStandardError (Join-Path $evidence 'stderr.log')
     $null = $process.Handle
-    $observer = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-File',('"'+(Join-Path $PSScriptRoot 'observe-ui-waits.ps1')+'"'),'-ObservedPid',$process.Id,'-Executable',('"'+$exe+'"'),'-Evidence',('"'+$evidence+'"')) -WindowStyle Hidden -PassThru
     $exited = Wait-Observed $process
     $renderAcknowledged = $false
     if (Test-Path -LiteralPath $report) {
@@ -40,10 +39,6 @@ try {
         if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
         if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
         Get-Content (Join-Path $evidence 'stderr.log') -Tail 40
-        try {
-            & (Join-Path $PSScriptRoot 'test-ui-waits.ps1') -ProcessId $process.Id -Executable $exe |
-                Set-Content (Join-Path $evidence 'wait-chains.json')
-        } catch { Write-Warning "Wait-chain inspection unavailable: $($_.Exception.Message)" }
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         if ($renderAcknowledged) { throw 'Atlas UI rendered but did not exit within the additional 25-second shutdown deadline' }
         throw 'Atlas UI did not acknowledge rendering/IPC within 25 seconds'
@@ -72,5 +67,4 @@ try {
     $env:ATLAS_UI_SMOKE_REPORT = $previousReport
     # Keep the render acknowledgement and logs for CI failure artifacts.
 }
-
 
