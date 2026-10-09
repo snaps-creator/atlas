@@ -38,6 +38,7 @@ fn run_application() {
                     tauri::webview::PageLoadEvent::Started => "PageLoadStarted",
                     tauri::webview::PageLoadEvent::Finished => "PageLoadFinished",
                 });
+                if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) { return; }
                 let _ = webview.eval(r#"(() => { const timer = setInterval(() => { if (document.querySelector('main') && document.querySelectorAll('button').length >= 5) { clearInterval(timer); window.__TAURI_INTERNALS__.invoke('ui_smoke_ready', { title: document.title, buttons: document.querySelectorAll('button').length }); } }, 100); })()"#);
             })
             .setup(|app| {
@@ -45,7 +46,7 @@ fn run_application() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(12));
-                    handle.exit(1);
+                    if claim_ui_smoke_completion(2) { handle.exit(1); }
                 });
                 Ok(())
             })
@@ -126,9 +127,17 @@ fn run_application() {
 
 // Only registered in the isolated UI acceptance mode above. A window/process
 // existing is not success: React must render and CEF IPC must reach this command.
+// Rendering and its watchdog must start at most one exit flow. A second exit
+// after the runtime channel closes takes Tauri's immediate process-exit path,
+// racing CEF shutdown instead of allowing the event loop to return normally.
+static UI_SMOKE_COMPLETION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+fn claim_ui_smoke_completion(outcome: u8) -> bool {
+    UI_SMOKE_COMPLETION.compare_exchange(0, outcome,
+        std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok()
+}
 #[tauri::command]
 fn ui_smoke_ready(app: tauri::AppHandle, title: String, buttons: usize) {
-    if buttons < 5 { return; }
+    if buttons < 5 || !claim_ui_smoke_completion(1) { return; }
     ui_smoke_stage("RenderAcknowledged");
     if let Some(path) = std::env::var_os("ATLAS_UI_SMOKE_REPORT") {
         if std::fs::write(path, serde_json::json!({"rendered":true,"title":title,"buttons":buttons,"version":env!("CARGO_PKG_VERSION")}).to_string()).is_err() { app.exit(2); return; }
