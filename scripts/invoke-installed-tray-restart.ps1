@@ -18,6 +18,7 @@ public static class AtlasTrayAcceptance {
     [StructLayout(LayoutKind.Sequential)] struct Icon {public uint size;public IntPtr window;public uint id;public Guid guid;}
     [DllImport("user32.dll",SetLastError=true)] static extern bool GetCursorPos(out Point point);
     [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref Icon icon,out Rect rect);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string name,string title);
     public static void Open(uint pid) {
         IntPtr found=IntPtr.Zero;
         EnumWindows((window,state)=> {
@@ -41,7 +42,7 @@ public static class AtlasTrayAcceptance {
     }
 }
 '@
-$desktop=[System.Windows.Automation.AutomationElement]::RootElement
+$desktop=[System.Windows.Automation.AutomationElement]::FromHandle([AtlasTrayAcceptance]::FindWindow("Shell_TrayWnd",$null))
 $buttons=$desktop.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button))
 foreach($b in $buttons) {
  if($b.Current.ProcessId -eq $ProcessId) {continue}
@@ -74,5 +75,6 @@ do {
 $matches=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$menuName)
 $matches | ForEach-Object { [pscustomobject]@{menuOwner=$_.Current.ProcessId;control=$_.Current.ControlType.ProgrammaticName;patterns=@($_.GetSupportedPatterns() | ForEach-Object ProgrammaticName)} } | ConvertTo-Json -Depth 3 | Write-Output
 throw 'Installed Atlas Restart menu item was not accessible'
+
 
 
