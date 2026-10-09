@@ -33,6 +33,10 @@ try {
         if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
         if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
         Get-Content (Join-Path $evidence 'stderr.log') -Tail 40
+        try {
+            & (Join-Path $PSScriptRoot 'test-ui-waits.ps1') -ProcessId $process.Id -Executable $exe |
+                Set-Content (Join-Path $evidence 'wait-chains.json')
+        } catch { Write-Warning "Wait-chain inspection unavailable: $($_.Exception.Message)" }
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         if ($renderAcknowledged) { throw 'Atlas UI rendered but did not exit within the additional 25-second shutdown deadline' }
         throw 'Atlas UI did not acknowledge rendering/IPC within 25 seconds'
