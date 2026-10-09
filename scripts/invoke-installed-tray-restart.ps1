@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][int]$ProcessId)
+param([Parameter(Mandatory=$true)][int]$ProcessId,[Parameter(Mandatory=$true)][string]$Name)
 $ErrorActionPreference='Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable GitHub Windows runner required' }
 Add-Type -AssemblyName UIAutomationClient
@@ -30,9 +30,9 @@ public static class AtlasTrayAcceptance {
 }
 '@
 [AtlasTrayAcceptance]::Open([uint32]$ProcessId)
-$name=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Перезагрузить')
+$menuName=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
 $owner=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$ProcessId)
-$condition=[System.Windows.Automation.AndCondition]::new($name,$owner)
+$condition=[System.Windows.Automation.AndCondition]::new($menuName,$owner)
 $deadline=[DateTime]::UtcNow.AddSeconds(10)
 do {
     $item=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)

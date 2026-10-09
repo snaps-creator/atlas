@@ -144,7 +144,8 @@ try {
                     Start-Sleep -Milliseconds 100
                 } while ([DateTime]::UtcNow -lt $deadline)
                 if ($saved.startup.launchWithWindows) { throw 'Installed UI did not persist disabled startup' }
-                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1') -ProcessId $oldPid
+                $startsBefore=@(Events | Where-Object kind -eq 'application_start').Count
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1') -ProcessId $oldPid -Name 'Перезагрузить'
                 if ($LASTEXITCODE -ne 0) { throw 'Real installed tray restart failed' }
                 $deadline=[DateTime]::UtcNow.AddSeconds(30)
                 do {
@@ -155,6 +156,10 @@ try {
                 if ($restarted.Count -ne 1 -or $restarted[0].ProcessId -eq $oldPid -or $restarted[0].CommandLine -notmatch '--manual-restart' -or $restarted[0].CommandLine -match '--autostart') { throw 'Restart did not create exactly one process with fresh launch arguments' }
                 Start-Sleep -Seconds 16
                 if (-not (Get-Process -Id $restarted[0].ProcessId -ErrorAction SilentlyContinue)) { throw 'Restarted application exited after Windows startup was disabled' }
+                $restartEvents=@(Events)
+                $restartSamples=@($restartEvents | Where-Object kind -eq 'passive_sample')
+                if (@($restartEvents | Where-Object kind -eq 'application_start').Count -le $startsBefore -or $restartSamples.Count -eq 0 -or $restartSamples[-1].value.status -ne 'Disconnected') { throw 'Restarted application did not complete initialization' }
+                if (-not (@([AtlasWindowHistory]::VisiblePids.ToArray()) -contains $restarted[0].ProcessId)) { throw 'Manual restart failed to restore the visible window' }
                 $saved=Fixture state | ConvertFrom-Json
                 if ($saved.startup.launchWithWindows) { throw 'Restart reverted disabled startup' }
                 Fixture verify | Write-Output
