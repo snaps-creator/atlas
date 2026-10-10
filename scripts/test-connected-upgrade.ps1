@@ -393,6 +393,10 @@ rules:
             }
             & curl.exe --fail --silent --max-time 20 https://example.com/ --output NUL
             if ($LASTEXITCODE -ne 0) { throw 'Direct network control failed after uninstall' }
+            if (-not $LegacyBaseline) {
+                & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
+                if ($LASTEXITCODE -ne 0) { throw 'Uninstall changed preserved sources, settings, references or credentials' }
+            }
             Write-Output "PASS: $cycle; service removed, startup cleaned and network baseline restored."
             if ($cycle -eq 'upgrade uninstall') { Install-Checked $candidate }
         }

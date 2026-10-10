@@ -27,3 +27,5 @@ Sandbox блокировал один WinCred fixture (NoStorageAccess1312) и r
 Промежуточная unsigned упаковка на6da9c05:191827706 байт, SHA25674cf5833b63bbc51498abfc23f7e0b1465792fd3ab1a96ad6401e02a0e8cd0ad;32 файла,x64/metadata/receipt/pinned hashes/corruption rejection PASS. Не clean target,не signed,не final artifact и не установлена. После этого функционального review убран повторный синхронный route query из selector: network epoch теперь принадлежит только асинхронному service monitor; stale-work regression выполнена отдельно.
 
 Финальный review:10 selection +8 monitor +12 broker regressions PASS после удаления повторного route query.
+
+Installed harness regression: preparation/verification branches tested in isolated in-memory SQLite fixtures for schema2 (2.4.2) and schema3 (actual2.4.3), including altered-name and overwritten-backup rejection. Legacy installed acceptance on f26dfe0 passed rollback, reinstall, fresh install/uninstall and two real synthetic offline NTUSER.DAT cleanups preserving unrelated entries: https://github.com/snaps-creator/atlas/actions/runs/38075294004. This is partial prior-SHA evidence; final-head CI remains required.

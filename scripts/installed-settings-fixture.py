@@ -64,6 +64,7 @@ directory = Path(os.environ["LOCALAPPDATA"]) / "net.atlasvpn.desktop"
 directory.mkdir(exist_ok=True)
 database = directory / "atlas.db"
 credential_hashes = Path(os.environ["RUNNER_TEMP"]) / "atlas-acceptance-credential-hashes.json"
+upgrade_references = Path(os.environ["RUNNER_TEMP"]) / "atlas-acceptance-upgrade-references.json"
 action = sys.argv[1]
 with sqlite3.connect(database, timeout=10) as db:
     if action == "seed":
@@ -111,20 +112,34 @@ with sqlite3.connect(database, timeout=10) as db:
     else:
         state = json.loads(dpapi(db.execute("SELECT payload FROM state WHERE id=1").fetchone()[0], False))
         if action == "prepare-upgrade":
-            # The real 2.4.2 startup reparses VLESS and assigns its runtime name.
-            # Establish user references AFTER that load, while 2.4.2 is stopped;
-            # a seed-only name is not a valid installed user selection.
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+            # Establish references after the baseline has loaded the fixture.
+            # Published 2.4.2 uses names/schema 2; candidate 2.4.3 already uses
+            # source-scoped identities/schema 3 and has a migration backup.
+            schema = db.execute("PRAGMA user_version").fetchone()[0]
+            assert schema in (2, 3)
             assert {s["source"] for s in state["subscriptions"]} == {"URL", "VLESS"}
             nodes = [n for source in state["subscriptions"] for n in source["servers"]]
             assert len(nodes) == 2 and len({n["name"] for n in nodes}) == 2
             source = next(s for s in state["subscriptions"] if s["source"] == "VLESS")
-            state["activeSource"] = "VLESS"
             state["selected"] = source["servers"][0]["name"]
-            state["sourceSelections"] = {s["source"]:s["servers"][0]["name"] for s in state["subscriptions"]}
-            state["favorites"] = [n["name"] for n in nodes]
+            if schema == 2:
+                state["activeSource"] = "VLESS"
+                state["sourceSelections"] = {s["source"]:s["servers"][0]["name"] for s in state["subscriptions"]}
+                state["favorites"] = [n["name"] for n in nodes]
+                backup_hash = None
+            else:
+                assert "activeSource" not in state and "sourceSelections" not in state
+                state["selectedNodeId"] = source["servers"][0]["atlas"]["nodeId"]
+                state["favorites"] = [n["atlas"]["nodeId"] for n in nodes]
+                assert len(set(state["favorites"])) == 2
+                backup = db.execute("SELECT payload FROM migration_backups3 WHERE version=3").fetchone()[0]
+                backup_hash = hashlib.sha256(backup).hexdigest()
+            upgrade_references.write_text(json.dumps(dict(schema=schema, selected=state["selected"],
+                sourceIds=sorted(s["id"] for s in state["subscriptions"]),
+                names=sorted(n["name"] for n in nodes), selectedNodeId=state.get("selectedNodeId"),
+                favorites=state["favorites"], backupHash=backup_hash)), encoding="utf-8")
             db.execute("UPDATE state SET payload=? WHERE id=1", (dpapi(json.dumps(state).encode(), True),))
-            print("PASS: stopped real 2.4.2 has two valid favorites and an explicit VLESS selection before upgrade")
+            print(f"PASS: stopped real schema-{schema} baseline has two valid favorites and an explicit VLESS selection before upgrade")
         elif action == "patch":
             patch = json.loads(sys.argv[2])
             state.update(patch)
@@ -139,10 +154,20 @@ with sqlite3.connect(database, timeout=10) as db:
             chosen = next(n for n in nodes if n["atlas"]["nodeId"] == state["selectedNodeId"])
             vless = next(s for s in state["subscriptions"] if s["source"] == "VLESS")
             assert chosen["atlas"]["sourceId"] == vless["id"] and chosen["name"] == state["selected"]
-            original = json.loads(dpapi(db.execute("SELECT payload FROM migration_backups3 WHERE version=3").fetchone()[0], False))
-            assert original["selected"] == chosen["name"]
-            assert set(original["favorites"]) == {n["name"] for n in nodes}
-            assert {s["id"] for s in original["subscriptions"]} == {s["id"] for s in state["subscriptions"]}
+            expected = json.loads(upgrade_references.read_text(encoding="utf-8"))
+            assert expected["selected"] == chosen["name"]
+            assert expected["names"] == sorted(n["name"] for n in nodes)
+            assert expected["sourceIds"] == sorted(s["id"] for s in state["subscriptions"])
+            backup = db.execute("SELECT payload FROM migration_backups3 WHERE version=3").fetchone()[0]
+            if expected["schema"] == 2:
+                original = json.loads(dpapi(backup, False))
+                assert original["selected"] == expected["selected"]
+                assert original["favorites"] == expected["favorites"]
+                assert sorted(s["id"] for s in original["subscriptions"]) == expected["sourceIds"]
+            else:
+                assert expected["selectedNodeId"] == state["selectedNodeId"]
+                assert set(expected["favorites"]) == set(state["favorites"])
+                assert hashlib.sha256(backup).hexdigest() == expected["backupHash"]
             expected_credentials = json.loads(credential_hashes.read_text(encoding="utf-8"))
             assert set(expected_credentials) == {s["id"] for s in state["subscriptions"]}
             for source in state["subscriptions"]:

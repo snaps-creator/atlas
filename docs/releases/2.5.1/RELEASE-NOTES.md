@@ -9,4 +9,3 @@ VPN сохраняет намерение подключиться, ждёт д�
 Один полный офлайн-установщик Atlas-Setup-2.5.1.exe содержит UI,сетевую службу,Mihomo,Xray,CEF,maintenance/updater. Обновление выполняется транзакционно с проверкой файлов и rollback. Источники,credentials,избранное,выбранный сервер и startup preferences сохраняются. Установка может прервать VPN для переключения версии.
 
 Реальный reboot/power loss,hidden CEF workload и multi-user offline-hive acceptance остаются ограничениями, указанными в release readiness. Подпись Atlas updates отличается от Authenticode. Перед публикацией обязательны signed build и installed acceptance на соответствующем main SHA.
-
