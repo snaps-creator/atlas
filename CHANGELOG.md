@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.5.1 (unpublished)
+
+- Combine URL subscriptions and manual VLESS sources in one repository, Add source dialog and server list; preserve source-scoped identity and selection across migration and refresh.
+- Persist connection intent before starting VPN, keep visibility independent, and re-arm bounded retries after a confirmed network change. Source refresh no longer owns a reconnect loop.
+- Schedule fair bounded reserve probes without requiring a manual ping. Keep healthy connections stable; latency optimization requires explicit opt-in.
+- Reject unauthorized IPC clients without tearing down a surviving session, retain a bounded owner admission deadline and record queue/reply/core timings.
+- Journal Windows credential compensation, retain configuration checkpoints on source errors, expose startup registration failures and inspect registered offline user hives during uninstall.
+- Coalesce repeated incident failures, record build/session identity and avoid serializing the whole history on every append.
+- Produce one full offline installer, `Atlas-Setup-2.5.1.exe`, distributed only as a GitHub Releases asset. Replace tracked legacy installer parts with signed CI acceptance; require separate manual authorization for publication.
+
+Actual evidence and remaining release gates: [2.5.1 readiness](docs/releases/2.5.1/10-RELEASE-READINESS.md).
+
 ## 2.4.3 (candidate)
 
 - Unify URL subscriptions and VLESS keys into one source repository and server pool, preserving source identity, selection and favorites during migration and refresh.
