@@ -60,7 +60,6 @@ pub(crate) struct Recovery {
     route_revision: u64,
     last_line: Option<String>,
     blocked: HashMap<String,Quarantine>,
-    network_epoch: Option<String>,
     pending: Option<Pending>,
     retry_at: Option<Instant>,
     needed: bool,
@@ -254,14 +253,9 @@ impl Recovery {
     }
     pub fn tick(&mut self, client: ApiClient, settings: &Settings) {
         let now = Instant::now();
-        if let Some(epoch) = crate::network_guard::default_route_signature() {
-            if self.network_epoch.as_ref().is_some_and(|old|old != &epoch) {
-                self.blocked.clear();
-                self.invalidate();
-                client.event(json!({"at":crate::model::now(),"kind":"network_epoch_changed","health":"prior network evidence discarded"}));
-            }
-            self.network_epoch = Some(epoch);
-        }
+        // HealthState owns the debounced asynchronous network observer.
+        // A second synchronous Windows query here would block pipe admission
+        // and invalidate evidence before that observer confirms an epoch.
         let servers = settings.servers();
         self.blocked.retain(|key,_| servers.iter().any(|n|node_key(n)==*key));
         let lines = client.logs().unwrap_or_default();
@@ -462,6 +456,23 @@ pub(crate) fn verify_names(client: &ApiClient, names: &[String], controls: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmed_observer_epoch_discards_quarantine_and_stale_jobs() {
+        let now=Instant::now();
+        let mut recovery=Recovery::default();
+        recovery.blocked.insert("old-node".into(),Quarantine{probe_after:now,failures:1});
+        recovery.probe_attempts.insert("old-node".into(),now);
+        recovery.samples.insert("old-node".into(),NodeSample{checked_at:now,primary_delay:None,alive:false});
+        recovery.propose_for_test(json!({"candidate":"old-node"}));
+        let previous_epoch=recovery.path_epoch();
+        let cancelled=recovery.cancelled.clone();
+        recovery.network_changed();
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(recovery.blocked.is_empty() && recovery.samples.is_empty() && recovery.probe_attempts.is_empty());
+        assert!(recovery.pending.is_none() && recovery.scheduled.is_none());
+        assert_ne!(recovery.path_epoch(),previous_epoch);
+        assert_eq!(recovery.route_revision,0);
+    }
     #[test]
     fn healthy_connection_keeps_selection_when_measurements_improve() {
         let settings=Settings::default();
