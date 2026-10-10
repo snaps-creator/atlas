@@ -2,9 +2,9 @@
 
 Existing PR: [#60](https://github.com/snaps-creator/atlas/pull/60), release/atlas-2.5.1 -> main.
 Initial SHA: d0cf52a9404229b7360115f1a495c7369c50a0e8.
-Final SHA: pending correction batch commit; no push during diagnosis/local stabilization. The exact final commit is verified against PR head, CI head_sha and signed artifact build/manifest. A file cannot contain its own commit hash; the explicit verified SHA is recorded in the PR description and final delivery.
+First correction SHA:8c32a80d5a953fffa55593d6b65fbd1804c239f7. Second correction SHA: pending batch commit. The exact final commit must match PR head, CI head_sha and signed artifact build/manifest. A file cannot contain its own commit hash; the explicit verified SHA is recorded in the PR description and final delivery.
 
-Current status: **BLOCKED BY CI** (local correction gate complete; final-head CI pending). This document is updated before the single coherent correction push; CI outcomes belong only to the exact head that produced them.
+Current status: **BLOCKED BY CI**. First correction's main CI passed, but three installed jobs failed the tray interaction. The complete matrix and all failed logs were collected before starting the second coherent correction batch. CI outcomes belong only to the exact head that produced them.
 
 ## Findings and correction batch
 
@@ -33,3 +33,15 @@ Workstation installation, live VPN/DNS/routes/proxy and existing user configurat
 No merge, release tag or publication is performed. Public distribution remains GitHub Releases; official latest is2.4.2 until an independently approved publication. Installation EXEs/parts are excluded from Git. User changes in the original checkout are preserved.
 
 Corrected problems: priorS01/S03/S11, currentS02/S04/S05/S07/S08 plus formatting/spacingS09/S10 (10 rows addressed; some require final installed CI to establish closure). S06 remains conditional final smoke gate; S12/S13 are explicit availability/residual limits. Final CI/readiness evidence is recorded for the exact correction SHA in the linked PR description, current-head GitHub Actions and signed build/manifest; this committed document is the completed local-validation snapshot, not a claim of future CI success.
+
+## First correction outcomes and second correction
+
+At8c32a80: [main38081178645](https://github.com/snaps-creator/atlas/actions/runs/38081178645) SUCCESS, including366 native tests with restricted-process check. [Connected38081178662](https://github.com/snaps-creator/atlas/actions/runs/38081178662): signed full installer and actual2.4.3 baseline builds PASS; legacy full acceptance PASS; published2.4.2 and actual2.4.3 installed jobs FAIL only tray GetRect interactionS04. [Remediation38081175340](https://github.com/snaps-creator/atlas/actions/runs/38081175340): clean signed build/backend/package/VerifyOnly PASS; installed job FAIL sameS04. All A–H and real UI disconnect/reconnect checks preceding tray interaction PASS. No other completed failure found.
+
+The initial shell replacement hypothesis did not establish closure. S04's previous FIXED claim is withdrawn. The current helper ran elevated while actual app and Explorer ran medium. Second batch launches a verified same-user/session medium non-admin helper and asserts matching integrity. GetRect records exact HRESULT for each bounded identifier; a failed query is no longer misreported as proof of missing registration. Exact causality of the prior GetRect failure remains subject to installed CI.
+
+An additional real defectS15 is independently reproduced twice: UIAutomation Invoke returns successfully on the pinned native tray menu without invoking its handler. The corrected helper uses actual native input on the verified owner's enabled MenuItem, with cursor restoration. A standalone pinned tray fixture exercises the same implementation and requires a callback acknowledgement plus normal process exit; this test is mandatory in both workflows. Installed acceptance additionally requires a real new Atlas PID and unchanged durable state. No checks, deadlines or retries were weakened; no production application code changed in this second batch.
+
+The8c32a80 signed installer is independently verified but is not a final release candidate:190500431bytes, SHA2568284770b35f6a2244f1d53120aa3c1441bc2e15237c2c3c61f1679ecf980954f. Exact build SHA, archive digest, minisign signatures of installer and manifest, all33 payload hashes/sizes and native updater verification PASS. Installed acceptance FAIL means overall readiness remains blocked.
+
+Second complete local gate:51 frontend tests,41 contracts, strict production build, cargo check all targets,38 PowerShell syntax checks, JSON/TOML/locks/Python parsing, six workflow graphs, both migration/tamper fixtures and actual standalone tray callback/normal-exit test PASS. Fixture locked offline build uses application lockfile versions/checksums; helper native declarations compile. Clippy exits0 with previously assessed inherited warnings. Full serial backend:247 library +50 maintenance +65 updater +3 main=365 PASS,0 FAIL,1+3 intentional ignores unchanged. Scoped fixture rustfmt/workflow Prettier and diff whitespace checks PASS. Production dependencies and binary sources are unchanged. First-correction signed package verification remains valid only for8c32a80; next-head clean signed build and all installed CI are required.

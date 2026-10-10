@@ -162,8 +162,13 @@ try {
                 } while ([DateTime]::UtcNow -lt $deadline)
                 if ($saved.startup.launchWithWindows) { throw 'Installed UI did not persist disabled startup' }
                 $startsBefore=@(Events | Where-Object kind -eq 'application_start').Count
-                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1') -ProcessId $oldPid -Name 'Перезагрузить'
-                if ($LASTEXITCODE -ne 0) { throw 'Real installed tray restart failed' }
+                $powershell=Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell/v1.0/powershell.exe'
+                $trayHelper=Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1'
+                $trayEvidence=Join-Path (Split-Path $InstallRoot -Parent) 'tray-restart.log'
+                $trayCommand='"'+$powershell+'" -NoProfile -ExecutionPolicy Bypass -File "'+$trayHelper+'" -ProcessId '+$oldPid+' -Name "Перезагрузить" -EvidencePath "'+$trayEvidence+'"'
+                $trayExit=[AtlasInstalledShell]::RunHelper([uint32]$oldPid,$powershell,$trayCommand,$PSScriptRoot,30000)
+                if (Test-Path -LiteralPath $trayEvidence) {Get-Content -LiteralPath $trayEvidence | Write-Output}
+                if ($trayExit -ne 0) { throw "Real installed tray restart failed: limited helper exit=$trayExit" }
                 $deadline=[DateTime]::UtcNow.AddSeconds(30)
                 do {
                     $restarted=@(Get-CimInstance Win32_Process -Filter "Name='Atlas.exe'" | Where-Object { $_.ExecutablePath -eq $desktopExe -and $_.CommandLine -notmatch '--type=' })

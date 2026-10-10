@@ -49,6 +49,8 @@ jobs:
           $version=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           ./scripts/test-packaged-installer.ps1 -Installer "artifacts/release/Atlas-Setup-${version}.exe"
           ./scripts/publish-verified-update.ps1 -Installer "artifacts/release/Atlas-Setup-${version}.exe" -VerifyOnly
+      - name: Verify actual native tray input and callback
+        run: ./scripts/test-tray-protocol.ps1
       - uses: actions/upload-artifact@v7
         with:
           name: remediation-candidate-${{ github.sha }}
@@ -64,7 +66,9 @@ jobs:
         if: failure()
         with:
           name: remediation-build-evidence
-          path: ${{ runner.temp }}/atlas-ui-acceptance-*/**
+          path: |
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
+            temp/tray-protocol-*/**
   installed:
     needs: candidate
     runs-on: windows-latest

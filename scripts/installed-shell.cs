@@ -28,6 +28,7 @@ public static class AtlasInstalledShell {
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr process,uint flags,StringBuilder path,ref uint length);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint code);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
     static Exception Error(string action) { return new Win32Exception(Marshal.GetLastWin32Error(),action); }
     static IntPtr Token(IntPtr process) {
         IntPtr token;if(!OpenProcessToken(process,0xA,out token))throw Error("Inspect runner process token");return token;
@@ -83,6 +84,30 @@ public static class AtlasInstalledShell {
                     var startup=new Startup{size=(uint)Marshal.SizeOf(typeof(Startup)),desktop="winsta0\\default"};Created created;
                     if(!CreateProcessWithTokenW(copy,0,exe,new StringBuilder("\""+exe+"\""),0,IntPtr.Zero,directory,ref startup,out created))throw Error("Launch limited notification area");
                     CloseHandle(created.thread);CloseHandle(created.process);
+                } finally {CloseHandle(copy);}
+            } finally {CloseHandle(token);}
+        } finally {CloseHandle(process);}
+    }
+    // UI actions must originate at the same integrity as their target. This
+    // launches only a runner-owned test helper, never an Atlas/service action.
+    public static uint RunHelper(uint desktopPid,string executable,string command,string directory,uint timeout) {
+        if(timeout==0 || timeout>60000)throw new Exception("Invalid runner helper deadline");
+        var process=OpenProcess(0x1000,false,desktopPid);if(process==IntPtr.Zero)throw Error("Open desktop owner");
+        try {
+            var token=Token(process);
+            try {
+                SameUser(token,desktopPid);if(Level(token)!=8192)throw new Exception("Desktop token is not medium");
+                using(var identity=new WindowsIdentity(token))if(new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+                    throw new Exception("Desktop helper token still grants administrative access");
+                IntPtr copy;if(!DuplicateTokenEx(token,0x18B,IntPtr.Zero,2,1,out copy))throw Error("Duplicate desktop helper token");
+                try {
+                    var startup=new Startup{size=(uint)Marshal.SizeOf(typeof(Startup)),desktop="winsta0\\default",flags=1,show=0};Created child;
+                    if(!CreateProcessWithTokenW(copy,0,executable,new StringBuilder(command),0x08000000,IntPtr.Zero,directory,ref startup,out child))throw Error("Launch limited UI helper");
+                    CloseHandle(child.thread);
+                    try {
+                        if(WaitForSingleObject(child.process,timeout)!=0){TerminateProcess(child.process,1);WaitForSingleObject(child.process,5000);throw new Exception("Limited UI helper exceeded its deadline");}
+                        uint code;if(!GetExitCodeProcess(child.process,out code))throw Error("Read UI helper exit");return code;
+                    } finally {CloseHandle(child.process);}
                 } finally {CloseHandle(copy);}
             } finally {CloseHandle(token);}
         } finally {CloseHandle(process);}

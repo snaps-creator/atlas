@@ -1,0 +1,7 @@
+[package]
+name="atlas-tray-protocol-fixture"
+version="0.0.0"
+edition="2021"
+[dependencies]
+tray-icon={version="=0.25.1",default-features=false}
+windows-sys={version="0.59",features=["Win32_Foundation","Win32_UI_WindowsAndMessaging"]}
