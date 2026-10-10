@@ -38,7 +38,9 @@ test('PR and release use one readiness gate; publication cannot start before it 
   const pr = read('pr-check'), release = read('release'), gate = read('updater-readiness');
   assert.equal(pr.jobs['release-readiness'].uses, './.github/workflows/updater-readiness.yml');
   assert.equal(release.jobs['release-readiness'].uses, pr.jobs['release-readiness'].uses);
-  assert.deepEqual([release.jobs['publish-windows'].needs].flat(), ['release-readiness']);
+  assert.deepEqual(release.jobs['publish-windows'].needs, ['release-readiness','release-acceptance','release-backend']);
+  assert.equal(release.jobs['release-acceptance'].uses,'./.github/workflows/connected-upgrade.yml');
+  assert.equal(release.jobs['release-backend'].uses,'./.github/workflows/pr-check.yml');
   assert(!release.jobs['publish-windows'].if?.includes('always()'), 'must not bypass failed dependency');
   assert.match(release.jobs['publish-windows'].if, /inputs.confirmation/);
   assert(release.on.workflow_dispatch && !release.on.push);
@@ -55,10 +57,14 @@ test('both pipelines run publication preparation after installed acceptance on t
   const connected=read('connected-upgrade'), release=read('release');
   const prRun=connected.jobs['connected-upgrade'].steps.find(step=>step.run?.includes('publish-verified-update.ps1')).run;
   const releaseRun=release.jobs['publish-windows'].steps.find(step=>step.run?.includes('publish-verified-update.ps1')).run;
-  for(const code of [prRun,releaseRun]) assert(code.indexOf('test-connected-upgrade.ps1')<code.indexOf('publish-verified-update.ps1'));
+  assert(prRun.indexOf('test-connected-upgrade.ps1')<prRun.indexOf('publish-verified-update.ps1'));
+  assert(!releaseRun.includes('build-release-installer.ps1'), 'publish must use the accepted artifact, not rebuild it');
+  const publishedArtifact=release.jobs['publish-windows'].steps.find(step=>step.uses?.startsWith('actions/download-artifact')).with.name;
+  const built=read('pr-installer').jobs.installer.steps.find(step=>step.with?.name?.startsWith('Atlas-Windows-x64')).with.name;
+  assert.equal(publishedArtifact,built);
   assert(prRun.includes('-VerifyOnly'));
   assert(!releaseRun.includes('-VerifyOnly'));
-  assert(prRun.includes('github.event.pull_request.head.sha'));
+  assert(prRun.includes('github.event.pull_request.head.sha || github.sha'));
   assert.deepEqual(connected.jobs['connected-upgrade'].needs,['build-installer','baseline-243']);
   assert.deepEqual(connected.jobs['connected-upgrade'].strategy.matrix.baseline,['legacy','2.4.2','2.4.3']);
   assert.equal(connected.jobs['build-installer'].needs,'release-readiness');

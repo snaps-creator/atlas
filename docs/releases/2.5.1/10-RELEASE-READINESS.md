@@ -4,7 +4,7 @@
 
 Обязательные gates: frontend,verificationContracts,backend,restrictedProcess,cleanSignedBuild,packageAndSignatures,connectedUpgrade,installedRecovery,publicationPreparation. updater-readiness.json — policy, не кеш успешных тестов. Старые Actions links в policy относятся к2.4.2 и не доказывают2.5.1.
 
-PR должен пройти main branch protection, отсутствие conflicts и все applicable checks на финальном head. Build ID и authenticated manifest привязаны к этому SHA. Релиз после merge строится снова на merged main SHA, проходит acceptance и получает tag именно этого SHA. Автоматическая публикация при pushmain удалена; workflow_dispatch требует отдельного подтверждения.
+PR должен пройти main branch protection, отсутствие conflicts и все applicable checks на финальном head. Build ID и authenticated manifest привязаны к этому SHA. Релиз после merge строится снова на merged main SHA, проходит ту же reusable матрицу acceptance (legacy/2.4.2/actual2.4.3), полный backend и получает tag именно этого SHA. Publish скачивает тот же подписанный artifact текущего run и не пересобирает EXE после тестов. Автоматическая публикация при pushmain удалена; workflow_dispatch требует отдельного подтверждения.
 
 Release assets: один полный EXE, его .sig,latest.json,update-manifest.json + .sig,SHA256SUMS.txt. Внутренний NSIS payload не распространяется. GitHub Actions artifacts временные; ни EXE,ни части,ни Git LFS не являются публичным каналом загрузки.
 

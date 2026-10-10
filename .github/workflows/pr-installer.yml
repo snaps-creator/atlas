@@ -1,31 +1,24 @@
 name: Build signed PR installer
-
 on:
-  workflow_call:
-
+  workflow_call: null
 permissions:
   contents: read
-
 jobs:
   installer:
-    # Never expose signing material to a fork or pull_request_target context.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     env:
-      ATLAS_BUILD_ID: ${{ github.event.pull_request.head.sha }}
+      ATLAS_BUILD_ID: ${{ github.event.pull_request.head.sha || github.sha }}
       CARGO_TARGET_DIR: ${{ github.workspace }}/t
-    # The signed installer can take over 20 minutes on a cold Windows runner.
-    # Keep enough headroom for Rust/Tauri compilation and artifact upload.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Initialize MSVC and CMake
         shell: pwsh
         run: ./scripts/initialize-msvc.ps1
-
       - name: Verify repeatable MSVC initialization
         shell: pwsh
         run: ./scripts/test-msvc-initialization.ps1
@@ -59,12 +52,15 @@ jobs:
           retention-days: 7
       - uses: actions/upload-artifact@v7
         with:
-          name: Atlas-Windows-x64-PR-${{ github.event.pull_request.number }}
-          path: |
+          name: Atlas-Windows-x64-${{ github.run_id }}
+          path: |-
             artifacts/release/Atlas-Setup-*.exe
             artifacts/release/Atlas-Setup-*.exe.sig
             artifacts/release/SHA256SUMS.txt
             artifacts/release/update-manifest.json*
+
+            artifacts/release/build.json
+            artifacts/release/verification/verification.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
