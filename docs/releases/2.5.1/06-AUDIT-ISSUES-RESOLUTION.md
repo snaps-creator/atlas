@@ -20,6 +20,6 @@
 |014 Unknown TUN marker ambiguity|liveOwnershipConfirmed/classificationMeaning|Conservative recovery не ослаблен; marker сам не live ownership|
 |015 hidden CEF/polling budget|Наследованы isolation/read-state/window-startup fixes|CPU/memory installed benchmark не измерен; открыто|
 |016 timeline/privacy|UUID session/build/monotonic timing добавлены, redaction сохранена|Публичный privacy export ещё не реализован; частично открыто|
-|017 uninstall loaded hives only|ProfileList + private RAII offline hive inspection|3 uninstall tests; реальный multi-user offline acceptance NOT RUN|
+|017 uninstall loaded hives only|ProfileList + private RAII offline hive inspection|3 uninstall tests +2 safe guards; real synthetic NTUSER.DAT acceptance добавлен в CI, пока PENDING|
 
 Блокирующие доказательства: clean signed artifact, полный backend и installed acceptance на финальном SHA. 006/015/016 остаются явно открытыми улучшениями, а не объявляются решёнными из-за отсутствия воспроизведения.

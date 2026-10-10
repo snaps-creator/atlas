@@ -360,6 +360,8 @@ rules:
                 New-ItemProperty -Path $runKey -Name Atlas -PropertyType String -Value ('"'+(Join-Path $installRoot 'AtlasUpdater.exe')+'" --launch --autostart') -Force | Out-Null
                 New-ItemProperty -Path $approvedKey -Name Atlas -PropertyType Binary -Value ([byte[]](2,0,0,0,0,0,0,0,0,0,0,0)) -Force | Out-Null
             }
+            $offlineHive=Join-Path $fixture ('offline-startup-'+[guid]::NewGuid().ToString('N'))
+            & (Join-Path $PSScriptRoot 'test-offline-startup-hive.ps1') -Mode Setup -Fixture $offlineHive -InstallRoot $installRoot
             $uninstaller = Join-Path $installRoot 'uninstall.exe'
             $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
             $null = $remove.Handle
@@ -373,6 +375,8 @@ rules:
                 }
                 throw "Failed ${cycle}: exit=$($remove.ExitCode)"
             }
+            try { & (Join-Path $PSScriptRoot 'test-offline-startup-hive.ps1') -Mode Verify -Fixture $offlineHive -InstallRoot $installRoot }
+            finally { & (Join-Path $PSScriptRoot 'test-offline-startup-hive.ps1') -Mode Cleanup -Fixture $offlineHive -InstallRoot $installRoot }
             if (Get-Service AtlasNetworkService -ErrorAction SilentlyContinue) { throw 'Uninstall left the Atlas service' }
             foreach ($remaining in @('Atlas.exe','AtlasUpdater.exe','current.json','versions')) {
                 if (Test-Path -LiteralPath (Join-Path $installRoot $remaining)) { throw "Uninstall left $remaining" }
