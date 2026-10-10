@@ -230,12 +230,12 @@ if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old
     if (-not $peerReady) { throw 'Disposable VLESS peer did not open its listener' }
     Install-Checked $previous
     $oldJournal=Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
-    if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne '2.4.2') { throw 'Real 2.4.2 installation was not committed' }
+    if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne $previousVersion) { throw "Real $previousVersion installation was not committed" }
     $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
     & $maintenance --prepare-install $previousRoot
     if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
     & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') prepare-upgrade
-    if ($LASTEXITCODE -ne 0) { throw 'Valid installed 2.4.2 references were not established' }
+    if ($LASTEXITCODE -ne 0) { throw "Valid installed $previousVersion references were not established" }
 }
     # A real tunnel, but deliberately NO automatic/default routes, no system DNS
     # and no external VPN server. This cannot route the CI control connection.

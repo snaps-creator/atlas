@@ -53,7 +53,6 @@ public static class AtlasWindowHistory {
     public static void Stop() { PostThreadMessage(threadId,0x12,UIntPtr.Zero,IntPtr.Zero); if(!worker.Join(5000)) throw new Exception("Window observer failed to stop"); }
 }
 '@
-& (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot
 function Quiesce {
     & $Maintenance --prepare-install $active
     if ($LASTEXITCODE -ne 0) { throw 'Candidate did not quiesce safely' }
@@ -80,6 +79,7 @@ $cases = @(
     @{name='G';windows=$false;auto=$false;tray=$false;restore=$true;was=$false;explicit=$true;connect=$false},
     @{name='H';windows=$false;auto=$false;tray=$true;restore=$false;was=$false;explicit=$true;connect=$false}
 )
+$shellInitialized = $false
 $failures = [System.Collections.Generic.List[string]]::new()
 try {
     Quiesce
@@ -108,6 +108,13 @@ try {
                 Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $deadline)
             if ($owners.Count -ne 1 -or $samples.Count -eq 0 -or $samples[-1].value.status -ne $expected) { throw "Startup $($case.name) did not reach $expected" }
+            # Case A establishes a real medium-integrity desktop after the
+            # upgrade harness has quiesced the candidate. Use its token to
+            # initialize the disposable notification area before tray cases.
+            if (-not $shellInitialized) {
+                & (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot
+                $shellInitialized = $true
+            }
             # Observe another complete recorder interval to catch repeated connect/recovery.
             Start-Sleep -Seconds 16
             $events=@(Events)
