@@ -39,7 +39,9 @@ test('PR and release use one readiness gate; publication cannot start before it 
   assert.equal(pr.jobs['release-readiness'].uses, './.github/workflows/updater-readiness.yml');
   assert.equal(release.jobs['release-readiness'].uses, pr.jobs['release-readiness'].uses);
   assert.deepEqual([release.jobs['publish-windows'].needs].flat(), ['release-readiness']);
-  assert.equal(release.jobs['publish-windows'].if, undefined, 'must not bypass failed dependency with always()');
+  assert(!release.jobs['publish-windows'].if?.includes('always()'), 'must not bypass failed dependency');
+  assert.match(release.jobs['publish-windows'].if, /inputs.confirmation/);
+  assert(release.on.workflow_dispatch && !release.on.push);
   assert(Object.hasOwn(gate.on, 'workflow_call'));
   const check = gate.jobs.readiness.steps.find(step => step.run === 'node scripts/check-updater-readiness.cjs');
   assert(check);
@@ -57,7 +59,8 @@ test('both pipelines run publication preparation after installed acceptance on t
   assert(prRun.includes('-VerifyOnly'));
   assert(!releaseRun.includes('-VerifyOnly'));
   assert(prRun.includes('github.event.pull_request.head.sha'));
-  assert.equal(connected.jobs['connected-upgrade'].needs,'build-installer');
+  assert.deepEqual(connected.jobs['connected-upgrade'].needs,['build-installer','baseline-243']);
+  assert.deepEqual(connected.jobs['connected-upgrade'].strategy.matrix.baseline,['legacy','2.4.2','2.4.3']);
   assert.equal(connected.jobs['build-installer'].needs,'release-readiness');
   assert.equal(connected.jobs['connected-upgrade'].steps.find(step=>step.uses?.startsWith('actions/download-artifact')).with['run-id'],'${{ github.run_id }}');
   const acceptance=fs.readFileSync('scripts/test-connected-upgrade.ps1','utf8');

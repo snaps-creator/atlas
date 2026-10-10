@@ -43,7 +43,7 @@ try {
 } finally { $env:ATLAS_INSTALL_RECEIPT=$previousReceipt }
 Copy-Item -LiteralPath (Join-Path $target 'release/AtlasUpdater.exe') -Destination (Join-Path $payload 'AtlasUpdater.exe')
 function ConvertTo-NsisLiteral([string]$Value) { return $Value.Replace('$','$$').Replace('"','$\"') }
-$output = Join-Path $work "Atlas-$Version-Setup.exe"
+$output = Join-Path $work "Atlas-Setup-$Version.exe"
 $template = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'transactional-installer.nsi'))
 $template = $template.Replace('@VERSION@',$Version).Replace('@OUTPUT@',(ConvertTo-NsisLiteral $output)).Replace('@PAYLOAD@',(ConvertTo-NsisLiteral $payload))
 $source = Join-Path $work 'installer.nsi'

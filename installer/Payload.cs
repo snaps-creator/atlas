@@ -1,1 +1,0 @@
-internal static class Payload { internal const long Size = 189453493L; internal const int Parts = 3; internal const string Sha256 = "e749b0c5cdf206a398de82b729704f7c56fe56d861cfe7a681e9290637ee499d"; }

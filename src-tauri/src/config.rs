@@ -10,6 +10,7 @@ pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
     if runtime_nodes(previous)!=runtime_nodes(next) {return false;}
     if previous.auto_test_interval_seconds != next.auto_test_interval_seconds { return false; }
     if previous.auto_search_ping_ms != next.auto_search_ping_ms { return false; }
+    if previous.auto_optimize != next.auto_optimize { return false; }
     let mut comparison = next.clone();
     comparison.selected = previous.selected.clone();
     generate(&comparison, "comparison")

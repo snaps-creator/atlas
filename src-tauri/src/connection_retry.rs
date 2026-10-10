@@ -9,6 +9,10 @@ pub(crate) struct ConnectionRetry {
 }
 
 impl ConnectionRetry {
+    /// Only a confirmed network epoch grants a fresh budget; data refresh does not.
+    pub(crate) fn network_changed(&mut self, wanted: bool) {
+        if wanted { self.reset(); }
+    }
     pub(crate) fn reset(&mut self) {
         self.failures = 0;
         self.retry_at = None;
@@ -87,5 +91,20 @@ mod tests {
         assert!(!retry.due(now, false, true));
         assert!(!retry.due(now, true, true));
         assert!(retry.due(now + Duration::from_secs(3), true, true));
+    }
+    #[test]
+    fn late_network_rearms_exhausted_budget_but_never_cancels_disconnect() {
+        let now = Instant::now();
+        for seconds in [30, 120, 600] {
+            let mut retry = ConnectionRetry::default();
+            for _ in 0..5 { retry.failed(now); }
+            let returned = now + Duration::from_secs(seconds);
+            assert!(!retry.due(returned, true, true));
+            retry.network_changed(true);
+            assert!(!retry.due(returned, true, true));
+            assert!(retry.due(returned + Duration::from_secs(3), true, true));
+            retry.network_changed(false);
+            assert!(!retry.due(returned + Duration::from_secs(600), false, true));
+        }
     }
 }

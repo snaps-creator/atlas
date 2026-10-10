@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "version": "2.4.3",
+  "version": "2.5.1",
   "requiredChecks": [
     "frontend",
     "verificationContracts",
@@ -22,7 +22,7 @@
     }
   ],
   "evidence": {
-    "report": "docs/RELEASE-2.4.3.md",
+    "report": "docs/releases/2.5.1/10-RELEASE-READINESS.md",
     "previousSignedAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37690808789",
     "mainBuildAndAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37695482741"
   },

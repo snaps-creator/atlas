@@ -38,6 +38,17 @@ pub fn configure(enabled:bool,explicit:bool)->Result<(),String>{
     }
     Ok(())
 }
+/// Read-only desired/effective status; Windows Task Manager disable wins.
+pub fn status(desired: bool) -> serde_json::Value {
+    let user=RegKey::predef(HKEY_CURRENT_USER);
+    let expected=std::env::current_exe().map_err(|e|e.to_string()).and_then(|p|command(&p));
+    let registered=user.open_subkey(RUN).and_then(|k|k.get_value::<String,_>("Atlas")).ok();
+    let disabled=user.open_subkey(APPROVED).ok().and_then(|k|k.get_raw_value("Atlas").ok())
+        .is_some_and(|v|v.bytes.first().is_some_and(|b|matches!(*b,3|7)));
+    let matches=expected.as_ref().ok().is_some_and(|value|registered.as_ref()==Some(value));
+    serde_json::json!({"desired":desired,"registered":matches,"disabledByWindows":disabled,
+        "effective":desired && matches && !disabled,"error":expected.err()})
+}
 #[cfg(test)]mod tests{
     use super::*;
     #[test]fn startup_uses_quoted_stable_launcher_for_every_version(){

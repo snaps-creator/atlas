@@ -3,8 +3,8 @@ $ErrorActionPreference = 'Stop'
 & node (Join-Path $PSScriptRoot 'check-updater-readiness.cjs')
 if ($LASTEXITCODE -ne 0) { throw 'Updater publication policy blocks preparation' }
 if (-not $env:GITHUB_REPOSITORY -or -not $env:ATLAS_BUILD_ID) { throw 'GitHub build/repository context is missing' }
-if (-not $VerifyOnly -and (-not $env:GITHUB_TOKEN -or $env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_REF -ne 'refs/heads/main' -or $env:ATLAS_BUILD_ID -ne $env:GITHUB_SHA)) {
-    throw 'Publication requires the verified main CI build and GitHub authorization'
+if (-not $VerifyOnly -and (-not $env:GITHUB_TOKEN -or $env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_REF -ne 'refs/heads/main' -or $env:ATLAS_BUILD_ID -ne $env:GITHUB_SHA -or $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or $env:ATLAS_RELEASE_AUTHORIZATION -ne 'Publish Atlas 2.5.1')) {
+    throw 'Publication requires the verified main CI build and separate manual publication authorization'
 }
 & (Join-Path $PSScriptRoot 'test-packaged-installer.ps1') -Installer $Installer
 & node (Join-Path $PSScriptRoot 'prepare-release.cjs') $Installer
@@ -25,7 +25,7 @@ $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
 $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'Atlas-release' }
 $body = @{tag_name=$tag;target_commitish=$env:GITHUB_SHA;name="Atlas $($manifest.version)";body=$manifest.notes;draft=$true;prerelease=$false} | ConvertTo-Json
 $release = Invoke-RestMethod -Method Post "$base/releases" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
-foreach ($file in @($Installer,"$Installer.sig",$manifestPath,$signedManifest,"$signedManifest.sig")) {
+foreach ($file in @($Installer,"$Installer.sig",$manifestPath,$signedManifest,"$signedManifest.sig",(Join-Path $directory 'SHA256SUMS.txt'))) {
     $assetName = [Uri]::EscapeDataString((Split-Path $file -Leaf))
     $url = $release.upload_url.Split('{')[0] + '?name=' + $assetName
     Invoke-RestMethod -Method Post $url -Headers $headers -ContentType 'application/octet-stream' -InFile $file | Out-Null

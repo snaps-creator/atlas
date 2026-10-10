@@ -194,7 +194,8 @@ impl Store {
             return Err("Версия базы настроек новее поддерживаемой; база не изменена".into());
         }
         tx.execute_batch("CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS backups(id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER NOT NULL, payload BLOB NOT NULL);")
+            CREATE TABLE IF NOT EXISTS backups(id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER NOT NULL, payload BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS credential_cleanup(id TEXT PRIMARY KEY NOT NULL);")
             .map_err(|e| e.to_string())?;
         if schema < 3 {
             let original: Option<Vec<u8>> = tx
@@ -270,8 +271,17 @@ impl Store {
         Ok(())
     }
     pub fn save(&mut self, s: &Settings) -> Result<(), String> {
+        let previous = self.load()?;
         let data = crypt(&serde_json::to_vec(s).map_err(|e| e.to_string())?, true)?;
         let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        for source in &previous.subscriptions {
+            if !s.subscriptions.iter().any(|current| current.id == source.id) {
+                tx.execute("INSERT OR IGNORE INTO credential_cleanup(id) VALUES(?1)", params![source.id]).map_err(|e| e.to_string())?;
+            }
+        }
+        for source in &s.subscriptions {
+            tx.execute("DELETE FROM credential_cleanup WHERE id=?1", params![source.id]).map_err(|e| e.to_string())?;
+        }
         tx.execute(
             "INSERT INTO backups(created,payload) SELECT ?1,payload FROM state WHERE id=1",
             params![crate::model::now()],
@@ -291,6 +301,48 @@ impl Store {
         self.db.execute("INSERT INTO state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![data]).map_err(|e|e.to_string())?;
         Ok(())
     }
+    pub fn save_visibility(&mut self, hidden: bool) -> Result<(), String> {
+        let mut persisted = self.load()?;
+        persisted.last_window_hidden = hidden;
+        self.write_operational(&persisted)
+    }
+    /// Durable compensation before writing a new source's Windows credential.
+    pub fn prepare_credential(&mut self, id: &str) -> Result<(), String> {
+        if self.load()?.subscriptions.iter().any(|s| s.id == id) {
+            return Err("Источник уже существует; обновите его отдельной командой".into());
+        }
+        self.db.execute("INSERT OR IGNORE INTO credential_cleanup(id) VALUES(?1)", params![id]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn reconcile_credentials(&mut self, mut delete: impl FnMut(&str) -> Result<(), String>) -> Result<(), String> {
+        let current = self.load()?;
+        let ids = self.db.prepare("SELECT id FROM credential_cleanup").map_err(|e| e.to_string())?
+            .query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        let mut failed = false;
+        for id in ids {
+            if current.subscriptions.iter().any(|s| s.id == id) || delete(&id).is_ok() {
+                self.db.execute("DELETE FROM credential_cleanup WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
+            } else { failed = true; }
+        }
+        if failed { Err("Не удалось удалить секрет из хранилища Windows; очистка сохранена и будет повторена при запуске".into()) }
+        else { Ok(()) }
+    }
+    /// Source download errors are observations, never configuration checkpoints.
+    pub fn save_source_status(&mut self, settings: &Settings) -> Result<(), String> {
+        let mut persisted = self.load()?;
+        for source in &mut persisted.subscriptions {
+            if let Some(current) = settings.subscriptions.iter().find(|s| s.id == source.id) {
+                source.error = current.error.clone();
+            }
+        }
+        self.write_operational(&persisted)
+    }
+    fn write_operational(&mut self, settings: &Settings) -> Result<(), String> {
+        let data = crypt(&serde_json::to_vec(settings).map_err(|e| e.to_string())?, true)?;
+        self.db.execute("INSERT INTO state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![data]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
     pub fn previous(&self) -> Result<Settings, String> {
         let data: Vec<u8> = self
             .db
@@ -306,6 +358,54 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visibility_crash_window_preserves_restore_and_explicit_disconnect() {
+        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let mut settings=Settings::default();
+        settings.was_connected=true; settings.startup.restore_connection=true;
+        store.save(&settings).unwrap();
+        store.save_visibility(true).unwrap();
+        let restored=store.load().unwrap();
+        assert!(restored.was_connected && restored.last_window_hidden);
+        assert!(!restored.user_disconnected);
+        settings.was_connected=false; settings.user_disconnected=true;
+        store.save_runtime(&settings).unwrap(); store.save_visibility(false).unwrap();
+        let restored=store.load().unwrap();
+        assert!(!restored.was_connected && restored.user_disconnected);
+    }
+    #[test]
+    fn hundred_refresh_failures_preserve_configuration_checkpoints() {
+        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let settings=decode_settings(&serde_json::to_vec(&legacy_fixture()).unwrap()).unwrap();
+        store.save(&settings).unwrap();
+        let mut changed=settings.clone(); changed.theme="dark".into(); store.save(&changed).unwrap();
+        for i in 0..100 {
+            changed.subscriptions[0].error=Some(format!("fixture error {i}"));
+            store.save_source_status(&changed).unwrap();
+        }
+        assert_eq!(store.previous().unwrap().theme,settings.theme);
+        assert_eq!(store.load().unwrap().subscriptions[0].error.as_deref(),Some("fixture error 99"));
+        assert_eq!(store.db.query_row("SELECT COUNT(*) FROM backups",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[test]
+    fn credential_compensation_survives_crash_failure_and_repeated_recovery() {
+        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        store.prepare_credential("aborted-add").unwrap();
+        assert!(store.reconcile_credentials(|_|Err("denied".into())).is_err());
+        let mut deleted=Vec::new();
+        store.reconcile_credentials(|id|{deleted.push(id.to_owned());Ok(())}).unwrap();
+        store.reconcile_credentials(|_|panic!("already cleaned")).unwrap();
+        assert_eq!(deleted,vec!["aborted-add"]);
+        let settings=decode_settings(&serde_json::to_vec(&legacy_fixture()).unwrap()).unwrap();
+        store.prepare_credential(&settings.subscriptions[0].id).unwrap();
+        store.save(&settings).unwrap();
+        store.reconcile_credentials(|_|panic!("committed source must retain credential")).unwrap();
+        assert!(store.prepare_credential(&settings.subscriptions[0].id).is_err());
+        let mut removed=settings.clone(); removed.subscriptions.remove(0); store.save(&removed).unwrap();
+        assert!(store.reconcile_credentials(|_|Err("denied".into())).is_err());
+        store.reconcile_credentials(|id|{assert_eq!(id,settings.subscriptions[0].id);Ok(())}).unwrap();
+        store.reconcile_credentials(|_|panic!("repeat delete")).unwrap();
+    }
     fn legacy_fixture() -> serde_json::Value {
         use serde_json::json;
         let mut value = serde_json::to_value(Settings::default()).unwrap();

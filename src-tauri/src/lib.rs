@@ -69,6 +69,7 @@ struct App {
     status: String,
     error: Option<String>,
     control_error: Option<String>,
+    startup_status: Value,
     logs: Vec<Value>,
     reconnect: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -112,6 +113,8 @@ impl App {
         let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs,"buildId":env!("ATLAS_BUILD_ID")});
         let mut value = value;
         value["controlError"] = json!(self.control_error);
+        value["startupStatus"] = self.startup_status.clone();
+        value["desiredConnected"] = json!(self.reconnect.load(std::sync::atomic::Ordering::SeqCst));
         value["refreshingSubscriptions"] = json!(subscription_refresh::active());
         value["revision"] = json!(self.revision);
         self.published.set(value.clone());
@@ -179,8 +182,20 @@ impl App {
                 if let Some(sub)=next.subscriptions.iter_mut().find(|s|s.id==id) {
                     if let Some(details)=sub.error.take() {sub.error=Some(format!("Импортировано: {}. Пропущено: {skipped}. {details}",sub.servers.len()));}
                 }
-                if let Some(entry) = entry { entry.set_password(&url).map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?; }
-                self.save(next)?;
+                if let Some(entry) = entry {
+                    // Never overwrite an existing credential with an add request.
+                    match entry.get_password() {
+                        Err(keyring::Error::NoEntry) => {},
+                        Ok(_) => return Err("Идентификатор секрета уже занят".into()),
+                        Err(_) => return Err("Не удалось проверить хранилище Windows".into()),
+                    }
+                    self.store.prepare_credential(&id)?;
+                    entry.set_password(&url).map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?;
+                }
+                if let Err(error) = self.save(next) {
+                    let cleanup = self.store.reconcile_credentials(delete_source_credential);
+                    return Err(match cleanup { Ok(()) => error, Err(cleanup) => format!("{error}; {cleanup}") });
+                }
                 self.log("INFO", "Подписка обновлена и проверена Mihomo");
         Ok(())
     }
@@ -292,6 +307,15 @@ impl App {
             return Err("Подключение отменено".into());
         }
         self.settings.mode = "tun".into();
+        // Commit durable connection intent before attempting the tunnel.
+        self.settings.was_connected = true;
+        self.settings.user_disconnected = false;
+        if let Err(error) = self.store.save_runtime(&self.settings) {
+            self.core.continue_running = None;
+            self.status = "Error".into();
+            self.error = Some(error.clone());
+            return Err(error);
+        }
         let result = windows::restore(&self.core.directory.join("proxy-restore.json"))
             .and_then(|_| self.core.start(&self.settings));
         if result.is_ok() { _connecting.complete(); } else { drop(_connecting); }
@@ -303,8 +327,7 @@ impl App {
                 }
                 self.settings.was_connected = true;
                 self.settings.user_disconnected = false;
-                if let Err(e) = self.store.save(&self.settings) {
-                    self.settings.was_connected = false;
+                if let Err(e) = self.store.save_runtime(&self.settings) {
                     let directory = self.core.directory.clone();
                     let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
                     let cleanup_failed = cleanup.is_err();
@@ -380,7 +403,7 @@ impl App {
     fn stop_session(&mut self, explicit: bool) -> Result<(), String> {
         let intent_error=if explicit {
             self.settings.was_connected=false;self.settings.user_disconnected=true;
-            self.store.save(&self.settings).err()
+            self.store.save_runtime(&self.settings).err()
         } else {None};
         self.revision = self.revision.wrapping_add(1);
         self.status = "Stopping".into();
@@ -397,7 +420,7 @@ impl App {
             self.log("ERROR", &error);
             return Err(error);
         }
-        if let Err(error) = self.store.save(&self.settings) {
+        if let Err(error) = self.store.save_runtime(&self.settings) {
             self.status = "Disconnected".into();
             self.error = Some(format!("Сеть восстановлена, но не удалось сохранить отключённое состояние: {error}"));
             return Err(self.error.clone().unwrap());
@@ -412,7 +435,7 @@ impl App {
     }
     fn persist_visibility(&mut self,hidden:bool)->Result<(),String> {
         self.settings.last_window_hidden=hidden;
-        self.store.save_runtime(&self.settings)
+        self.store.save_visibility(hidden)
     }
     fn prepare_restart(&mut self) -> Result<(), String> {
         self.stop_session(false)?;
@@ -533,12 +556,25 @@ impl App {
                 let previous = self.settings.startup.launch_with_windows;
                 self.save(next)?;
                 let result = startup::configure(enabled,enabled!=previous);
+                self.startup_status = startup::status(enabled);
                 if let Err(e) = result {
                     let mut back = self.settings.clone();
                     back.startup.launch_with_windows = previous;
                     self.save(back)?;
+                    self.startup_status = startup::status(previous);
+                    self.startup_status["error"] = json!(e);
                     return Err(format!("Автозапуск Windows: {e}"));
                 }
+            }
+            "subscription_rename" => {
+                let id=p["id"].as_str().ok_or("Нет ID")?;
+                let name=p["name"].as_str().ok_or("Нет названия")?.trim();
+                if name.is_empty() || name.chars().count()>128 || name.chars().any(char::is_control) {
+                    return Err("Название должно содержать от 1 до 128 символов без управляющих знаков".into());
+                }
+                let mut next=self.settings.clone();
+                next.subscriptions.iter_mut().find(|s|s.id==id).ok_or("Источник не найден")?.name=name.into();
+                self.save(next)?;
             }
             "subscription_user_agent" => {
                 let id = p["id"].as_str().ok_or("Не выбрана подписка")?;
@@ -562,7 +598,7 @@ impl App {
                 next.subscriptions.retain(|s| s.id != id);
                 model::repository::reconcile_references(&self.settings,&mut next);
                 self.save(next)?;
-                let _ = keyring::Entry::new("AtlasVPN", id).and_then(|e| e.delete_credential());
+                self.store.reconcile_credentials(delete_source_credential)?;
             }
             "import_preview" => {
                 return serde_json::to_value(rules::import(p["text"].as_str().ok_or("Нет YAML")?)?)
@@ -640,6 +676,12 @@ impl App {
     }
 }
 type Shared = Arc<Mutex<App>>;
+fn delete_source_credential(id: &str) -> Result<(), String> {
+    match keyring::Entry::new("AtlasVPN", id).and_then(|entry| entry.delete_credential()) {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Не удалось очистить секрет источника".into()),
+    }
+}
 struct ConnectionIntent(Arc<std::sync::atomic::AtomicBool>);
 struct ManualRestart(std::sync::atomic::AtomicBool);
 type ShuttingDown = Arc<std::sync::atomic::AtomicBool>;
@@ -1077,7 +1119,7 @@ async fn request_inner(
                 Err(error) => {
                     if let Some(sub) = a.settings.subscriptions.iter_mut().find(|s|s.id == id) { sub.error=Some(error.clone()); }
                     let settings = a.settings.clone();
-                    a.store.save(&settings)?;
+                    a.store.save_source_status(&settings)?;
                     a.snapshot();
                     return Err(error);
                 }
@@ -1148,14 +1190,17 @@ pub fn run() {
             let _startup_update_guard=if update_health::challenge().is_none(){Some(update_lock::UpdateLock::admit_session().map_err(std::io::Error::other)?)}else{None};
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let store =
+            let mut store =
                 storage::Store::open(&dir.join("atlas.db")).map_err(std::io::Error::other)?;
+            let credential_error = store.reconcile_credentials(delete_source_credential).err();
             let mut settings = store.load().map_err(std::io::Error::other)?;
             settings.mode = "tun".into();
+            let mut startup_error = None;
             // Repair stale startup registration to match the saved user preference.
             if update_health::challenge().is_none() {
                 if let Err(error)=startup::configure(settings.startup.launch_with_windows,false) {
                     eprintln!("Atlas startup registration failed: {error}");
+                    startup_error = Some(format!("Автозапуск Windows: {error}"));
                 }
                 if !settings.startup.launch_with_windows && std::env::args().any(|arg| arg == "--autostart") {
                     app.handle().exit(0);
@@ -1167,13 +1212,14 @@ pub fn run() {
             incident_history::load(&history_path);
             incident_history::record("application_start", json!({"version":env!("CARGO_PKG_VERSION"),"buildId":env!("ATLAS_BUILD_ID")}), &[]);
             let core = core::Core::new(binary, dir.clone());
+            let mut startup_status = startup::status(settings.startup.launch_with_windows);
+            if let Some(error) = startup_error { startup_status["error"]=json!(error); }
             let reason=startup_coordinator::LaunchReason::from_args(&std::env::args().collect::<Vec<_>>());
             let coordinator=startup_coordinator::StartupCoordinator::new(reason,&settings.startup,
                 settings.was_connected,settings.user_disconnected,settings.last_window_hidden);
             let show_initial=coordinator.should_show_window();
-            // The coordinator captured the preceding session. This session has
-            // not established a VPN yet; only connect success records it again.
-            settings.was_connected=false;
+            // Durable restore intent survives startup, visibility and failures.
+            // Only an explicit Disconnect clears it.
             settings.last_window_hidden=!show_initial;
             app.manage(WindowVisibility(Arc::new(std::sync::atomic::AtomicBool::new(!show_initial))));
             let coordinator:StartupState=Arc::new(Mutex::new(coordinator));
@@ -1200,7 +1246,8 @@ pub fn run() {
                 core,
                 status: "Initializing".into(),
                 error: None,
-                control_error: None,
+                control_error: credential_error,
+                startup_status,
                 logs: vec![],
                 reconnect: intent.clone(),
             }));
@@ -1428,11 +1475,13 @@ pub fn run() {
             std::thread::spawn(move || {
                 let mut reconnect_retry = connection_retry::ConnectionRetry::default();
                 let mut cleanup_retry = connection_retry::ConnectionRetry::default();
+                let mut uplink = network_change::Monitor::default();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if shutdown.load(std::sync::atomic::Ordering::SeqCst)
                         || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
                     if update_health::pending() {continue;}
+                    let network_changed = uplink.tick();
                     // Query the service without holding the mutation lock. A
                     // result from an earlier revision cannot affect a new session.
                     let observed=handle.state::<published_state::ReadState>().get().ok()
@@ -1481,6 +1530,20 @@ pub fn run() {
                         reconnect_retry.reset();
                     }
                     let wants_connection = intent.load(std::sync::atomic::Ordering::SeqCst);
+                    if network_changed {
+                        reconnect_retry.network_changed(wants_connection);
+                        incident_history::record("desktop_network_epoch", json!({"desiredConnected":wants_connection}), &[]);
+                    }
+                    if wants_connection && matches!(a.status.as_str(), "Error" | "Disconnected" | "WaitingForNetwork") {
+                        if uplink.online() == Some(false) {
+                            a.status = "WaitingForNetwork".into();
+                        } else if a.status == "WaitingForNetwork" && uplink.online() == Some(true) {
+                            a.status = "Error".into();
+                        }
+                    }
+                    if uplink.stale() && a.control_error.is_none() {
+                        a.control_error = Some("Наблюдение сети задерживается; состояние uplink неизвестно".into());
+                    }
                     if !wants_connection && a.status == "CleanupError"
                         && cleanup_retry.due(std::time::Instant::now(), true, true) {
                         match a.stop_session(false) {
@@ -1488,7 +1551,7 @@ pub fn run() {
                             Err(_) => cleanup_retry.failed(std::time::Instant::now()),
                         }
                     }
-                    if !a.cancellation.settings_pending()
+                    if !a.cancellation.settings_pending() && uplink.online() != Some(false)
                         && reconnect_retry.due(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
                         a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
                         match a.connect() {

@@ -14,7 +14,7 @@ function fixture() {
     const sig = crypto.sign(null,crypto.createHash('blake2b512').update(bytes).digest(),privateKey), comment = Buffer.from('fixture only');
     return Buffer.from(['untrusted comment: test',Buffer.concat([Buffer.from('ED'),id,sig]).toString('base64'),'trusted comment: '+comment,crypto.sign(null,Buffer.concat([sig,comment]),privateKey).toString('base64')].join('\n')).toString('base64');
   }
-  const artifact=Buffer.from('signed installer fixture'), version='2.4.2', build='a'.repeat(40), asset=`Atlas_${version}_x64-setup.exe`, repository='snaps-creator/atlas';
+  const artifact=Buffer.from('signed installer fixture'), version='2.4.2', build='a'.repeat(40), asset=`Atlas-Setup-${version}.exe`, repository='snaps-creator/atlas';
   const manifest={schema:2,installer_kind:'transactional-v1',version,build,asset,platform:'windows-x86_64',url:`https://github.com/${repository}/releases/download/v${version}/${asset}`,size:artifact.length,sha256:crypto.createHash('sha256').update(artifact).digest('hex'),signature:sign(artifact)};
   const bytes=Buffer.from(JSON.stringify(manifest));
   return {sign,manifest,input:{artifact,artifactSignature:manifest.signature,manifestBytes:bytes,manifestSignature:sign(bytes),publicKey:key,version,build,asset,repository}};
@@ -44,6 +44,7 @@ test('actual PowerShell VerifyOnly prepares all assets without any GitHub API ca
   fs.writeFileSync(path.join(root,'updater-readiness.json'),JSON.stringify(policy));
   fs.writeFileSync(path.join(root,'src-tauri/tauri.conf.json'),JSON.stringify({version:input.version,plugins:{updater:{pubkey:input.publicKey}}}));
   const installer=path.join(root,'artifacts',input.asset);
+  fs.writeFileSync(path.join(root,'artifacts/SHA256SUMS.txt'),crypto.createHash('sha256').update(input.artifact).digest('hex')+'  '+input.asset+'\n');
   fs.writeFileSync(installer,input.artifact);fs.writeFileSync(installer+'.sig',input.artifactSignature);
   fs.writeFileSync(path.join(root,'artifacts/update-manifest.json'),input.manifestBytes);fs.writeFileSync(path.join(root,'artifacts/update-manifest.json.sig'),input.manifestSignature);
   fs.writeFileSync(path.join(root,'run.ps1'),`function Invoke-RestMethod { throw 'FORBIDDEN_API_CALL' }\n& ./scripts/publish-verified-update.ps1 -Installer './artifacts/${input.asset}' -VerifyOnly\n`);
@@ -75,7 +76,7 @@ finally { ConvertTo-Json -InputObject $global:atlasTestApiCalls -Depth 5 | Set-C
 `);
   for (const fail of ['0','1']) {
     const published=spawnSync('pwsh',['-NoProfile','-File','run.ps1'],{cwd:root,encoding:'utf8',env:{...process.env,
-      GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_STEP_SUMMARY:'',ATLAS_TEST_FAIL_UPLOAD:fail}});
+      GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_EVENT_NAME:'workflow_dispatch',ATLAS_RELEASE_AUTHORIZATION:'Publish Atlas 2.5.1',GITHUB_STEP_SUMMARY:'',ATLAS_TEST_FAIL_UPLOAD:fail}});
     assert.ifError(published.error);
     assert(fs.existsSync(path.join(root,'calls.json')),published.stdout+'\n'+published.stderr);
     const calls=JSON.parse(fs.readFileSync(path.join(root,'calls.json')));
@@ -87,8 +88,8 @@ finally { ConvertTo-Json -InputObject $global:atlasTestApiCalls -Depth 5 | Set-C
       assert(!calls.some(call=>call.method==='Patch'));
     } else {
       assert.equal(published.status,0,published.stdout+'\n'+published.stderr);
-      assert.equal(calls.length,7);
-      assert.deepEqual(calls.slice(1,-1).map(call=>path.basename(call.file)),[input.asset,input.asset+'.sig','latest.json','update-manifest.json','update-manifest.json.sig']);
+      assert.equal(calls.length,8);
+      assert.deepEqual(calls.slice(1,-1).map(call=>path.basename(call.file)),[input.asset,input.asset+'.sig','latest.json','update-manifest.json','update-manifest.json.sig','SHA256SUMS.txt']);
       assert.equal(calls.at(-1).method,'Patch');
       assert.equal(JSON.parse(calls.at(-1).body).draft,false);
     }

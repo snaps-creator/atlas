@@ -66,12 +66,11 @@ pub(crate) struct Recovery {
     needed: bool,
     scheduled: Option<Scheduled>,
     samples: HashMap<String,NodeSample>,
+    probe_attempts: HashMap<String,Instant>,
     last_active: Option<Instant>,
     active: Option<Scheduled>,
     slow_samples: u8,
     last_reserves: Option<Instant>,
-    last_pool: Option<Instant>,
-    pool_cursor: usize,
     observed_current: Option<String>,
     current_since: Option<Instant>,
     improvement: Option<(String,u8)>,
@@ -95,7 +94,8 @@ impl Recovery {
         self.cancelled=Default::default();
         self.generation += 1; self.pending = None; self.needed = false; self.retry_at = None;
         self.scheduled = None; self.samples.clear(); self.last_active = None;
-        self.last_reserves = None; self.last_pool = None; self.observed_current = None;
+        self.probe_attempts.clear();
+        self.last_reserves = None; self.observed_current = None;
         self.current_since = None; self.improvement = None; self.active = None; self.slow_samples = 0;
     }
     fn poll_active(&mut self, client: &ApiClient, settings: &Settings, now: Instant) {
@@ -114,7 +114,7 @@ impl Recovery {
                 self.slow_samples.saturating_add(1)
             } else { 0 };
             if self.slow_samples == 0 {
-                self.improvement = None; self.pool_cursor=0; self.last_pool=None;
+                self.improvement = None;
             }
             if !alive {
                 self.needed = true; self.retry_at = None;
@@ -170,7 +170,7 @@ impl Recovery {
                 checked_at: now, primary_delay: *delay, alive: *alive });
             if name == &pending.current && !alive { self.needed = true; }
         }
-        if self.needed || self.pending.is_some() || self.observed_current.as_deref() != Some(&pending.current) || pending.purpose != "reserves" || !matches!(settings.selected.as_str(),"AUTO"|"FAILOVER") { return; }
+        if !settings.auto_optimize || self.needed || self.pending.is_some() || self.observed_current.as_deref() != Some(&pending.current) || pending.purpose != "reserves" || !matches!(settings.selected.as_str(),"AUTO"|"FAILOVER") { return; }
         let Some(current) = self.samples.get(&pending.current).filter(|s|s.alive && s.checked_at.elapsed() < Duration::from_secs(90)) else { return; };
         let Some(current_delay) = current.primary_delay else { return; };
         if self.slow_samples < 3 || current_delay <= settings.auto_search_ping_ms {
@@ -200,34 +200,34 @@ impl Recovery {
             self.current_since = Some(now);
             self.improvement = None;
             self.active=None; self.last_active=None; self.slow_samples=0;
-            self.pool_cursor=0; self.last_pool=None;
+
             client.event(json!({"at":crate::model::now(),"kind":"automatic_optimization",
                 "from":pending.current,"to":name,"improvementMs":current_delay-delay,
                 "series":2,"heldSeconds":60}));
         }
     }
+    fn planned_names(&self, settings: &Settings, current: &str, now: Instant) -> Vec<String> {
+        let nodes=settings.servers();
+        let mut names:Vec<_>=nodes.iter().filter(|n|n["name"] != current && !self.blocked.contains_key(&node_key(n)))
+            .filter_map(|n|n["name"].as_str().map(str::to_owned))
+            .filter(|name|self.samples.get(name).is_none_or(|s|now.duration_since(s.checked_at)>=Duration::from_secs(settings.auto_test_interval_seconds)))
+            .filter(|name|self.probe_attempts.get(name).is_none_or(|at|now.duration_since(*at)>=Duration::from_secs(30)))
+            .collect();
+        names.sort_by_key(|name|self.probe_attempts.get(name).copied());
+        names.truncate(2);
+        names
+    }
     fn schedule(&mut self, client: ApiClient, settings: &Settings, now: Instant) {
         if self.scheduled.is_some() || self.pending.is_some() || self.needed { return; }
-        let automatic = matches!(settings.selected.as_str(),"AUTO"|"FAILOVER");
         let Some(current) = self.observed_current.clone() else { return; };
-        if !automatic || self.slow_samples < 3 { return; }
+        // Fair background measurement is independent of optimization and of
+        // the current server's delay. Unknown nodes must not wait for manual ping.
         if self.last_reserves.is_some_and(|at|now.duration_since(at)<Duration::from_secs(2)) { return; }
-        if self.last_pool.is_some_and(|at|now.duration_since(at)<Duration::from_secs(60)) { return; }
-        let nodes=settings.servers();
-        let mut backups:Vec<_>=nodes.iter().filter(|n|n["name"] != current && !self.blocked.contains_key(&node_key(n)))
-            .filter_map(|n|n["name"].as_str().map(str::to_owned)).collect();
-        backups.sort_by_key(|name|self.samples.get(name).filter(|s|s.alive).and_then(|s|s.primary_delay).unwrap_or(u64::MAX));
-        let mut names=Vec::new();
-        if let Some((name,_))=&self.improvement { names.push(name.clone()); }
-        for _ in 0..backups.len().min(2) {
-            if self.pool_cursor >= backups.len() { self.pool_cursor=0; self.last_pool=Some(now); break; }
-            let name=backups[self.pool_cursor].clone(); self.pool_cursor+=1;
-            if !names.contains(&name) { names.push(name); }
-            if names.len()==2 { break; }
-        }
+        let names=self.planned_names(settings,&current,now);
         self.last_reserves=Some(now);
         let purpose="reserves";
         if names.is_empty() { return; }
+        for name in &names { self.probe_attempts.insert(name.clone(),now); }
         let (tx,rx)=mpsc::channel();
         self.scheduled=Some(Scheduled{rx,generation:self.generation,current,purpose});
         std::thread::spawn(move || {
@@ -239,15 +239,14 @@ impl Recovery {
                     let jobs: Vec<_>=pair.iter().map(|name| {
                         let client=&client;
                         scope.spawn(move || {
-                            let primary=crate::latency::verified_probe(client,name,crate::latency::DISPLAY_URL);
-                            match primary {
-                                Ok(value) => (name.clone(),value["delay"].as_u64(),true),
-                                Err(_) => (name.clone(),None,
-                                    crate::latency::verified_probe(client,name,crate::latency::SECONDARY_URL).is_ok())
+                            match confirmed_probe(client,name) {
+                                Ok(value) => Some((name.clone(),value["delay"].as_u64(),true)),
+                                Err(error) if remote_probe_failure(&error) => Some((name.clone(),None,false)),
+                                Err(_) => None, // Local busy/errors are not node failures.
                             }
                         })
                     }).collect();
-                    jobs.into_iter().filter_map(|j|j.join().ok()).collect::<Vec<_>>()
+                    jobs.into_iter().filter_map(|j|j.join().ok().flatten()).collect::<Vec<_>>()
                 }));
             }
             let _=tx.send(results);
@@ -330,7 +329,7 @@ impl Recovery {
                         self.observed_current = selected.map(str::to_owned);
                         self.current_since = Some(now); self.slow_samples=0;
                         self.last_active=None; self.improvement=None;
-                        self.active=None; self.scheduled=None; self.pool_cursor=0; self.last_pool=None;
+                        self.active=None; self.scheduled=None;
                     } else { self.needed = true; }
                     self.retry_at = Some(now + Duration::from_secs(30));
                     client.event(json!({"at":crate::model::now(),"kind":"recovery_result","evidence":report,
@@ -463,6 +462,48 @@ pub(crate) fn verify_names(client: &ApiClient, names: &[String], controls: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn healthy_connection_keeps_selection_when_measurements_improve() {
+        let settings=Settings::default();
+        assert!(!settings.auto_optimize);
+        let now=Instant::now();
+        let mut recovery=Recovery::default();
+        recovery.observed_current=Some("active".into());
+        recovery.current_since=Some(now-Duration::from_secs(120));
+        recovery.slow_samples=3;
+        recovery.improvement=Some(("faster".into(),1));
+        recovery.samples.insert("active".into(),NodeSample{checked_at:now,primary_delay:Some(500),alive:true});
+        let (tx,rx)=mpsc::channel();
+        tx.send(vec![("faster".into(),Some(20),true)]).unwrap();
+        recovery.scheduled=Some(Scheduled{rx,generation:0,current:"active".into(),purpose:"reserves"});
+        let core=crate::core::Core::new(Default::default(),Default::default());
+        recovery.poll_scheduled(&core.client(),&settings,now);
+        assert_eq!(recovery.observed_current.as_deref(),Some("active"));
+        assert_eq!(recovery.route_revision,0);
+        assert_eq!(recovery.samples["faster"].primary_delay,Some(20));
+    }
+    #[test]
+    fn large_pool_unknown_nodes_are_fair_even_after_controller_errors() {
+        let mut settings=Settings::default();
+        settings.subscriptions.push(crate::model::Subscription{source:Default::default(),options:Default::default(),id:"source".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:(0..126).map(|i|json!({"name":format!("node-{i}"),"server":"192.0.2.1","port":443})).collect()});
+        let mut recovery=Recovery::default();
+        let now=Instant::now();
+        let mut seen=HashSet::new();
+        // Failed local requests produce no availability sample but still yield
+        // their place in the queue to nodes that have never been attempted.
+        for round in 0..63 {
+            let at=now+Duration::from_secs(round*2);
+            let names=recovery.planned_names(&settings,"active",at);
+            assert_eq!(names.len(),2);
+            for name in names { assert!(seen.insert(name.clone())); recovery.probe_attempts.insert(name,at); }
+        }
+        assert_eq!(seen.len(),126);
+        let names=recovery.planned_names(&settings,"active",now+Duration::from_secs(126));
+        assert_eq!(names,vec!["node-0","node-1"]);
+        recovery.invalidate();
+        assert!(recovery.probe_attempts.is_empty());
+    }
     #[test]
     fn http_failure_with_working_https_is_not_a_dead_node() {
         assert_eq!(confirm_remote_failure(Err("Mihomo API: HTTP 504".into()), || Ok(98)),Ok(98));

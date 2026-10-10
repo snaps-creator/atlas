@@ -511,7 +511,7 @@ function App() {
             }
             onClick={() =>
               run(() =>
-                act(connected || data?.guardActive ? "disconnect" : "connect"),
+                act(connected || data?.guardActive || data?.desiredConnected ? "disconnect" : "connect"),
               )
             }
           >
@@ -670,6 +670,7 @@ function App() {
               </button>
             </div>
           )}
+          {data?.controlError && <div className="alert" role="status"><span>{data.controlError}</span></div>}
           {error && (
             <div role="alert" className="alert">
               <span>{error}</span>
@@ -736,7 +737,7 @@ function App() {
                         onClick={() =>
                           run(() =>
                             act(
-                              connected || connecting || data?.guardActive
+                              connected || connecting || data?.guardActive || data?.desiredConnected
                                 ? "disconnect"
                                 : "connect",
                             ),
@@ -750,7 +751,7 @@ function App() {
                         )}
                       </button>
                       <div>
-                        <h2>{initializing ? "Подготовка сети…" : connecting ? "Подключение…" : data.status === "Stopping" ? "Отключение…" : connected ? "Туннель запущен" : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
+                        <h2>{initializing ? "Подготовка сети…" : connecting ? "Подключение…" : data.status === "WaitingForNetwork" ? "Ожидание сети…" : data.status === "Stopping" ? "Отключение…" : connected ? "Туннель запущен" : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
                         <p>
                           {connected
                             ? protection.detail
@@ -765,14 +766,14 @@ function App() {
                         onClick={() =>
                           run(() =>
                             act(
-                              connected || connecting || data?.guardActive
+                              connected || connecting || data?.guardActive || data?.desiredConnected
                                 ? "disconnect"
                                 : "connect",
                             ),
                           )
                         }
                       >
-                        {connecting ? "Отменить" : connected || protectedPause ? "Отключить" : "Подключить"}
+                        {connecting || (!connected && data?.desiredConnected) ? "Отменить" : connected || protectedPause ? "Отключить" : "Подключить"}
                         <ArrowUpRight size={17} />
                       </button>
                     </div>
@@ -982,6 +983,10 @@ function App() {
                           <SubscriptionCard sub={sub}
                           refreshing={data?.refreshingSubscriptions?.includes(sub.id) ?? false}
                           canDelete={!busy && !connected}
+                          rename={async (name) => {
+                            await request<Snapshot>("subscription_rename", { id: sub.id, name });
+                            await refresh();
+                          }}
                           saveUserAgent={async (userAgent) => {
                             await request<Snapshot>("subscription_user_agent", { id: sub.id, userAgent });
                             await refresh();
@@ -1370,6 +1375,12 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Автопереключение</h2>
+                    <Toggle
+                      title="Оптимизировать работающий VPN"
+                      text="Разрешить переход на более быстрый сервер. Восстановление при отказе работает независимо."
+                      value={s.autoOptimize ?? false}
+                      onChange={(value) => run(() => save({ ...s, autoOptimize: value }))}
+                    />
                     <div className="setting-row">
                       <div>
                         <strong>Искать быстрее при пинге выше</strong>
@@ -1395,6 +1406,10 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Запуск</h2>
+                    {data.startupStatus?.error && <p className="error">{data.startupStatus.error}</p>}
+                    {data.startupStatus?.desired && !data.startupStatus.effective && <p className="error">
+                      {data.startupStatus.disabledByWindows ? "Автозапуск отключён в Windows. Включите его в Диспетчере задач, если хотите запускать Atlas автоматически." : "Регистрация автозапуска не подтверждена."}
+                    </p>}
                     <Toggle
                       title="Запускать с Windows"
                       text="Автозапуск после входа в вашу учётную запись"

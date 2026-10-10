@@ -101,7 +101,6 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                         }
                         let source=before.settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка удалена")?.source;
                         a.install_subscription(id.clone(),url,nodes,None,None,source)?;
-                        if trigger=="recovery" && a.status=="Error" && a.reconnect.load(Ordering::SeqCst) { a.connect()?; }
                         a.snapshot(); Ok(())
                     })();
                     incident_history::record("subscription_refresh_completed",json!({"subscription":id,"trigger":trigger,
@@ -112,7 +111,7 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                                 if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id) {
                                     sub.error=Some(error);
                                     let settings=a.settings.clone();
-                                    if a.store.save(&settings).is_err() {a.log("WARN","Не удалось сохранить состояние обновления подписки");}
+                                    if a.store.save_source_status(&settings).is_err() {a.log("WARN","Не удалось сохранить состояние обновления подписки");}
                                 }
                             }
                             a.snapshot();

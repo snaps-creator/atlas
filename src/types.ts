@@ -51,6 +51,7 @@ export type Settings = {
   };
   autoTestIntervalSeconds: number;
   autoSearchPingMs: number;
+  autoOptimize?: boolean;
   theme: string;
   wasConnected: boolean;
   favorites: string[];
@@ -58,6 +59,9 @@ export type Settings = {
 export type SubscriptionSource = "URL" | "VLESS";
 export type Log = { time: number; level: string; message: string };
 export type Snapshot = {
+  controlError?: string | null;
+  startupStatus?: {desired: boolean; registered: boolean; disabledByWindows: boolean; effective: boolean; error?: string | null};
+  desiredConnected?: boolean;
   refreshingSubscriptions?: string[];
   buildId?: string;
   revision?: number;

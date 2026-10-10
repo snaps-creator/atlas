@@ -49,23 +49,8 @@ jobs:
       - name: Test updater signature verification
         run: node --test scripts/*.check.cjs
 
-      - name: Verify offline source-archive installer
-        shell: pwsh
-        run: |
-          node scripts/verify-offline-installer.cjs
-          if ($LASTEXITCODE -ne 0) { throw 'Offline installer signature failed.' }
-          ./scripts/test-offline-installer.ps1
-
-      - name: Verify checked-in installer when present
-        shell: pwsh
-        run: |
-          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          $label = if ($version -match '^(\d+\.\d+\.\d+)-alpha(?:\..*)?$') { "Alpha $($Matches[1])" } elseif ($version -match '^1\.0\.0-beta\.(\d+(?:\.\d+)*)$') { "Beta $($Matches[1])" } else { $version }
-          $installer = "Atlas $label Setup.exe"
-          if (Test-Path -LiteralPath $installer) {
-            node scripts/verify-installer.cjs $installer
-            if ($LASTEXITCODE -ne 0) { throw 'Checked-in installer signature is invalid.' }
-          }
+      - name: Verify release distribution contracts
+        run: node --test scripts/release-distribution.check.cjs
 
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance --bin AtlasUpdater

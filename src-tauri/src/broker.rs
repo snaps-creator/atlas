@@ -252,6 +252,8 @@ impl Broker {
         self.call_cancellable(op, payload, None)
     }
     pub fn call_cancellable(&self, op: &str, payload: Value, running: Option<&std::sync::atomic::AtomicBool>) -> Result<Value, String> {
+        let queued=Instant::now();
+        let request_id=uuid::Uuid::new_v4().to_string();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut slot = loop {
             if running.is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst)) {
@@ -267,8 +269,9 @@ impl Broker {
         };
         if slot.is_none() { *slot = Some(Self::reconnect_pipe(running)?); }
         let file = slot.as_mut().ok_or("Канал сетевой службы закрыт")?;
+        let dispatched=Instant::now();
         let reply = (|| {
-            send_cancellable(file, &json!({"op":op,"payload":payload}), running)?;
+            send_cancellable(file, &json!({"op":op,"payload":payload,"requestId":request_id}), running)?;
             // Starting can include driver installation; its IPC deadline must outlive readiness.
             receive_cancellable(
                 file,
@@ -291,6 +294,11 @@ impl Broker {
                 return Err(error);
             }
         };
+        if queued.elapsed()>Duration::from_millis(100) || matches!(op,"start"|"apply"|"select"|"stop") {
+            crate::incident_history::record("service_call_timing",json!({"operation":op,"requestId":request_id,
+                "queueMs":dispatched.duration_since(queued).as_millis(),"replyMs":dispatched.elapsed().as_millis(),
+                "coreMs":reply["coreMs"],"success":reply["error"].is_null()}),&[]);
+        }
         if let Some(e) = reply["error"].as_str() {
             crate::incident_history::record("service_operation_failed",json!({"operation":op,"error":e,"evidence":reply["evidence"]}),&[]);
             Err(e.into())
@@ -884,6 +892,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
         };
         let op = request["op"].as_str().unwrap_or("");
         let payload = &request["payload"];
+        let core_started=Instant::now();
         let result: Result<Value, String> = (|| match op {
             "support_snapshot" => {
                 let id = queries.start(false, |_| crate::support_report::privileged_snapshot().map(|text| json!({"text":text})))?;
@@ -1139,7 +1148,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
             }
             _ => Err("Неизвестная команда сетевой службы".into()),
         })();
-        let reply = match result {
+        let mut reply = match result {
             Ok(v) => json!({"result":v}),
             Err(e) => {
                 let persisted=std::fs::read_to_string(core.directory.join("last-session-failure.json")).ok()
@@ -1151,6 +1160,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 json!({"error":e,"evidence":crate::support_report::redact_value(&evidence,&[])})
             },
         };
+        reply["coreMs"]=json!(core_started.elapsed().as_millis());
         if send(&mut pipe, &reply).is_err() {
             break;
         }
@@ -1165,9 +1175,20 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
     Ok(!explicit_stop && ((*configured && guard.is_some()) || (!*configured && guard.is_none())))
 }
 
+struct ClientAdmission { deadline: Instant }
+impl ClientAdmission {
+    fn new(configured: bool, now: Instant) -> Self {
+        Self { deadline:now+Duration::from_secs(if configured {30} else {3}) }
+    }
+    fn retry_rejection(&self, now: Instant, stopping: bool) -> bool {
+        !stopping && now < self.deadline
+    }
+}
 pub fn serve_service() -> Result<(), String> {
     let mut state = Controller::new()?;
     let mut channel_result = Ok(());
+    // Rejected clients cannot extend the owner admission window indefinitely.
+    let mut admission = ClientAdmission::new(false,Instant::now());
     while !crate::service::is_stopping() {
         state.tick();
         let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)");
@@ -1202,7 +1223,7 @@ pub fn serve_service() -> Result<(), String> {
                 return Err(error("Не удалось открыть канал сетевой службы"));
             }
             let mut connected = false;
-            let deadline = Instant::now() + Duration::from_secs(if state.session.configured { 30 } else { 3 });
+            let deadline = admission.deadline;
             while !crate::service::is_stopping() {
                 state.tick();
                 if Instant::now() >= deadline {
@@ -1222,6 +1243,7 @@ pub fn serve_service() -> Result<(), String> {
             }
             let mut client_pid = 0;
             if GetNamedPipeClientProcessId(handle, &mut client_pid) == 0
+                || (state.session.desktop_pid != 0 && state.session.desktop_pid != client_pid)
                 || verify_process_image(
                     client_pid,
                     &std::env::current_exe()
@@ -1232,8 +1254,11 @@ pub fn serve_service() -> Result<(), String> {
             {
                 DisconnectNamedPipe(handle);
                 CloseHandle(handle);
-                channel_result = Err("Канал сетевой службы отклонён: клиент не подтверждён".into());
-                break;
+                // This is a client failure, not a terminal service failure.
+                // Keep the session/observer and original bounded deadline.
+                if !admission.retry_rejection(Instant::now(),crate::service::is_stopping()) { break; }
+                thread::sleep(Duration::from_millis(100));
+                continue;
             }
             let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
             if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
@@ -1244,8 +1269,20 @@ pub fn serve_service() -> Result<(), String> {
             }
             let file = File::from_raw_handle(handle);
             match run_channel(file, &mut state, client_pid) {
-                Ok(true) => continue,
+                Ok(true) => {
+                    admission = ClientAdmission::new(state.session.configured,Instant::now());
+                    continue;
+                },
                 Ok(false) => channel_result = Ok(()),
+                Err(error) if state.session.configured && state.session.guard.is_some() => {
+                    // An authenticated client's failed reply/reconciliation is
+                    // recoverable while the independent session owner survives.
+                    state.session.core.continue_running=None;
+                    state.scheduler.queries.invalidate();
+                    crate::incident_history::record("service_client_rejected",json!({"error":error,"sessionPreserved":true}),&[]);
+                    admission=ClientAdmission::new(true,Instant::now());
+                    continue;
+                },
                 Err(error) => channel_result = Err(error),
             }
         }
@@ -1267,6 +1304,18 @@ pub fn serve_service() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejected_clients_preserve_the_owner_window_without_extending_it() {
+        let now=Instant::now();
+        for configured in [false,true] {
+            let admission=ClientAdmission::new(configured,now);
+            let original=admission.deadline;
+            for ms in 0..1000 { assert!(admission.retry_rejection(now+Duration::from_millis(ms),false)); }
+            assert_eq!(admission.deadline,original);
+            assert!(!admission.retry_rejection(now,true));
+            assert!(!admission.retry_rejection(original,false));
+        }
+    }
     #[test]
     fn channel_loss_with_live_process_requires_reconnect_not_process_restart() {
         assert_eq!(channel_recovery_action("Running"), ChannelRecoveryAction::Reconnect);

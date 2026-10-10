@@ -1,7 +1,7 @@
 name: Atlas remediation acceptance
 on:
   push:
-    branches: [codex/unified-sources-startup]
+    branches: [codex/unified-sources-startup, release/atlas-2.5.1]
 permissions:
   contents: read
 concurrency:
@@ -47,14 +47,14 @@ jobs:
         shell: pwsh
         run: |
           $version=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          ./scripts/test-packaged-installer.ps1 -Installer "artifacts/release/Atlas_${version}_x64-setup.exe"
-          ./scripts/publish-verified-update.ps1 -Installer "artifacts/release/Atlas_${version}_x64-setup.exe" -VerifyOnly
+          ./scripts/test-packaged-installer.ps1 -Installer "artifacts/release/Atlas-Setup-${version}.exe"
+          ./scripts/publish-verified-update.ps1 -Installer "artifacts/release/Atlas-Setup-${version}.exe" -VerifyOnly
       - uses: actions/upload-artifact@v7
         with:
           name: remediation-candidate-${{ github.sha }}
           path: |
-            artifacts/release/*setup.exe
-            artifacts/release/*setup.exe.sig
+            artifacts/release/Atlas-Setup-*.exe
+            artifacts/release/Atlas-Setup-*.exe.sig
             artifacts/release/update-manifest.json*
             artifacts/release/build.json
             artifacts/release/verification/verification.json
@@ -87,9 +87,9 @@ jobs:
         shell: pwsh
         run: |
           $version=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          node scripts/verify-installer.cjs "candidate/Atlas_${version}_x64-setup.exe"
+          node scripts/verify-installer.cjs "candidate/Atlas-Setup-${version}.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed' }
-          ./scripts/test-connected-upgrade.ps1 -Installer "candidate/Atlas_${version}_x64-setup.exe"
+          ./scripts/test-connected-upgrade.ps1 -Installer "candidate/Atlas-Setup-${version}.exe"
       - uses: actions/upload-artifact@v7
         if: failure()
         with:

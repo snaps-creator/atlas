@@ -1,5 +1,5 @@
 //! Remove only startup registrations owned by this installation. The elevated
-//! helper may run under a different account, so inspect loaded user hives.
+//! helper may run under a different account, so inspect registered profiles.
 use std::path::Path;
 use winreg::{enums::*, types::FromRegValue, RegKey};
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -63,23 +63,68 @@ fn cleanup_user(user: &RegKey, root: &Path) -> Result<(), String> {
     }
     delete(&run)
 }
+fn user_sid(sid: &str) -> bool {
+    (sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-"))
+        && !sid.ends_with("_Classes")
+        && sid.split('-').skip(1).all(|part|!part.is_empty() && part.chars().all(|c|c.is_ascii_digit()))
+}
+fn profile_directory(raw: &str) -> Result<std::path::PathBuf, String> {
+    let drive=std::env::var("SystemDrive").unwrap_or_default();
+    let value=regex::Regex::new("(?i)%systemdrive%").unwrap().replace_all(raw,regex::NoExpand(&drive));
+    let path=std::path::PathBuf::from(value.as_ref());
+    if value.contains('%') || !path.is_absolute() || path.components().any(|c|matches!(c,std::path::Component::ParentDir)) {
+        return Err("Invalid registered user profile path; startup cleanup incomplete".into());
+    }
+    Ok(path)
+}
 pub fn cleanup(root: &Path) -> Result<(), String> {
     let users = RegKey::predef(HKEY_USERS);
+    let mut loaded=std::collections::HashSet::new();
     for sid in users.enum_keys() {
         let sid = sid.map_err(|error| error.to_string())?;
-        if !(sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-"))
-            || sid.ends_with("_Classes")
-        {
-            continue;
-        }
+        if !user_sid(&sid) { continue; }
         let user = users.open_subkey(&sid).map_err(|error| error.to_string())?;
         cleanup_user(&user, root)?;
+        loaded.insert(sid);
+    }
+    let profiles=RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList").map_err(|e|e.to_string())?;
+    for sid in profiles.enum_keys() {
+        let sid=sid.map_err(|e|e.to_string())?;
+        if !user_sid(&sid) || loaded.contains(&sid) {continue;}
+        // Prefer a hive loaded since the initial inventory (logon race).
+        if let Ok(user)=users.open_subkey(&sid) {cleanup_user(&user,root)?;continue;}
+        let profile=profiles.open_subkey(&sid).map_err(|e|e.to_string())?;
+        let raw:String=profile.get_value("ProfileImagePath").map_err(|e|e.to_string())?;
+        let directory=profile_directory(&raw)?;
+        let hive=directory.join("NTUSER.DAT");
+        if !directory.exists() {continue;}
+        use std::os::windows::fs::MetadataExt;
+        // Never follow a reparse point to an unrelated registry hive.
+        for path in [&directory,&hive] {
+            let meta=std::fs::symlink_metadata(path).map_err(|e|format!("Cannot inspect offline profile; startup cleanup incomplete: {e}"))?;
+            if meta.file_attributes() & 0x400 != 0 {return Err("Offline profile is a reparse point; startup cleanup incomplete".into());}
+        }
+        // Private process-scoped app hive: no global mount/name, RAII unload.
+        let user=RegKey::load_app_key_with_flags(&hive,KEY_READ|KEY_WRITE,REG_PROCESS_APPKEY)
+            .map_err(|e|format!("Cannot inspect offline user startup; uninstall stopped before payload removal: {e}"))?;
+        cleanup_user(&user,root)?;
     }
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offline_profile_resolution_does_not_use_the_elevated_users_home() {
+        assert_eq!(profile_directory(r"D:\Users\fixture").unwrap(),Path::new(r"D:\Users\fixture"));
+        for raw in [r"%USERPROFILE%",r"%UNKNOWN%\fixture",r"relative\fixture",r"D:\Users\..\Windows"] {
+            assert!(profile_directory(raw).is_err());
+        }
+        assert!(user_sid("S-1-5-21-1-2-3-1001"));
+        assert!(user_sid("S-1-12-1-1-2-3-4"));
+        assert!(!user_sid("S-1-5-21-1-2-3-1001_Classes"));
+        assert!(!user_sid("S-1-5-21-invalid"));
+    }
     #[test]
     fn ownership_is_exact_and_understands_canonical_windows_paths() {
         let root = Path::new(r"\\?\C:\Program Files\Atlas");

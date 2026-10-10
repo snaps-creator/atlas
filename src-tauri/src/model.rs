@@ -103,6 +103,8 @@ pub struct Settings {
     pub auto_test_interval_seconds: u64,
     #[serde(default = "default_auto_search_ping_ms")]
     pub auto_search_ping_ms: u64,
+    #[serde(default)]
+    pub auto_optimize: bool,
     pub theme: String,
     pub was_connected: bool,
     pub favorites: Vec<String>,
@@ -138,6 +140,7 @@ impl Default for Settings {
             },
             auto_test_interval_seconds: DEFAULT_AUTO_TEST_INTERVAL_SECONDS,
             auto_search_ping_ms: default_auto_search_ping_ms(),
+            auto_optimize: false,
             theme: "system".into(),
             was_connected: false,
             favorites: vec![],

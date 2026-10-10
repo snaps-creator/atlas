@@ -30,7 +30,7 @@ $override=Join-Path $output 'payload-config.json'
 if ($LASTEXITCODE -ne 0) {throw 'Release payload build failed'}
 $payloadInstaller=Join-Path $target "release/bundle/nsis/Atlas_${version}_x64-setup.exe"
 $built=& (Join-Path $PSScriptRoot 'build-transactional-installer.ps1') -PayloadInstaller $payloadInstaller -BuildId $BuildId -TargetDirectory $target -Version $version -PassThru
-$installer=Join-Path $output "Atlas_${version}_x64-setup.exe"
+$installer=Join-Path $output "Atlas-Setup-${version}.exe"
 Copy-Item -LiteralPath $built.Installer -Destination $installer
 & (Join-Path $PSScriptRoot 'verify-transactional-installer.ps1') -Installer $installer -ExpectedPayload $built.Payload -EvidenceDirectory (Join-Path $output 'verification') -ExpectedVersion $version
 $verification=Join-Path $output 'verification/verification.json'

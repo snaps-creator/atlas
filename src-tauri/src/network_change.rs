@@ -42,8 +42,37 @@ pub(crate) struct Monitor {
     changes: Changes,
     pending: Option<Receiver<Option<Snapshot>>>,
     last_started: Option<Instant>,
+    abandoned: Option<Receiver<Option<Snapshot>>>,
+}
+static WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct WorkerSlot;
+impl WorkerSlot {
+    fn take() -> Option<Self> {
+        WORKERS.fetch_update(std::sync::atomic::Ordering::SeqCst,std::sync::atomic::Ordering::SeqCst,
+            |count|(count<4).then_some(count+1)).ok().map(|_|Self)
+    }
+}
+impl Drop for WorkerSlot {
+    fn drop(&mut self) { WORKERS.fetch_sub(1,std::sync::atomic::Ordering::SeqCst); }
 }
 impl Monitor {
+    fn retire_stalled(&mut self, now: Instant) {
+        if self.abandoned.as_ref().is_some_and(|rx|!matches!(rx.try_recv(),Err(mpsc::TryRecvError::Empty))) {
+            self.abandoned=None; // Late sample belongs to an obsolete observation.
+        }
+        if self.abandoned.is_none() && self.pending.is_some()
+            && self.last_started.is_some_and(|at|now.duration_since(at)>Duration::from_secs(15)) {
+            self.abandoned=self.pending.take();
+        }
+    }
+    pub(crate) fn online(&self) -> Option<bool> {
+        if self.stale() { return None; }
+        self.changes.stable.as_ref().map(|s| s.online)
+    }
+    pub(crate) fn stale(&self) -> bool {
+        self.changes.last_sample.is_some_and(|at| at.elapsed()>Duration::from_secs(15))
+            || (self.pending.is_some() && self.last_started.is_some_and(|at| at.elapsed()>Duration::from_secs(15)))
+    }
     pub(crate) fn tick(&mut self) -> bool {
         let now=Instant::now();
         let mut changed=false;
@@ -54,9 +83,12 @@ impl Monitor {
                 Err(mpsc::TryRecvError::Empty) => {},
             }
         }
+        self.retire_stalled(now);
         if self.pending.is_none() && self.last_started.is_none_or(|at|now.duration_since(at)>=Duration::from_secs(2)) {
+            let Some(slot)=WorkerSlot::take() else {return changed;};
             let (tx,rx)=mpsc::channel();
             if std::thread::Builder::new().name("atlas-uplink-observer".into()).spawn(move || {
+                let _slot=slot;
                 let _=tx.send(snapshot());
             }).is_ok() { self.pending=Some(rx); self.last_started=Some(now); }
         }
@@ -222,5 +254,20 @@ mod tests {
         let started=Instant::now();
         for _ in 0..1000 { assert!(!monitor.tick()); assert!(monitor.pending.is_some()); }
         assert!(started.elapsed()<Duration::from_secs(1));
+    }
+    #[test]
+    fn stalled_observer_is_explicitly_unknown_and_keeps_one_worker() {
+        let (_tx, rx) = mpsc::channel();
+        let mut monitor = Monitor { pending: Some(rx), last_started: Some(Instant::now()-Duration::from_secs(20)), ..Default::default() };
+        monitor.changes.stable = sample("old", None);
+        assert!(monitor.stale());
+        assert_eq!(monitor.online(), None);
+        monitor.retire_stalled(Instant::now());
+        assert!(monitor.abandoned.is_some());
+        assert!(monitor.pending.is_none());
+        let (_second,rx)=mpsc::channel();
+        monitor.pending=Some(rx);
+        monitor.last_started=Some(Instant::now()-Duration::from_secs(20));
+        for _ in 0..100 { monitor.retire_stalled(Instant::now()); assert!(monitor.stale()); }
     }
 }

@@ -6,7 +6,7 @@ const {verifySignature}=require('./verify-installer.cjs');
 function create({installer,evidence,version,build,publicKey}){
   const transactional=evidence.payloadVerified===true&&evidence.corruptedPayloadRejected===true;
   if(!(transactional||evidence.verified)||evidence.version!==version||!build||!/^[a-zA-Z0-9_.-]{1,100}$/.test(build))throw Error('Unverified package/build identity');
-  const asset=path.basename(installer);if(asset!==`Atlas_${version}_x64-setup.exe`)throw Error('Unexpected installer asset name');
+  const asset=path.basename(installer);if(asset!==`Atlas-Setup-${version}.exe`)throw Error('Unexpected installer asset name');
   const signature=fs.readFileSync(installer+'.sig','utf8').trim();
   const artifact=verifySignature(fs.readFileSync(installer),signature,publicKey);
   if(transactional&&evidence.sha256!==artifact.sha256)throw Error('Transactional installer differs from verification evidence');

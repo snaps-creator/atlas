@@ -1,9 +1,12 @@
 name: Publish Atlas update
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Separate authorization after merge: type Publish Atlas 2.5.1'
+        required: true
+        type: string
 
 concurrency:
   group: atlas-release-main
@@ -18,6 +21,7 @@ jobs:
 
   publish-windows:
     needs: release-readiness
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
     runs-on: windows-latest
     env:
       ATLAS_BUILD_ID: ${{ github.sha }}
@@ -90,12 +94,13 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATLAS_RELEASE_AUTHORIZATION: ${{ inputs.confirmation }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           ./scripts/build-release-installer.ps1 -Clean -Signed -TargetDirectory t/release-clean -OutputDirectory artifacts/release
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $installer = "artifacts/release/Atlas_${version}_x64-setup.exe"
+          $installer = "artifacts/release/Atlas-Setup-${version}.exe"
           ./scripts/test-connected-upgrade.ps1 -Installer $installer
           ./scripts/publish-verified-update.ps1 -Installer $installer
       - name: Preserve generated installer and dependency evidence

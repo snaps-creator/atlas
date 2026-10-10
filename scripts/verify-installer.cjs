@@ -29,7 +29,7 @@ if (require.main === module) {
     const version = config.version.replace(/^1\.0\.0-beta\./,'');
     const alpha = /^(\d+\.\d+\.\d+)-alpha(?:\..*)?$/.exec(config.version);
     const label = alpha ? `Alpha ${alpha[1]}` : config.version.startsWith('1.0.0-beta.') ? `Beta ${version}` : config.version;
-    const file = process.argv[2] || `Atlas ${label} Setup.exe`;
+    const file = process.argv[2] || `artifacts/release/Atlas-Setup-${version}.exe`;
     const result = verifySignature(fs.readFileSync(file),fs.readFileSync(file+'.sig','utf8'),config.plugins.updater.pubkey);
     console.log(JSON.stringify({verified:true,version:config.version,file,...result}));
   } catch (error) { console.error(error.message); process.exitCode=1; }

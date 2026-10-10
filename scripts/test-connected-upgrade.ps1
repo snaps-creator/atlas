@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline)
+param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller)
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.
@@ -173,12 +173,17 @@ function Install-Checked([string]$path) {
         throw "Installer failed: $($process.ExitCode)"
     }
 }
-$previousVersion = if ($LegacyBaseline) { '2.2.3-alpha.47.1' } else { '2.4.2' }
+$previousVersion = if ($PreviousInstaller) { '2.4.3' } elseif ($LegacyBaseline) { '2.2.3-alpha.47.1' } else { '2.4.2' }
 $previousName = "Atlas_${previousVersion}_x64-setup.exe"
 $previous = Join-Path $fixture $previousName
 $base = "https://github.com/snaps-creator/atlas/releases/download/v$previousVersion/"
-Invoke-WebRequest ($base + $previousName) -OutFile $previous
-Invoke-WebRequest ($base + $previousName + '.sig') -OutFile "$previous.sig"
+if ($PreviousInstaller) {
+    Copy-Item -LiteralPath $PreviousInstaller -Destination $previous
+    Copy-Item -LiteralPath "$PreviousInstaller.sig" -Destination "$previous.sig"
+} else {
+    Invoke-WebRequest ($base + $previousName) -OutFile $previous
+    Invoke-WebRequest ($base + $previousName + '.sig') -OutFile "$previous.sig"
+}
 node (Join-Path $PSScriptRoot 'verify-installer.cjs') $previous
 if ($LASTEXITCODE -ne 0) { throw 'Old release signature does not match Atlas trust' }
 $previousRoot = $installRoot
@@ -278,7 +283,7 @@ rules:
         $journal = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
         if ($journal.stage -ne 'Committed') { throw 'Upgrade was not durably committed' }
         $activeRoot = Join-Path $installRoot ('versions/' + $journal.active.id)
-        $expectedVersion = if ($LegacyBaseline) { '2.4.2' } else { (Get-Content (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version }
+        $expectedVersion = (Get-Content (Join-Path $repo 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version
         if ($journal.active.version -ne $expectedVersion) { throw 'Wrong active version after upgrade' }
         # Commit already checked authenticated UI/service readiness. Stop this
         # disposable runner's candidate before the independent TUN reuse test.
