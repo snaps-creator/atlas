@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           . ./scripts/initialize-msvc.ps1
-          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --bin AtlasMaintenance --bin AtlasUpdater
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
           if ($LASTEXITCODE -ne 0) { throw 'Backend regression suite failed' }
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
           if ($LASTEXITCODE -ne 0) { throw 'Restricted desktop regression failed' }

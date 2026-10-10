@@ -1220,7 +1220,7 @@ pub fn run() {
             let show_initial=coordinator.should_show_window();
             // Durable restore intent survives startup, visibility and failures.
             // Only an explicit Disconnect clears it.
-            settings.last_window_hidden=!show_initial;
+            settings.last_window_hidden = !show_initial;
             app.manage(WindowVisibility(Arc::new(std::sync::atomic::AtomicBool::new(!show_initial))));
             let coordinator:StartupState=Arc::new(Mutex::new(coordinator));
             app.manage(coordinator.clone());
@@ -1541,9 +1541,7 @@ pub fn run() {
                             a.status = "Error".into();
                         }
                     }
-                    if uplink.stale() && a.control_error.is_none() {
-                        a.control_error = Some("Наблюдение сети задерживается; состояние uplink неизвестно".into());
-                    }
+                    uplink.update_warning(&mut a.control_error);
                     if !wants_connection && a.status == "CleanupError"
                         && cleanup_retry.due(std::time::Instant::now(), true, true) {
                         match a.stop_session(false) {

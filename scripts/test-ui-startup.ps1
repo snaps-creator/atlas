@@ -6,6 +6,11 @@ $evidenceRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $evidence = Join-Path $evidenceRoot ('atlas-ui-acceptance-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $evidence | Out-Null
 $report = Join-Path $evidence 'report.json'
+function Write-SmokeFailureEvidence {
+    Write-Output "UI process evidence: $evidence"
+    if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
+    Get-Content -LiteralPath (Join-Path $evidence 'stderr.log') -Tail 40
+}
 $previousMode = $env:ATLAS_UI_PROCESS_SMOKE
 $previousReport = $env:ATLAS_UI_SMOKE_REPORT
 try {
@@ -38,8 +43,8 @@ try {
         throw 'Atlas UI did not acknowledge rendering/IPC within 25 seconds'
     }
     $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { throw "Isolated Atlas UI exited with failure code $($process.ExitCode)" }
-    if (-not (Test-Path -LiteralPath $report)) { throw 'Atlas created a process but failed to render its interface and acknowledge IPC' }
+    if ($process.ExitCode -ne 0) { Write-SmokeFailureEvidence; throw "Isolated Atlas UI exited with failure code $($process.ExitCode)" }
+    if (-not (Test-Path -LiteralPath $report)) { Write-SmokeFailureEvidence; throw 'Atlas created a process but failed to render its interface and acknowledge IPC' }
     $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
     if (-not $result.rendered -or $result.buttons -lt 5) { throw 'Atlas UI acceptance report is incomplete' }
     # Historical binaries have no trace. Current candidates must prove one exit

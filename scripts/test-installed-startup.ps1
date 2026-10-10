@@ -79,9 +79,26 @@ $cases = @(
     @{name='G';windows=$false;auto=$false;tray=$false;restore=$true;was=$false;explicit=$true;connect=$false},
     @{name='H';windows=$false;auto=$false;tray=$true;restore=$false;was=$false;explicit=$true;connect=$false}
 )
-$shellInitialized = $false
 $failures = [System.Collections.Generic.List[string]]::new()
 try {
+    Quiesce
+    Fixture verify | Write-Output
+    # Prepare the limited notification area BEFORE launching the tested app.
+    # Replacing Explorer after case A creates a tray registration race. This
+    # bootstrap uses the real stable launcher with synthetic disconnected state,
+    # then quiesces it; cases A-H start fresh against the ready medium shell.
+    $bootstrapState=@{startup=@{launchWithWindows=$false;autoConnect=$false;startInTray=$true;restoreConnection=$false;delaySeconds=1};wasConnected=$false;userDisconnected=$true;lastWindowHidden=$true}
+    Fixture patch ($bootstrapState | ConvertTo-Json -Compress) | Out-Null
+    $bootstrap=Start-Process -FilePath (Join-Path $InstallRoot 'AtlasUpdater.exe') -ArgumentList '--launch' -PassThru -WindowStyle Hidden
+    if (-not $bootstrap.WaitForExit(30000) -or $bootstrap.ExitCode -ne 0) { throw 'Shell bootstrap stable launcher failed' }
+    $deadline=[DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $bootstrapOwners=@(Get-CimInstance Win32_Process -Filter "Name='Atlas.exe'" | Where-Object { $_.ExecutablePath -eq $desktopExe -and $_.CommandLine -notmatch '--type=' })
+        if ($bootstrapOwners.Count -eq 1) { break }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if ($bootstrapOwners.Count -ne 1) { throw 'Shell bootstrap did not establish exactly one installed desktop owner' }
+    & (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot
     Quiesce
     Fixture verify | Write-Output
     foreach ($case in $cases) {
@@ -108,13 +125,6 @@ try {
                 Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $deadline)
             if ($owners.Count -ne 1 -or $samples.Count -eq 0 -or $samples[-1].value.status -ne $expected) { throw "Startup $($case.name) did not reach $expected" }
-            # Case A establishes a real medium-integrity desktop after the
-            # upgrade harness has quiesced the candidate. Use its token to
-            # initialize the disposable notification area before tray cases.
-            if (-not $shellInitialized) {
-                & (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot
-                $shellInitialized = $true
-            }
             # Observe another complete recorder interval to catch repeated connect/recovery.
             Start-Sleep -Seconds 16
             $events=@(Events)

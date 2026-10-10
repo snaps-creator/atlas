@@ -63,7 +63,10 @@ impl From<&Startup> for Policy {
 
 #[derive(Debug)]
 enum State {
-    Pending { policy: Policy, ready_since: Option<Instant> },
+    Pending {
+        policy: Policy,
+        ready_since: Option<Instant>,
+    },
     Consumed,
     Cancelled,
 }
@@ -86,7 +89,10 @@ impl StartupCoordinator {
         let restore_eligible = previous_connected && !user_disconnected;
         let policy = Policy::from(settings);
         let state = if policy.auto || (policy.restore && restore_eligible) {
-            State::Pending { policy, ready_since: None }
+            State::Pending {
+                policy,
+                ready_since: None,
+            }
         } else {
             State::Cancelled
         };
@@ -94,7 +100,9 @@ impl StartupCoordinator {
             state,
             restore_eligible,
             show_window: match reason {
-                LaunchReason::ManualRestart | LaunchReason::UpdaterRestart | LaunchReason::RecoveryRestart => !previous_hidden,
+                LaunchReason::ManualRestart
+                | LaunchReason::UpdaterRestart
+                | LaunchReason::RecoveryRestart => !previous_hidden,
                 _ => !settings.start_in_tray,
             },
         }
@@ -117,7 +125,11 @@ impl StartupCoordinator {
     /// The owner must keep ready false while update_health::pending() is true;
     /// pending health alone must not call cancel().
     pub fn poll(&mut self, now: Instant, ready: bool, settings: &Startup) -> bool {
-        let State::Pending { policy, ready_since } = &mut self.state else {
+        let State::Pending {
+            policy,
+            ready_since,
+        } = &mut self.state
+        else {
             return false;
         };
         let next = Policy::from(settings);
@@ -154,8 +166,11 @@ mod tests {
     use super::*;
 
     const REASONS: [LaunchReason; 6] = [
-        LaunchReason::ManualLaunch, LaunchReason::ManualRestart, LaunchReason::WindowsStartup,
-        LaunchReason::UpdaterRestart, LaunchReason::InstallerFirstLaunch,
+        LaunchReason::ManualLaunch,
+        LaunchReason::ManualRestart,
+        LaunchReason::WindowsStartup,
+        LaunchReason::UpdaterRestart,
+        LaunchReason::InstallerFirstLaunch,
         LaunchReason::RecoveryRestart,
     ];
 
@@ -171,15 +186,19 @@ mod tests {
 
     #[test]
     fn manual_restart_cannot_replay_windows_startup_or_update_challenge() {
-        let args=manual_restart_args("Atlas.exe".into()).into_iter().map(|a|a.into_string().unwrap()).collect::<Vec<_>>();
-        assert_eq!(args,vec!["Atlas.exe","--manual-restart"]);
-        let reason=LaunchReason::from_args(&args);
-        assert_eq!(reason,LaunchReason::ManualRestart);
-        let mut s=settings(0,0); s.launch_with_windows=false;
-        for hidden in [false,true] {
-            let c=StartupCoordinator::new(reason,&s,false,false,hidden);
-            assert_eq!(c.should_show_window(),!hidden);
-            assert_ne!(reason,LaunchReason::WindowsStartup);
+        let args = manual_restart_args("Atlas.exe".into())
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["Atlas.exe", "--manual-restart"]);
+        let reason = LaunchReason::from_args(&args);
+        assert_eq!(reason, LaunchReason::ManualRestart);
+        let mut s = settings(0, 0);
+        s.launch_with_windows = false;
+        for hidden in [false, true] {
+            let c = StartupCoordinator::new(reason, &s, false, false, hidden);
+            assert_eq!(c.should_show_window(), !hidden);
+            assert_ne!(reason, LaunchReason::WindowsStartup);
         }
     }
 
@@ -188,9 +207,9 @@ mod tests {
         let now = Instant::now();
         let enabled = settings(2, 5);
         let disabled = settings(0, 5);
-        let new = |s: &Startup| StartupCoordinator::new(
-            LaunchReason::ManualLaunch, s, false, false, false,
-        );
+        let new = |s: &Startup| {
+            StartupCoordinator::new(LaunchReason::ManualLaunch, s, false, false, false)
+        };
         let mut c = new(&enabled);
         assert!(!c.is_finished());
         assert!(!c.poll(now, false, &enabled));
@@ -227,16 +246,32 @@ mod tests {
                     for hidden in [false, true] {
                         for reason in REASONS {
                             let s = settings(bits, 2);
-                            let mut c = StartupCoordinator::new(reason, &s, connected, disconnected, hidden);
-                            let show = if matches!(reason, LaunchReason::ManualRestart | LaunchReason::UpdaterRestart | LaunchReason::RecoveryRestart) {
+                            let mut c = StartupCoordinator::new(
+                                reason,
+                                &s,
+                                connected,
+                                disconnected,
+                                hidden,
+                            );
+                            let show = if matches!(
+                                reason,
+                                LaunchReason::ManualRestart
+                                    | LaunchReason::UpdaterRestart
+                                    | LaunchReason::RecoveryRestart
+                            ) {
                                 !hidden
-                            } else { !s.start_in_tray };
+                            } else {
+                                !s.start_in_tray
+                            };
                             assert_eq!(c.should_show_window(), show);
                             assert!(!c.poll(now, false, &s));
                             assert!(!c.poll(now + Duration::from_secs(100), true, &s));
                             assert!(!c.poll(now + Duration::from_secs(101), true, &s));
-                            assert_eq!(c.poll(now + Duration::from_secs(102), true, &s),
-                                s.auto_connect || (s.restore_connection && connected && !disconnected));
+                            assert_eq!(
+                                c.poll(now + Duration::from_secs(102), true, &s),
+                                s.auto_connect
+                                    || (s.restore_connection && connected && !disconnected)
+                            );
                             assert!(!c.poll(now + Duration::from_secs(1000), true, &s));
                             assert_eq!(c.should_show_window(), show);
                         }
@@ -248,23 +283,47 @@ mod tests {
 
     #[test]
     fn flags_are_exact_and_precedence_is_order_independent() {
-        let classify = |args: &[&str]| LaunchReason::from_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let classify = |args: &[&str]| {
+            LaunchReason::from_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
         for (flag, reason) in [
             ("--autostart", LaunchReason::WindowsStartup),
             ("--manual-restart", LaunchReason::ManualRestart),
             ("--updater-restart", LaunchReason::UpdaterRestart),
             ("--update-health", LaunchReason::UpdaterRestart),
-            ("--installer-first-launch", LaunchReason::InstallerFirstLaunch),
+            (
+                "--installer-first-launch",
+                LaunchReason::InstallerFirstLaunch,
+            ),
             ("--recovery-restart", LaunchReason::RecoveryRestart),
         ] {
             assert_eq!(classify(&["Atlas.exe", flag]), reason);
             assert_eq!(classify(&[flag]), reason);
-            assert_eq!(classify(&[&format!("{flag}=true")]), LaunchReason::ManualLaunch);
+            assert_eq!(
+                classify(&[&format!("{flag}=true")]),
+                LaunchReason::ManualLaunch
+            );
         }
-        assert_eq!(classify(&["--update-health", "transaction", "nonce", "--installer-first-launch"]), LaunchReason::InstallerFirstLaunch);
+        assert_eq!(
+            classify(&[
+                "--update-health",
+                "transaction",
+                "nonce",
+                "--installer-first-launch"
+            ]),
+            LaunchReason::InstallerFirstLaunch
+        );
         assert_eq!(classify(&[]), LaunchReason::ManualLaunch);
-        assert_eq!(classify(&["--launch", "--unknown"]), LaunchReason::ManualLaunch);
-        let flags = ["--autostart", "--installer-first-launch", "--updater-restart", "--recovery-restart"];
+        assert_eq!(
+            classify(&["--launch", "--unknown"]),
+            LaunchReason::ManualLaunch
+        );
+        let flags = [
+            "--autostart",
+            "--installer-first-launch",
+            "--updater-restart",
+            "--recovery-restart",
+        ];
         for i in 0..flags.len() {
             for j in i..flags.len() {
                 assert_eq!(classify(&[flags[i], flags[j]]), classify(&[flags[j]]));
@@ -279,9 +338,14 @@ mod tests {
         for _action in ["manual connect", "manual disconnect", "quit"] {
             for stage in 0..3 {
                 let mut s = settings(2, 5);
-                let mut c = StartupCoordinator::new(LaunchReason::UpdaterRestart, &s, true, false, true);
-                if stage >= 1 { assert!(!c.poll(now, false, &s)); }
-                if stage >= 2 { assert!(!c.poll(now, true, &s)); }
+                let mut c =
+                    StartupCoordinator::new(LaunchReason::UpdaterRestart, &s, true, false, true);
+                if stage >= 1 {
+                    assert!(!c.poll(now, false, &s));
+                }
+                if stage >= 2 {
+                    assert!(!c.poll(now, true, &s));
+                }
                 c.cancel();
                 c.cancel();
                 for bits in 0..16 {
@@ -297,7 +361,8 @@ mod tests {
     fn updater_health_gates_readiness_then_allows_one_delayed_connection() {
         let now = Instant::now();
         let reason = LaunchReason::from_args(&["--update-health".to_owned()]);
-        for bits in [2, 8] { // auto-connect and restore-only policies
+        for bits in [2, 8] {
+            // auto-connect and restore-only policies
             for hidden in [false, true] {
                 let s = settings(bits, 5);
                 let mut c = StartupCoordinator::new(reason, &s, true, false, hidden);
@@ -320,13 +385,23 @@ mod tests {
     fn main_window_starts_hidden_until_startup_policy_is_applied() {
         let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
             .expect("Tauri configuration must be valid JSON");
-        let windows = config["app"]["windows"].as_array().expect("Configured windows");
-        let main_windows: Vec<_> = windows.iter()
+        let windows = config["app"]["windows"]
+            .as_array()
+            .expect("Configured windows");
+        let main_windows: Vec<_> = windows
+            .iter()
             .filter(|window| window["label"].as_str().unwrap_or("main") == "main")
             .collect();
-        assert_eq!(main_windows.len(), 1, "Exactly one main window must be configured");
-        assert_eq!(main_windows[0]["visible"].as_bool(), Some(false),
-            "Main must explicitly start hidden to prevent a flash before startup policy runs");
+        assert_eq!(
+            main_windows.len(),
+            1,
+            "Exactly one main window must be configured"
+        );
+        assert_eq!(
+            main_windows[0]["visible"].as_bool(),
+            Some(false),
+            "Main must explicitly start hidden to prevent a flash before startup policy runs"
+        );
     }
 
     #[test]
@@ -338,14 +413,28 @@ mod tests {
                     for after in 0..16 {
                         let a = settings(before, 5);
                         let b = settings(after, 5);
-                        let eligible = |s: &Startup| s.auto_connect || (s.restore_connection && connected && !disconnected);
-                        let mut c = StartupCoordinator::new(LaunchReason::ManualLaunch, &a, connected, disconnected, false);
+                        let eligible = |s: &Startup| {
+                            s.auto_connect || (s.restore_connection && connected && !disconnected)
+                        };
+                        let mut c = StartupCoordinator::new(
+                            LaunchReason::ManualLaunch,
+                            &a,
+                            connected,
+                            disconnected,
+                            false,
+                        );
                         assert!(!c.poll(now, true, &a));
                         assert!(!c.poll(now + Duration::from_secs(4), true, &b));
                         let armed = eligible(&a) && eligible(&b);
                         let changed = Policy::from(&a) != Policy::from(&b);
-                        assert_eq!(c.poll(now + Duration::from_secs(5), true, &b), armed && !changed);
-                        assert_eq!(c.poll(now + Duration::from_secs(9), true, &b), armed && changed);
+                        assert_eq!(
+                            c.poll(now + Duration::from_secs(5), true, &b),
+                            armed && !changed
+                        );
+                        assert_eq!(
+                            c.poll(now + Duration::from_secs(9), true, &b),
+                            armed && changed
+                        );
                         assert!(!c.poll(now + Duration::from_secs(100), true, &settings(2, 0)));
                     }
                 }
@@ -358,14 +447,19 @@ mod tests {
         let now = Instant::now();
         for delay in [0, 1, 20, u64::MAX] {
             let mut s = settings(2, 10);
-            let mut c = StartupCoordinator::new(LaunchReason::ManualLaunch, &s, false, false, false);
+            let mut c =
+                StartupCoordinator::new(LaunchReason::ManualLaunch, &s, false, false, false);
             assert!(!c.poll(now, true, &s));
             s.delay_seconds = delay;
             let changed = now + Duration::from_secs(9);
             assert!(!c.poll(changed, false, &s));
             assert_eq!(c.poll(changed, true, &s), delay == 0);
             if delay != 0 {
-                assert!(!c.poll(changed + Duration::from_secs(delay.min(300)) - Duration::from_nanos(1), true, &s));
+                assert!(!c.poll(
+                    changed + Duration::from_secs(delay.min(300)) - Duration::from_nanos(1),
+                    true,
+                    &s
+                ));
                 assert!(c.poll(changed + Duration::from_secs(delay.min(300)), true, &s));
             }
             assert!(!c.poll(changed + Duration::from_secs(1000), true, &s));

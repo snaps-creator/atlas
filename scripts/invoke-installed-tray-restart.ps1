@@ -9,6 +9,12 @@ using System.Text;
 using System.Runtime.InteropServices;
 public static class AtlasTrayAcceptance {
     delegate bool WindowCallback(IntPtr window,IntPtr state);
+    [StructLayout(LayoutKind.Sequential)] struct Point { public int x,y; }
+    [StructLayout(LayoutKind.Sequential)] struct Rect { public int left,top,right,bottom; }
+    [StructLayout(LayoutKind.Sequential)] struct Icon { public uint size;public IntPtr window;public uint id;public Guid guid; }
+    [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref Icon icon,out Rect rect);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool SetCursorPos(int x,int y);
     [DllImport("user32.dll")] static extern bool EnumWindows(WindowCallback callback,IntPtr state);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint pid);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window,StringBuilder name,int length);
@@ -24,6 +30,18 @@ public static class AtlasTrayAcceptance {
             return true;
         },IntPtr.Zero);
         if(found==IntPtr.Zero) throw new Exception("Installed Atlas tray window not found");
+        // A callback enqueue alone does not prove the shell registered the icon.
+        // Query only this verified owner's tray HWND, with a bounded id inventory.
+        Rect rect=new Rect();bool registered=false;
+        for(uint id=1;id<=16;id++) {
+            var icon=new Icon{size=(uint)Marshal.SizeOf(typeof(Icon)),window=found,id=id};
+            if(Shell_NotifyIconGetRect(ref icon,out rect)>=0) { registered=true;break; }
+        }
+        if(!registered)throw new Exception("Installed Atlas tray icon is not registered in the runner notification area");
+        Point cursor;
+        if(!GetCursorPos(out cursor))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Runner input desktop cursor unavailable");
+        if(rect.right>rect.left && rect.bottom>rect.top && !SetCursorPos(rect.left+(rect.right-rect.left)/2,rect.top+(rect.bottom-rect.top)/2))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Position runner cursor at registered Atlas icon");
         // tray-icon 0.25.1's shell callback, followed by the real native menu.
         if(!PostMessage(found,6002,UIntPtr.Zero,new IntPtr(0x205))) throw new Exception("Tray menu could not be opened");
     }

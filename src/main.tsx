@@ -12,17 +12,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { startUpdatePolling } from "./updatePolling";
 import {
   Activity,
-  ArrowDown,
-  ArrowUp,
   ArrowUpRight,
   Check,
   ChevronRight,
   Compass,
   Download,
   Globe2,
-  GripVertical,
   LayoutDashboard,
-  ListFilter,
   LoaderCircle,
   Plus,
   Power,
@@ -34,15 +30,13 @@ import {
   SlidersHorizontal,
   Star,
   Stethoscope,
-  Trash2,
   Wifi,
   X,
   FileText,
-  Copy,
 } from "lucide-react";
 import { request, download, bytes, native } from "./api";
-import { RouteSelect, routeName } from "./RuleEditor";
-import type { Snapshot, Settings, Group, Connection } from "./types";
+import { RouteSelect } from "./RuleEditor";
+import type { Snapshot, Settings, Connection } from "./types";
 import "./style.css";
 
 import { RulesPanel } from "./RulesPanel";
@@ -55,7 +49,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
+import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, LatencyEpoch, type Latency } from "./latency";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
@@ -127,11 +121,6 @@ function App() {
     { name: string; ok: boolean | null; detail: string }[]
   >([]);
   const [publicIp, setPublicIp] = useState("");
-  const [importText, setImportText] = useState("");
-  const [preview, setPreview] = useState<{
-    groups: Group[];
-    warnings: string[];
-  } | null>(null);
   const [dnsText, setDnsText] = useState("");
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [logLevel, setLogLevel] = useState("ALL");
@@ -351,9 +340,9 @@ function App() {
   const initializing = data?.status === "Initializing";
   const protectedPause = data?.status === "ProtectedPause";
   const header = (
-    eyebrow: string,
+    _eyebrow: string,
     title: string,
-    description: string,
+    _description: string,
     action?: React.ReactNode,
   ) => (
     <div className="page-head">

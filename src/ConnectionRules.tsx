@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Connection, Route, Settings } from "./types";
-import { RouteSelect, routeName } from "./RuleEditor";
+import { RouteSelect } from "./RuleEditor";
 export function ConnectionRules({
   connection: c,
   settings: s,

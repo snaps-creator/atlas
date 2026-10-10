@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RefreshCw, Trash2 } from "lucide-react";
 import type { Subscription } from "./types";
 import { subscriptionAge } from "./subscriptionAge";
