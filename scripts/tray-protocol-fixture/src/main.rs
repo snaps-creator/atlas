@@ -1,6 +1,6 @@
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
-    Icon, TrayIconBuilder,
+    Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 fn main() {
@@ -16,9 +16,24 @@ fn main() {
         std::fs::write(&output, format!("{}", e.id.0)).unwrap();
         signal.store(true, std::sync::atomic::Ordering::SeqCst);
     }));
+    let tray_evidence = evidence.join("tray-click.txt");
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
+            std::fs::write(&tray_evidence, format!("{event:?}")).unwrap();
+        }
+    }));
     let menu = Menu::new();
     let restart = MenuItem::with_id("restart", "Перезагрузить", true, None);
     menu.append(&restart).unwrap();
+    let disabled = MenuItem::with_id("disabled", "Disabled", false, None);
+    menu.append(&disabled).unwrap();
     let icon = Icon::from_rgba(vec![64, 128, 255, 255].repeat(256), 16, 16).unwrap();
     let tray = TrayIconBuilder::new()
         .with_id("atlas")

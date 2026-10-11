@@ -168,6 +168,7 @@ try {
                 $trayCommand='"'+$powershell+'" -NoProfile -ExecutionPolicy Bypass -File "'+$trayHelper+'" -ProcessId '+$oldPid+' -Name "Перезагрузить" -EvidencePath "'+$trayEvidence+'"'
                 $trayExit=[AtlasInstalledShell]::RunHelper([uint32]$oldPid,$powershell,$trayCommand,$PSScriptRoot,30000)
                 if (Test-Path -LiteralPath $trayEvidence) {Get-Content -LiteralPath $trayEvidence | Write-Output}
+                else {throw "Limited tray helper exited before transcript initialization: exit=$trayExit"}
                 if ($trayExit -ne 0) { throw "Real installed tray restart failed: limited helper exit=$trayExit" }
                 $deadline=[DateTime]::UtcNow.AddSeconds(30)
                 do {

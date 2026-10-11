@@ -26,27 +26,32 @@ try {
     $native=[regex]::Match($source,"@'\r?\n([\s\S]*?)\r?\n'@").Groups[1].Value
     if (-not $native) {throw 'Native tray implementation missing'}
     Add-Type -TypeDefinition $native
-    Add-Type -AssemblyName UIAutomationClient
-    Add-Type -AssemblyName UIAutomationTypes
     [AtlasTrayAcceptance]::Open([uint32]$process.Id)
-    $condition=[System.Windows.Automation.AndCondition]::new(
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Перезагрузить'),
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$process.Id))
     $deadline=[DateTime]::UtcNow.AddSeconds(5)
     do {
-        $item=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
-        if ($item) {break}
+        $found=[AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'Перезагрузить')
+        if ($found) {break}
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
-    if (-not $item -or -not $item.Current.IsEnabled -or $item.Current.ControlType -ne [System.Windows.Automation.ControlType]::MenuItem) {throw 'Fixture native menu item unavailable'}
-    $bounds=$item.Current.BoundingRectangle
-    if ($bounds.IsEmpty -or $bounds.Width -le 0 -or $bounds.Height -le 0) {throw 'Fixture item has no native input target'}
-    [AtlasTrayAcceptance]::Click([int]($bounds.Left+$bounds.Width/2),[int]($bounds.Top+$bounds.Height/2))
+    if (-not $found) {throw ('Fixture native popup unavailable: '+[AtlasTrayAcceptance]::Diagnostic)}
+    # Negative checks run only after the actual popup has been found.
+    if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$PID,'Перезагрузить')) {throw 'Wrong popup owner accepted'}
+    if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'not-a-fixture-action')) {throw 'Wrong popup action accepted'}
+    if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'Disabled')) {throw 'Disabled native command accepted'}
+    if (-not [AtlasTrayAcceptance]::TryClickMenu([uint32]$process.Id,'Перезагрузить')) {throw ('Native popup changed before input: '+[AtlasTrayAcceptance]::Diagnostic)}
     if (-not $process.WaitForExit(5000)) {throw 'Native menu click did not reach the fixture handler'}
     $process.WaitForExit()
     if ($process.ExitCode -ne 0 -or (Get-Content (Join-Path $root 'menu.txt') -Raw).Trim() -ne 'restart') {throw 'Fixture did not acknowledge exactly the native restart action'}
-    Write-Output "PASS: registered native tray, actual popup click, callback acknowledgement and normal fixture exit; evidence=$root"
+    if (-not (Test-Path -LiteralPath (Join-Path $root 'tray-click.txt'))) {throw 'Missing actual tray callback evidence'}
+    Write-Output "PASS: native popup owner/label/enabled state/hit-test, wrong-owner/wrong-label/disabled rejection, actual input and callback acknowledgement; evidence=$root"
+} catch {
+    $_ | Out-String | Set-Content -LiteralPath (Join-Path $root 'failure.log')
+    throw
 } finally {
-    if ('AtlasTrayAcceptance' -as [type]) {[AtlasTrayAcceptance]::RestoreCursor()}
-    if (-not $process.HasExited) {Stop-Process -Id $process.Id -Force}
+    if ('AtlasTrayAcceptance' -as [type]) {
+        [AtlasTrayAcceptance]::Diagnostic | Set-Content -LiteralPath (Join-Path $root 'native-menu.log')
+        [AtlasTrayAcceptance]::RestoreCursor()
+    }
+    if (-not $process.HasExited) {$process.Kill();$null=$process.WaitForExit(2000)}
+    $process.Dispose()
 }

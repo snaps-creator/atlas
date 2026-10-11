@@ -4,8 +4,8 @@ const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 const os = require("node:os");
 
-function run(args, env = process.env) {
-  return spawnSync("pwsh.exe", ["-NoProfile", ...args], {
+function run(args, env = process.env, executable = "pwsh.exe") {
+  return spawnSync(executable, ["-NoProfile", ...args], {
     encoding: "utf8",
     timeout: 20000,
     env,
@@ -67,10 +67,14 @@ test(
     const file = path
       .join(__dirname, "installed-shell.cs")
       .replaceAll("'", "''");
-    const result = run([
-      "-Command",
-      `Add-Type -Path '${file}'; $level=[AtlasInstalledShell]::Integrity([uint32]$PID); if($level -notin 8192,12288,16384){throw 'Unexpected process integrity'}`,
-    ]);
+    const result = run(
+      [
+        "-Command",
+        `Add-Type -Path '${file}'; $level=[AtlasInstalledShell]::Integrity([uint32]$PID); if($level -notin 8192,12288,16384){throw 'Unexpected process integrity'}`,
+      ],
+      process.env,
+      "powershell.exe",
+    );
     assert.equal(result.status, 0, result.stdout + result.stderr);
   },
 );
@@ -105,12 +109,16 @@ test(
     const code = /@'\r?\n([\s\S]*?)\r?\n'@/.exec(source)?.[1];
     assert(code, "Native tray diagnostic source required");
     const encoded = Buffer.from(code).toString("base64");
-    const result = run([
-      "-Command",
-      "Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" +
-        encoded +
-        "')))",
-    ]);
+    const result = run(
+      [
+        "-Command",
+        "Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" +
+          encoded +
+          "')))",
+      ],
+      process.env,
+      "powershell.exe",
+    );
     assert.equal(result.status, 0, result.stdout + result.stderr);
   },
 );

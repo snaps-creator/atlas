@@ -29,7 +29,9 @@ public static class AtlasInstalledShell {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint code);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
-    static Exception Error(string action) { return new Win32Exception(Marshal.GetLastWin32Error(),action); }
+    [DllImport("kernel32.dll",ExactSpelling=true,SetLastError=true)] static extern IntPtr GetEnvironmentStringsW();
+    [DllImport("kernel32.dll",ExactSpelling=true)] static extern bool FreeEnvironmentStringsW(IntPtr environment);
+    static Exception Error(string action) { int code=Marshal.GetLastWin32Error();return new Win32Exception(code,action+" (Win32="+code+")"); }
     static IntPtr Token(IntPtr process) {
         IntPtr token;if(!OpenProcessToken(process,0xA,out token))throw Error("Inspect runner process token");return token;
     }
@@ -102,7 +104,13 @@ public static class AtlasInstalledShell {
                 IntPtr copy;if(!DuplicateTokenEx(token,0x18B,IntPtr.Zero,2,1,out copy))throw Error("Duplicate desktop helper token");
                 try {
                     var startup=new Startup{size=(uint)Marshal.SizeOf(typeof(Startup)),desktop="winsta0\\default",flags=1,show=0};Created child;
-                    if(!CreateProcessWithTokenW(copy,0,executable,new StringBuilder(command),0x08000000,IntPtr.Zero,directory,ref startup,out child))throw Error("Launch limited UI helper");
+                    // NULL creates a profile environment; it does not inherit
+                    // GITHUB_ACTIONS/RUNNER_TEMP from this runner process.
+                    var environment=GetEnvironmentStringsW();
+                    if(environment==IntPtr.Zero)throw Error("Capture runner helper environment");
+                    try {
+                        if(!CreateProcessWithTokenW(copy,0,executable,new StringBuilder(command),0x08000400,environment,directory,ref startup,out child))throw Error("Launch limited UI helper");
+                    } finally {FreeEnvironmentStringsW(environment);}
                     CloseHandle(child.thread);
                     try {
                         if(WaitForSingleObject(child.process,timeout)!=0){TerminateProcess(child.process,1);WaitForSingleObject(child.process,5000);throw new Exception("Limited UI helper exceeded its deadline");}

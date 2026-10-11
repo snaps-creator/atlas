@@ -7,8 +7,6 @@ if ($EvidencePath) {
     Start-Transcript -LiteralPath $EvidencePath -Force | Out-Null
 }
 try {
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
 $callerLevel=[AtlasInstalledShell]::Integrity([uint32]$PID)
 $ownerLevel=[AtlasInstalledShell]::Integrity([uint32]$ProcessId)
@@ -28,8 +26,11 @@ public static class AtlasTrayAcceptance {
     [StructLayout(LayoutKind.Sequential)] struct Icon { public uint size;public IntPtr window;public uint id;public Guid guid; }
     [StructLayout(LayoutKind.Sequential)] struct Mouse { public int x,y;public uint data,flags,time;public UIntPtr extra; }
     [StructLayout(LayoutKind.Sequential)] struct Input { public uint type;public Mouse mouse; }
+    [StructLayout(LayoutKind.Sequential)] struct MenuBar { public uint size;public Rect rect;public IntPtr menu,window;public uint flags; }
     static Point originalCursor;
     static bool cursorSaved;
+    static string trayDiagnostic="",menuDiagnostic="";
+    public static string Diagnostic { get {return trayDiagnostic+"; "+menuDiagnostic;} }
     [DllImport("user32.dll",SetLastError=true)] static extern uint SendInput(uint count,Input[] inputs,int size);
     [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref Icon icon,out Rect rect);
     [DllImport("user32.dll",SetLastError=true)] static extern bool GetCursorPos(out Point point);
@@ -38,6 +39,15 @@ public static class AtlasTrayAcceptance {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint pid);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window,StringBuilder name,int length);
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr window,uint message,UIntPtr w,IntPtr l);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window,uint flags);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetMenuBarInfo(IntPtr window,int obj,int item,ref MenuBar bar);
+    [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetMenuString(IntPtr menu,uint item,StringBuilder text,int length,uint flags);
+    [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu,uint item,uint flags);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetMenuItemRect(IntPtr window,IntPtr menu,uint item,out Rect rect);
     public static void Open(uint pid) {
         IntPtr found=IntPtr.Zero;
         EnumWindows((window,state)=> {
@@ -59,6 +69,7 @@ public static class AtlasTrayAcceptance {
             failures.AppendFormat(" id={0}:0x{1:X8}",id,result);
         }
         if(!registered)throw new Exception("Cannot resolve installed tray rectangle; HWND="+found+" identifierSize="+Marshal.SizeOf(typeof(Icon))+failures);
+        trayDiagnostic="tray HWND="+found+" rect="+rect.left+","+rect.top+","+rect.right+","+rect.bottom;
         Point cursor;
         if(!GetCursorPos(out cursor))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Runner input desktop cursor unavailable");
         originalCursor=cursor;cursorSaved=true;
@@ -72,31 +83,69 @@ public static class AtlasTrayAcceptance {
         var inputs=new[]{new Input{mouse=new Mouse{flags=2}},new Input{mouse=new Mouse{flags=4}}};
         if(SendInput(2,inputs,Marshal.SizeOf(typeof(Input)))!=2)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Native menu input rejected");
     }
+    static bool ReadItem(IntPtr menu,uint index,string label,out Rect rect) {
+        rect=new Rect();var name=new StringBuilder(1024);
+        if(GetMenuString(menu,index,name,name.Capacity,0x400)==0 || name.ToString()!=label)return false;
+        uint state=GetMenuState(menu,index,0x400);
+        // Reject disabled/grayed items, separators and submenu parents.
+        return state!=uint.MaxValue && (state&0x813)==0 && GetMenuItemRect(IntPtr.Zero,menu,index,out rect)
+            && rect.right>rect.left && rect.bottom>rect.top;
+    }
+    static bool FindItem(uint pid,string label,out IntPtr popup,out IntPtr menu,out uint index,out Rect rect) {
+        IntPtr foundPopup=IntPtr.Zero,foundMenu=IntPtr.Zero;uint foundIndex=0;Rect foundRect=new Rect();int matches=0;
+        var observed=new StringBuilder();uint foregroundPid;var foreground=GetForegroundWindow();GetWindowThreadProcessId(foreground,out foregroundPid);
+        observed.AppendFormat("target PID={0}; foreground HWND={1} PID={2}",pid,foreground,foregroundPid);
+        EnumWindows((window,state)=>{
+            uint owner;GetWindowThreadProcessId(window,out owner);
+            if(owner!=pid || !IsWindowVisible(window))return true;
+            var cls=new StringBuilder(256);GetClassName(window,cls,cls.Capacity);
+            if(cls.ToString()!="#32768")return true;
+            var bar=new MenuBar{size=(uint)Marshal.SizeOf(typeof(MenuBar))};
+            if(!GetMenuBarInfo(window,-4,0,ref bar)){observed.AppendFormat("; popup={0} GetMenuBarInfo error={1}",window,Marshal.GetLastWin32Error());return true;}
+            int count=GetMenuItemCount(bar.menu);observed.AppendFormat("; popup={0} HMENU={1} count={2}",window,bar.menu,count);
+            if(count<1 || count>32)return true;
+            for(uint i=0;i<count;i++) {
+                var name=new StringBuilder(256);GetMenuString(bar.menu,i,name,name.Capacity,0x400);
+                observed.AppendFormat(" [{0}:{1} state=0x{2:X}]",i,name,GetMenuState(bar.menu,i,0x400));
+                Rect candidate;if(!ReadItem(bar.menu,i,label,out candidate))continue;
+                foundPopup=window;foundMenu=bar.menu;foundIndex=i;foundRect=candidate;matches++;
+            }
+            return true;
+        },IntPtr.Zero);
+        menuDiagnostic=observed.ToString();
+        if(matches>1)throw new Exception("Ambiguous native tray action: "+Diagnostic);
+        popup=foundPopup;menu=foundMenu;index=foundIndex;rect=foundRect;return matches==1;
+    }
+    public static bool HasMenuItem(uint pid,string label) {
+        IntPtr popup,menu;uint index;Rect rect;return FindItem(pid,label,out popup,out menu,out index,out rect);
+    }
+    public static bool TryClickMenu(uint pid,string label) {
+        IntPtr popup,menu;uint index;Rect rect;
+        if(!FindItem(pid,label,out popup,out menu,out index,out rect))return false;
+        // Revalidate the same native menu and its current input target before
+        // injecting input; neither a provider acknowledgement nor stale bounds
+        // may select another window.
+        var bar=new MenuBar{size=(uint)Marshal.SizeOf(typeof(MenuBar))};uint owner;
+        GetWindowThreadProcessId(popup,out owner);
+        if(owner!=pid || !IsWindowVisible(popup) || !GetMenuBarInfo(popup,-4,0,ref bar) || bar.menu!=menu || !ReadItem(menu,index,label,out rect))return false;
+        var point=new Point{x=rect.left+(rect.right-rect.left)/2,y=rect.top+(rect.bottom-rect.top)/2};
+        var hit=WindowFromPoint(point);
+        if(GetAncestor(hit,2)!=popup){menuDiagnostic+="; input target is obscured";return false;}
+        Click(point.x,point.y);return true;
+    }
     public static void RestoreCursor(){if(cursorSaved){SetCursorPos(originalCursor.x,originalCursor.y);cursorSaved=false;}}
 }
 '@
 [AtlasTrayAcceptance]::Open([uint32]$ProcessId)
-$menuName=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
-$owner=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$ProcessId)
-$condition=[System.Windows.Automation.AndCondition]::new($menuName,$owner)
 $deadline=[DateTime]::UtcNow.AddSeconds(10)
 do {
-    $item=[System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition)
-    if ($item -and $item.Current.IsEnabled) {
-        # The Win32 provider's Invoke can return without WM_COMMAND. Use real
-        # input on the verified owner's actual popup, then the parent harness
-        # requires an actual restart/new PID and durable settings preservation.
-        if ($item.Current.ControlType -ne [System.Windows.Automation.ControlType]::MenuItem) {throw 'Tray action did not resolve to a native menu item'}
-        $bounds=$item.Current.BoundingRectangle
-        if ($bounds.IsEmpty -or $bounds.Width -le 0 -or $bounds.Height -le 0) {throw 'Native tray menu item has no clickable rectangle'}
-        [AtlasTrayAcceptance]::Click([int]($bounds.Left+$bounds.Width/2),[int]($bounds.Top+$bounds.Height/2))
+    if ([AtlasTrayAcceptance]::TryClickMenu([uint32]$ProcessId,$Name)) {
+        Write-Output ([AtlasTrayAcceptance]::Diagnostic)
         exit 0
     }
     Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
-$matches=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$menuName)
-$matches | ForEach-Object { [pscustomobject]@{menuOwner=$_.Current.ProcessId;control=$_.Current.ControlType.ProgrammaticName;patterns=@($_.GetSupportedPatterns() | ForEach-Object ProgrammaticName)} } | ConvertTo-Json -Depth 3 | Write-Output
-throw 'Installed Atlas Restart menu item was not accessible'
+throw ('Installed Atlas native Restart menu unavailable: '+[AtlasTrayAcceptance]::Diagnostic)
 } finally {
     if ('AtlasTrayAcceptance' -as [type]) {[AtlasTrayAcceptance]::RestoreCursor()}
     if ($EvidencePath) {Stop-Transcript | Out-Null}
