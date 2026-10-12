@@ -38,7 +38,11 @@ try {
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$PID,'Перезагрузить')) {throw 'Wrong popup owner accepted'}
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'not-a-fixture-action')) {throw 'Wrong popup action accepted'}
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'Disabled')) {throw 'Disabled native command accepted'}
-    if (-not [AtlasTrayAcceptance]::TryClickMenu([uint32]$process.Id,'Перезагрузить')) {throw ('Native popup changed before input: '+[AtlasTrayAcceptance]::Diagnostic)}
+    $inputLevel=[AtlasTrayAcceptance]::InputIntegrity([uint32]$PID)
+    if ([AtlasTrayAcceptance]::TryClickMenu([uint32]$process.Id,'Перезагрузить',($inputLevel+4096))) {throw 'Wrong required integrity accepted'}
+    if ([AtlasTrayAcceptance]::Diagnostic -notmatch 'native input integrity mismatch') {throw 'Negative integrity check did not reach the input guard'}
+    if (Test-Path (Join-Path $root 'menu.txt')) {throw 'Rejected integrity delivered a menu command'}
+    if (-not [AtlasTrayAcceptance]::TryClickMenu([uint32]$process.Id,'Перезагрузить',$inputLevel)) {throw ('Native popup changed before input: '+[AtlasTrayAcceptance]::Diagnostic)}
     if (-not $process.WaitForExit(5000)) {throw 'Native menu click did not reach the fixture handler'}
     $process.WaitForExit()
     if ($process.ExitCode -ne 0 -or (Get-Content (Join-Path $root 'menu.txt') -Raw).Trim() -ne 'restart') {throw 'Fixture did not acknowledge exactly the native restart action'}

@@ -16,29 +16,12 @@ $appLevel=[AtlasInstalledShell]::Integrity([uint32]$desktop[0].ProcessId)
 $shellLevel=if($shell){[AtlasInstalledShell]::Integrity($shell)}else{0}
 Write-Output "Runner desktop integrity=$appLevel; shell integrity=$shellLevel"
 if ($appLevel -ne 8192) { throw 'Installed Atlas must run at medium integrity' }
-# Starting Explorer from an elevated CI step gives the notification area a
-# different integrity level from the installed desktop. Use that desktop's
-# existing limited token; never elevate Atlas to make the test pass.
-. (Join-Path $PSScriptRoot 'shell-restart-policy.ps1')
-$policy=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',$true)
-if (-not $policy) { throw 'Runner shell restart policy unavailable' }
-try {
-    Invoke-ShellRestartPolicyLease -Registry $policy -Body {
-        if (-not $shell -or $shellLevel -ne $appLevel) {
-            if ($shell) { [AtlasInstalledShell]::StopVerifiedShell($shell) }
-            [AtlasInstalledShell]::Launch([uint32]$desktop[0].ProcessId)
-            $deadline=[DateTime]::UtcNow.AddSeconds(20)
-            do {
-                $shell=[AtlasInstalledShell]::ShellPid()
-                if ($shell -and [AtlasInstalledShell]::Integrity($shell) -eq $appLevel) { break }
-                Start-Sleep -Milliseconds 100
-            } while ([DateTime]::UtcNow -lt $deadline)
-        }
-        if (-not $shell -or [AtlasInstalledShell]::Integrity($shell) -ne $appLevel) { throw 'Runner notification area did not start at the desktop integrity level' }
-        Write-Output "PASS: disposable notification area PID=$shell and installed Atlas both run at medium integrity; restart policy leased through test action"
-        # Restoring policy before this action lets Winlogon replace the limited
-        # notification area before its consumers perform a real tray action.
-        try { & $installedBody }
-        finally { Write-Output ('Shell fixture completion before policy restore: '+[AtlasInstalledShell]::ShellDiagnostic()) }
-    }
-} finally { [AtlasInstalledShell]::ReleaseShellObservation(); $policy.Dispose() }
+# Explorer supplies a read-only registered-icon rectangle. Real input goes to
+# Atlas's native menu, whose owner and integrity are checked at the click site.
+# Replacing the runner's shell with Atlas's restricted token destroys this
+# independent desktop fixture on hosted Windows; retain the existing shell.
+if (-not $shell) { throw 'Runner notification area unavailable' }
+[AtlasInstalledShell]::VerifyShell($shell)
+Write-Output "PASS: existing runner notification area PID=$shell verified; installed Atlas remains medium; input integrity checked on the native menu owner"
+try { & $installedBody }
+finally { Write-Output ('Shell fixture completion: '+[AtlasInstalledShell]::ShellDiagnostic()) }

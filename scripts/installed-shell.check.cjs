@@ -70,7 +70,7 @@ test(
     const result = run(
       [
         "-Command",
-        `Add-Type -Path '${file}'; $level=[AtlasInstalledShell]::Integrity([uint32]$PID); if($level -notin 8192,12288,16384){throw 'Unexpected process integrity'}; [AtlasInstalledShell]::ShellDiagnostic(); [AtlasInstalledShell]::ReleaseShellObservation(); [AtlasInstalledShell]::ShellDiagnostic()`,
+        `Add-Type -Path '${file}'; $level=[AtlasInstalledShell]::Integrity([uint32]$PID); if($level -notin 8192,12288,16384){throw 'Unexpected process integrity'}; try { [AtlasInstalledShell]::VerifyShell([uint32]$PID); throw 'Non-shell process accepted' } catch { if($_.Exception.ToString() -notmatch 'Refusing a non-Explorer process'){throw} }; $shell=[AtlasInstalledShell]::ShellPid(); if($shell){[AtlasInstalledShell]::VerifyShell($shell); if([AtlasInstalledShell]::ShellPid() -ne $shell){throw 'Read-only verification changed the shell'}}; [AtlasInstalledShell]::ShellDiagnostic(); [AtlasInstalledShell]::ReleaseShellObservation(); [AtlasInstalledShell]::ShellDiagnostic()`,
       ],
       process.env,
       "powershell.exe",

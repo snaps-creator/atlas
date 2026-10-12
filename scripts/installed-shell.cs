@@ -92,6 +92,16 @@ public static class AtlasInstalledShell {
         try {var token=Token(process);try{SameUser(token,pid);return Level(token);}finally{CloseHandle(token);}}
         finally {CloseHandle(process);}
     }
+    public static void VerifyShell(uint pid) {
+        var process=OpenProcess(0x1000,false,pid);if(process==IntPtr.Zero)throw Error("Inspect runner shell");
+        try {
+            var name=new StringBuilder(32768);uint length=32768;
+            if(!QueryFullProcessImageName(process,0,name,ref length))throw Error("Inspect shell image");
+            if(!String.Equals(name.ToString(),Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"explorer.exe"),StringComparison.OrdinalIgnoreCase))
+                throw new Exception("Refusing a non-Explorer process");
+            var token=Token(process);try{SameUser(token,pid);}finally{CloseHandle(token);}
+        } finally {CloseHandle(process);}
+    }
     public static void StopVerifiedShell(uint pid) {
         var process=OpenProcess(0x101001,false,pid);if(process==IntPtr.Zero)throw Error("Open runner shell");
         try {
