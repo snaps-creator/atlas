@@ -1,7 +1,16 @@
 param([switch]$Worker,[string]$Repository,[string]$Executable,[string]$Report)
 $ErrorActionPreference='Stop'
 if ($Worker) {
+    if([Environment]::UserName -notmatch '^AtlasProbe[0-9a-f]{8}$'){throw 'Worker requires the private disposable diagnostic identity'}
     $env:GITHUB_ACTIONS='true';$env:RUNNER_OS='Windows'
+    # Start-Process -Credential inherits the caller's environment even when
+    # LoadUserProfile loads the new identity's hive. Bind profile paths to the
+    # actual token before Add-Type or Explorer creates any per-user files.
+    $env:USERPROFILE=[Environment]::GetFolderPath('UserProfile')
+    $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
+    $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
+    $env:TEMP=Join-Path $env:LOCALAPPDATA 'Temp';$env:TMP=$env:TEMP
+    New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
     Set-Location -LiteralPath $Repository
     Start-Transcript -LiteralPath $Report -Force | Out-Null
     try {
@@ -23,6 +32,7 @@ if ($Worker) {
         $reports=@(Get-ChildItem -Path "$probeRoot/*.json" | Where-Object Name -in 'medium.json','parent.json')
         if(-not $reports.Count){throw 'No normal user registration report'}
         foreach($file in $reports){$proof=Get-Content -LiteralPath $file.FullName -Raw|ConvertFrom-Json;if($proof.notifyAdd -ne 1){throw 'Native registration still failed for normal user'}}
+        $reports | ForEach-Object {Copy-Item -LiteralPath $_.FullName -Destination (Split-Path $Report -Parent)}
         Write-Output 'PASS: actual native icon registration with a normal medium shell and unchanged application token logic'
     } finally {Stop-Transcript | Out-Null}
     return

@@ -71,6 +71,7 @@ jobs:
         with:
           name: tray-root-probe-${{ matrix.runner }}
           path: |
-            C:/Users/*/AppData/Local/AtlasTrayRootProbe-*/*.json
-            ${{ runner.temp }}/AtlasProbe*/split-user.log
+            C:/Users/runneradmin/AppData/Local/AtlasTrayRootProbe-*/*.json
+            ${{ runner.temp }}/AtlasProbe*/*.log
+            ${{ runner.temp }}/AtlasProbe*/*.json
           if-no-files-found: error
