@@ -6,7 +6,7 @@ import type { Snapshot } from "./types";
 export type PoolHealth = { phase: "idle" | "checking" | "refreshing" | "healthy" | "degraded" | "all_timeout" | "local_error"; text: string; checkedAt: number };
 type Proxy = { now?: string; testUrl?: string; alive?: boolean; history?: { delay: number; time?: string }[]; extra?: Record<string, Proxy> };
 const PRIMARY = "http://cp.cloudflare.com/generate_204";
-const SECONDARY = "https://www.cloudflare.com/cdn-cgi/trace";
+const SECONDARY = "https://www.google.com/generate_204";
 export function observedHealth(names: string[], proxies: Record<string, Proxy>, maxAgeMs: number, now = Date.now()): PoolHealth {
   let selected = "ATLAS";
   const seen = new Set<string>();

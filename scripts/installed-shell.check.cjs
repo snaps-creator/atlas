@@ -122,3 +122,32 @@ test(
     assert.equal(result.status, 0, result.stdout + result.stderr);
   },
 );
+
+test(
+  "a detached tray helper preserves its early exception before closing the transcript",
+  { skip: process.platform !== "win32" },
+  (t) => {
+    const fs = require("node:fs");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-tray-error-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const evidence = path.join(root, "negative.log");
+    // PID 0 cannot own an Atlas window. The script must fail during process
+    // inspection, before shell discovery, cursor movement or input delivery.
+    const result = run(
+      [
+        "-ExecutionPolicy", "Bypass", "-File",
+        path.join(__dirname, "invoke-installed-tray-restart.ps1"),
+        "-ProcessId", "0", "-Name", "negative-test", "-EvidencePath", evidence,
+      ],
+      { ...process.env, GITHUB_ACTIONS: "true", RUNNER_OS: "Windows", RUNNER_TEMP: root },
+      "powershell.exe",
+    );
+    assert.ifError(result.error);
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    for (const file of [evidence, evidence + ".error.txt"]) {
+      const diagnostic = fs.readFileSync(file, "utf8");
+      assert.match(diagnostic, /Inspect process \(Win32=87\)/);
+      assert.match(diagnostic, /Script stack:.*invoke-installed-tray-restart\.ps1/);
+    }
+  },
+);

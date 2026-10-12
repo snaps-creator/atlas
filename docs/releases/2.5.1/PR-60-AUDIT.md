@@ -1,0 +1,90 @@
+# PR #60 — independent audit (2026-10-12)
+
+## Scope and provenance
+
+- PR: https://github.com/snaps-creator/atlas/pull/60 (open).
+- Source: `release/atlas-2.5.1`; target: `main`.
+- Audited source: `46c0edef9eeee729c960821ffb8e6bfa34efb3a9`.
+- Audited base: `365b91279f5b7c1a9fd49fd49ab42f1b5f986c69`.
+- 26 commits, 121 changed files, including removal of tracked offline installer parts.
+- Isolated audit worktree; an unrelated modification to `update_user.rs` in the original checkout is preserved and excluded.
+- Windows x64, MSVC 2022, Rust 1.98.1. Initial tests used Node 26.3.0/npm 11.16.0; portable Node 22.23.3 downloaded with SHA-256 verification for CI parity and installer validation.
+- Inventory and baseline analysis precede source changes. Later discoveries and validation outcomes are appended rather than represented as initial evidence.
+
+## Current-head CI inventory
+
+| Workflow / run | Result | Evidence |
+| --- | --- | --- |
+| [Check pull request / 38142834393](https://github.com/snaps-creator/atlas/actions/runs/38142834393) | PASS | Backend, frontend, script contracts, restricted desktop child, native tray fixture and readiness |
+| [Verify connected upgrade / 38142834398](https://github.com/snaps-creator/atlas/actions/runs/38142834398) | FAIL | Jobs 114486314224 (2.4.2) and 114486314244 (2.4.3); legacy baseline passes |
+| [Atlas remediation acceptance / 38142670073](https://github.com/snaps-creator/atlas/actions/runs/38142670073) | FAIL | Installed job 114487017734; signed candidate job passes |
+
+Full logs for all three failed jobs and their diagnostic archives were read. Archive digests matched GitHub's reported SHA-256. All three failures converge on Startup A, `test-installed-startup.ps1:216`, after `RunHelper` returns exit 1 for `invoke-installed-tray-restart.ps1`. Upgrade with a live fixture service/TUN, encrypted settings migration, favorites/selection preservation, packaged UI smoke and the other startup matrix cases pass. Recovery/uninstall stages after the failed matrix are not established by these runs. A CEF timeout message is not by itself a failed UI smoke: that smoke reports a successful render/IPC/exit.
+
+REST reviews, inline comments and issue comments are empty; GraphQL review threads are empty with no next page. No review dismissal is needed. GitHub reports mergeable, but unstable CI. Main ruleset requires a PR, resolved threads and prohibits non-fast-forward/deletion; its required-status-context list is empty. This does not waive the requested CI gate. Legacy branch protection and code-scanning alerts APIs return 404; security alerts cannot be claimed absent from those responses.
+
+## Registry
+
+Line numbers below refer to the audited source above.
+
+| ID | Severity / category | Component / source | Location | Finding and root cause | Related failures | Correction / required evidence | Initial status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A01 | High / ROOT CAUSE (unresolved) | Installed acceptance / three CI logs | `scripts/invoke-installed-tray-restart.ps1:10-17`; `scripts/installed-shell.cs:54-57` | Limited helper exits before the verified-integrity message. Available evidence cannot distinguish C# compilation, process/token access, user/session checks or integrity mismatch. The underlying exception is missing. | A02; all three Startup A failures | Capture the original exception, then diagnose it on the real restricted child; retain actual tray action, integrity checks and deadlines. Require all affected installed jobs on corrected HEAD. | OPEN; do not label as a proven application defect |
+| A02 | High / ROOT CAUSE | Test diagnostics / source plus empty transcripts | `scripts/invoke-installed-tray-restart.ps1:149-152`; `scripts/installed-shell.cs:109-117` | The script closes its transcript in `finally` before PowerShell formats an unhandled error. The detached helper has no captured stderr, so CI loses the reason and stack. | A01; generic `limited helper exit=1` | Write the caught ErrorRecord/inner exception and stack before closing the transcript, then preserve nonzero exit. Exercise an early failure in Windows PowerShell 5.1 with no UI interaction. | CONFIRMED |
+| A03 | High / REGRESSION | Reconnect / full diff review | `src-tauri/src/connection_retry.rs:24`; `src-tauri/src/lib.rs:1553` | Retry stops permanently after five failures unless the network epoch changes. Internet can recover while adapter, address, DNS and route remain unchanged; desired connection then stays down. | Independent of CI tray failures | Keep cleanup retries bounded, but let authorized connection recovery continue at the capped delay. Test prolonged same-topology outages, delay bounds, cancellation and success reset. | CONFIRMED |
+| A04 | Medium / REGRESSION | Health UI / full diff review | `src/usePoolRecovery.ts:9`; `src-tauri/src/latency.rs:179` | Backend secondary control moved to Google HTTPS 204; UI still reads Cloudflare trace. A successful secondary control with failed primary is shown as degraded. | Independent of A03 and CI | Align endpoint contract; assert fresh secondary success, both failures and stale secondary success. | CONFIRMED |
+| E01 | Medium / ENVIRONMENT BLOCKER | Local baseline | `temp/baseline-*` (ignored evidence) | AppContainer denies subprocess/module resolution, token inspection and Tauri build outputs. This is reproduced as sandbox-only behavior, not a code failure. | Initial frontend/contracts/native attempts | Repeat unchanged commands outside AppContainer. | RESOLVED: 51 frontend, 41 script and 365 Rust tests pass |
+| E02 | Low / ENVIRONMENT BLOCKER | Toolchain/dependencies | Rust components and npm cache | Minimal Rust lacked rustfmt/clippy; offline npm cache incomplete. Node initially differs from CI. | Initial offline setup failure | Install pinned components and verified portable Node; install locked dependencies without modifying lockfile. | RESOLVED; pinned-node gate follows |
+| E03 | Medium / ENVIRONMENT BLOCKER | Vulnerability metadata transmission | `npm audit` | Automatic approval review blocked sending the dependency list to registry.npmjs.org before explicit consent. | None | User explicitly authorized npm audit; run it and record actual result. | RESOLVED: audit exit 0, zero reported vulnerabilities |
+| W01 | Low / WARNING | Formatting / rustfmt | Existing Rust sources including `src-tauri/build.rs` | Whole-project `cargo fmt --check` fails on widespread existing compact formatting. No required formatting job exists; historical stabilization already records this. | None | Record failure honestly; avoid unrelated mass reformat. Format newly edited standalone Rust code. | ACCEPTED baseline style debt |
+| W02 | Low / WARNING | Clippy / local baseline | Existing Rust modules | Clippy succeeds with suggestions (17 library, 7 maintenance and 8 updater warnings, overlapping). Includes style, needless borrows and existing loop regex allocation. | None | No compiler errors or denied lints. Recheck edited paths; no broad unrelated rewrite. | ACCEPTED nonblocking warnings |
+| W03 | Low / WARNING | Frontend bundling | Vite output | Main JS chunk approximately 793 kB exceeds advisory 500 kB threshold. Strict TypeScript and production build succeed. | None | Separate performance work; do not disguise as a build failure. | ACCEPTED advisory |
+| E04 | Medium / ENVIRONMENT BLOCKER | Security/review APIs | GitHub code-scanning API | HTTP 404 prevents an authoritative code-scanning-alert inventory. | None | Record unavailable API separately from npm and source security checks. | UNAVAILABLE |
+| E05 | High / ENVIRONMENT BLOCKER | Installed system scenarios | Connected-upgrade/recovery acceptance | Installing on this workstation or changing its live VPN/network is prohibited by task. Physical reboot, power loss and Wi-Fi roaming also unavailable. | A01 blocks later CI stages | Use disposable GitHub Windows runners for install/upgrade/recovery/uninstall. Mark physical scenarios NOT RUN. | DEFERRED TO CI / physical tests NOT RUN |
+
+## Full-diff review coverage
+
+- Unified URL/VLESS sources: canonical payload identity is source-scoped; metadata excluded from runtime config; selection/favorites use stable node IDs; refresh remaps only unambiguous logical names within the source. Explicit select/favorite commands prevent stale UI snapshots overwriting repository-owned fields. VLESS is excluded from URL refresh jobs.
+- Storage: schema 3 migrates inside a transaction, retains encrypted migration snapshots, rejects future schemas, rolls back malformed migrations and preserves DPAPI/WinCred behavior. Runtime/visibility/status saves do not churn user configuration backups. Credential cleanup/restore compensation remains durable.
+- Startup/recovery: six launch reasons, durable desired connection, explicit disconnect suppression, readiness and updater commit gates, visible/hidden restoration and one-shot restart arguments reviewed. Asynchronous network observation is bounded and read-only. A03 is independent of adapter-change tests.
+- Probes/core: manual ping does not issue selection changes; background probes are bounded/fair; alternative-provider confirmation precedes declaring a path failed. Auto optimization is opt-in; nested selector restore preserves existing selection across reload/credential rotation and rejects ambiguity. A04 is the cross-language mismatch.
+- IPC/service: admission timeout remains bounded even for wrong clients; authenticated PID verification, cancellation/revision checks and session ownership retained. Failed clients do not terminate the SYSTEM service. Telemetry deduplication retains first/last/count and bounded storage.
+- Windows/updater: process cleanup verifies ownership; startup registry cleanup matches the quoted installation path and preserves unrelated values; unloaded profile access rejects reparse paths. Transactional package verification, receipt binding, staged admission/commit/rollback and original-user desktop launch remain enforced.
+- Distribution: one `Atlas-Setup-2.5.1.exe`; obsolete tracked installer parts removed. Required core resource binaries remain intentional. Release publishing is manual, main-only, confirmed and gated by reusable tests/connected acceptance. This audit does not dispatch publishing or create tags. README still points users to the published release rather than claiming 2.5.1 is already published.
+- Workflows/scripts: all six YAML files parsed and job/local-workflow references checked; all 38 tracked PowerShell scripts parse; version/distribution contracts pass. No new installer binary or credential file is tracked. Review of C# tray helper identifies A02; actual A01 remains evidence-limited.
+
+Prior stabilization findings S01–S17 in [PR-STABILIZATION-ISSUES.md](PR-STABILIZATION-ISSUES.md) and its result are historical context, not independent fresh PASS claims. The above inventory supersedes the historical pending-CI status for source `46c0ede`.
+
+## Baseline validation
+
+| Check | Outcome |
+| --- | --- |
+| Frontend unit tests | PASS — 12 files / 51 tests |
+| TypeScript + production bundle | PASS; W03 warning |
+| `node --test scripts/*.check.cjs` | PASS — 41 tests |
+| Locked/offline Rust lib + three binaries | PASS — 365 tests; four deliberate ignored child/admin drivers, separately exercised in initial CI |
+| Clippy lib/bins | PASS with W02 warnings |
+| Whole Rust formatting | FAIL, baseline W01; not silently reported PASS |
+| PowerShell parsing / workflow references | PASS — 38 scripts / 6 workflows |
+| `npm audit --json` | PASS — zero reported vulnerabilities, after explicit user consent |
+| Version/distribution contracts and `git diff --check` | PASS |
+| Local unsigned release installer | IN PROGRESS before source changes; result appended below |
+| Signed clean installer | PASS in original-head CI; no local signing key used |
+| Installed upgrade/startup matrix | BLOCKED BY CI A01; workstation installation intentionally NOT RUN |
+
+## Follow-up evidence
+
+This section records completion of baseline packaging, regression reproduction and subsequent fixes without altering their original provenance.
+
+- Baseline local installer PASS before source changes: unsigned, cached target, 190453941 bytes, SHA-256 `33aa5df1186ec7813975d008364d87c64c25d54104dea52958dd5e532909bbf1`. All 32 packaged files, x64 metadata, version and native receipt verified; corruption rejected. Isolated packaged UI PASS (12 buttons/render/IPC/normal exit); negative missing-component/version checks PASS. No installation or network setup executed.
+- Baseline Node 22.23.3 / npm 11.16.0 repeat: 51 frontend and 41 script checks PASS. Standalone native tray fixture PASS: actual click/callback and wrong-owner/wrong-label/disabled rejection.
+- A04 reproduced with a disposable test against the unchanged source: primary false + fresh Google HTTPS success returns `degraded`, expected `healthy`.
+- A02 reproduced in Windows PowerShell 5.1 with PID 0, which cannot reach any UI action: exit 1 and stderr `Inspect process (Win32=87)`; transcript omits the exception. The first local attempt was blocked by Windows PowerShell's execution policy; process-only `-ExecutionPolicy Bypass`, already used by the CI caller, allowed the negative test without changing machine policy.
+- Baseline inventory is complete. Source fixes begin only after the above packaging and regression evidence was collected. The true A01 exception remains to be collected on a disposable runner.
+- First correction: A02 persists the caught ErrorRecord/inner exception and script stack before transcript teardown, with a durable sidecar also printed by installed startup acceptance. A03 uses continuing capped recovery only for connection intent; the existing finite cleanup budget and all its assertions remain. A04 aligns the UI secondary URL and adds a cross-language contract check. Targeted Windows PowerShell diagnostic test, health regressions and six retry tests PASS. No installed guard, timeout or security assertion was relaxed.
+- E06 / ENVIRONMENT BLOCKER or independent test defect (cause unresolved): first full corrected gate passes 52 frontend, 43 script and 367 Rust tests, plus build/Clippy, but its standalone native tray click receives no fixture handler acknowledgement within the unchanged five-second deadline. Evidence contains the registered tray rectangle, visible native menu, correct owner/label/enabled state and tray callback; no `menu.txt`. Foreground belongs to a different process. The exact native C# input implementation is unchanged by this correction and passed the initial standalone run. A background menu/focus/input race is a hypothesis, not an established root cause. Retain the failure evidence and investigate separately; do not label the full gate PASS or push until resolved/qualified.
+- E06 isolated rerun PASS with unchanged source and assertions. It also reports another foreground process, so foreground ownership alone does not establish the cause. Keep the original failure as an intermittent local fixture warning, require a subsequent complete serial gate and disposable-runner tray validation, and do not claim a root fix. No retry was added to any test. The [Windows foreground restrictions](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) and [notification-menu foreground requirement](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenu) explain why interactive desktop conditions warrant separate evidence, without proving this failure's cause.
+- GitHub release lookup for `v2.5.1` returns 404: this version exists in the PR/source and build artifacts, not as a published release. No release/tag was created by this audit.
+- Corrected local installer PASS: unsigned/cached target, 190460292 bytes, SHA-256 `775eb1fbc1b9937fd75d3b61634138a9c7c9625159d9aeb3b07bf7257f0b3617`. All 32 files/metadata/receipt verified, corrupted payload rejected, missing components/wrong version rejected and restored payload accepted. Packaged isolated React UI PASS (12 buttons/render/IPC/normal exit).
+- Complete subsequent serial gate PASS: Node 22.23.3/npm 11.16.0; 52 frontend tests; strict TypeScript/Vite; 43 script contracts; 249 library + 50 maintenance + 65 updater + 3 main = 367 Rust tests; Clippy succeeds with existing warnings; edited retry module rustfmt PASS; actual native tray input/handler and negative ownership/label/disabled checks PASS; readiness, six workflow references, 38 PowerShell parsers and `git diff --check` PASS. Four intentional ignored admin/child drivers remain; the workstation caller is not an administrator, so their separate invocation stays CI-only. The earlier E06 failure remains disclosed rather than erased or converted into a root-fix claim.
+- First batch status before push: A02/A03/A04 FIXED WITH LOCAL REGRESSION EVIDENCE; A01 OPEN pending installed CI diagnostics; E06 nonblocking intermittent local warning pending runner validation. No stale source-selection interface remains outside migration compatibility. No credential/private-key pattern found in the corrective diff; generated installers/evidence are ignored and no binary is added to tracking. This is local validation, not a READY FOR MERGE claim.

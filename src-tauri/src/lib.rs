@@ -1550,7 +1550,7 @@ pub fn run() {
                         }
                     }
                     if !a.cancellation.settings_pending() && uplink.online() != Some(false)
-                        && reconnect_retry.due(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
+                        && reconnect_retry.due_connection(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
                         a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
                         match a.connect() {
                             Ok(()) => reconnect_retry.reset(),

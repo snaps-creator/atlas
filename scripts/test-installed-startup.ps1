@@ -169,6 +169,7 @@ try {
                 $trayExit=[AtlasInstalledShell]::RunHelper([uint32]$oldPid,$powershell,$trayCommand,$PSScriptRoot,30000)
                 if (Test-Path -LiteralPath $trayEvidence) {Get-Content -LiteralPath $trayEvidence | Write-Output}
                 else {throw "Limited tray helper exited before transcript initialization: exit=$trayExit"}
+                if (Test-Path -LiteralPath ($trayEvidence+'.error.txt')) {Get-Content -LiteralPath ($trayEvidence+'.error.txt') | Write-Output}
                 if ($trayExit -ne 0) { throw "Real installed tray restart failed: limited helper exit=$trayExit" }
                 $deadline=[DateTime]::UtcNow.AddSeconds(30)
                 do {

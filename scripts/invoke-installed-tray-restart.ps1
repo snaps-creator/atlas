@@ -146,6 +146,17 @@ do {
     Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
 throw ('Installed Atlas native Restart menu unavailable: '+[AtlasTrayAcceptance]::Diagnostic)
+} catch {
+    # Detached limited helpers have no captured stderr. PowerShell formats an
+    # unhandled error only after finally closes the transcript, losing its cause.
+    $failureRecord=$_
+    $diagnostic="Tray helper failure: $($failureRecord.Exception.ToString())`r`nError ID: $($failureRecord.FullyQualifiedErrorId)`r`nScript stack: $($failureRecord.ScriptStackTrace)"
+    Write-Output $diagnostic
+    if ($EvidencePath) {
+        try { [IO.File]::WriteAllText($EvidencePath+'.error.txt',$diagnostic,[Text.UTF8Encoding]::new($false)) }
+        catch { Write-Output "Cannot persist tray error sidecar: $($_.Exception.Message)" }
+    }
+    throw $failureRecord
 } finally {
     if ('AtlasTrayAcceptance' -as [type]) {[AtlasTrayAcceptance]::RestoreCursor()}
     if ($EvidencePath) {Stop-Transcript | Out-Null}
