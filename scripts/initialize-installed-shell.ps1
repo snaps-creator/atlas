@@ -38,6 +38,7 @@ try {
         Write-Output "PASS: disposable notification area PID=$shell and installed Atlas both run at medium integrity; restart policy leased through test action"
         # Restoring policy before this action lets Winlogon replace the limited
         # notification area before its consumers perform a real tray action.
-        & $installedBody
+        try { & $installedBody }
+        finally { Write-Output ('Shell fixture completion before policy restore: '+[AtlasInstalledShell]::ShellDiagnostic()) }
     }
-} finally { $policy.Dispose() }
+} finally { [AtlasInstalledShell]::ReleaseShellObservation(); $policy.Dispose() }

@@ -10,7 +10,10 @@ try {
 Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
 $callerLevel=[AtlasInstalledShell]::Integrity([uint32]$PID)
 $ownerLevel=[AtlasInstalledShell]::Integrity([uint32]$ProcessId)
-$shellLevel=[AtlasInstalledShell]::Integrity([AtlasInstalledShell]::ShellPid())
+$shellPid=[AtlasInstalledShell]::ShellPid()
+Write-Output ('Limited tray helper context: '+[AtlasInstalledShell]::ShellDiagnostic())
+if (-not $shellPid) { throw 'Runner notification area unavailable before real tray input' }
+$shellLevel=[AtlasInstalledShell]::Integrity($shellPid)
 if ($callerLevel -ne 8192 -or $ownerLevel -ne $callerLevel -or $shellLevel -ne $callerLevel) {
     throw "Tray UI action requires matching medium integrity: helper=$callerLevel owner=$ownerLevel shell=$shellLevel"
 }

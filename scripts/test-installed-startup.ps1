@@ -166,6 +166,7 @@ try {
                 $trayHelper=Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1'
                 $trayEvidence=Join-Path (Split-Path $InstallRoot -Parent) 'tray-restart.log'
                 $trayCommand='"'+$powershell+'" -NoProfile -ExecutionPolicy Bypass -File "'+$trayHelper+'" -ProcessId '+$oldPid+' -Name "Перезагрузить" -EvidencePath "'+$trayEvidence+'"'
+                Write-Output ('Parent context before tray helper: '+[AtlasInstalledShell]::ShellDiagnostic())
                 $trayExit=[AtlasInstalledShell]::RunHelper([uint32]$oldPid,$powershell,$trayCommand,$PSScriptRoot,30000)
                 if (Test-Path -LiteralPath $trayEvidence) {Get-Content -LiteralPath $trayEvidence | Write-Output}
                 else {throw "Limited tray helper exited before transcript initialization: exit=$trayExit"}

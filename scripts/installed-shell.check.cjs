@@ -70,12 +70,18 @@ test(
     const result = run(
       [
         "-Command",
-        `Add-Type -Path '${file}'; $level=[AtlasInstalledShell]::Integrity([uint32]$PID); if($level -notin 8192,12288,16384){throw 'Unexpected process integrity'}`,
+        `Add-Type -Path '${file}'; $level=[AtlasInstalledShell]::Integrity([uint32]$PID); if($level -notin 8192,12288,16384){throw 'Unexpected process integrity'}; [AtlasInstalledShell]::ShellDiagnostic(); [AtlasInstalledShell]::ReleaseShellObservation(); [AtlasInstalledShell]::ShellDiagnostic()`,
       ],
       process.env,
       "powershell.exe",
     );
     assert.equal(result.status, 0, result.stdout + result.stderr);
+    const observations = result.stdout.trim().split(/\r?\n/);
+    assert.equal(observations.length, 2);
+    for (const observation of observations) {
+      assert.match(observation, /^shell PID=\d+; launched shell=not observed; station=\S+; desktop=\S+; session=\d+$/);
+      assert.doesNotMatch(observation, /unavailable:/);
+    }
   },
 );
 

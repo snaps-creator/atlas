@@ -9,6 +9,8 @@ using System.Text;
 // Used only by the disposable installed acceptance script. No Atlas IPC or
 // network settings are involved; the application stays at medium integrity.
 public static class AtlasInstalledShell {
+    static IntPtr observedShell;
+    static uint observedShellPid;
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct Startup {
         public uint size; public string reserved,desktop,title;
         public uint x,y,width,height,xChars,yChars,fill,flags;
@@ -31,6 +33,10 @@ public static class AtlasInstalledShell {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
     [DllImport("kernel32.dll",ExactSpelling=true,SetLastError=true)] static extern IntPtr GetEnvironmentStringsW();
     [DllImport("kernel32.dll",ExactSpelling=true)] static extern bool FreeEnvironmentStringsW(IntPtr environment);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool GetUserObjectInformation(IntPtr handle,int index,IntPtr data,int length,out int needed);
     static Exception Error(string action) { int code=Marshal.GetLastWin32Error();return new Win32Exception(code,action+" (Win32="+code+")"); }
     static IntPtr Token(IntPtr process) {
         IntPtr token;if(!OpenProcessToken(process,0xA,out token))throw Error("Inspect runner process token");return token;
@@ -53,6 +59,34 @@ public static class AtlasInstalledShell {
         uint pid;var window=FindWindow("Shell_TrayWnd",null);if(window==IntPtr.Zero)return 0;
         GetWindowThreadProcessId(window,out pid);return pid;
     }
+    static string ObjectName(IntPtr handle) {
+        int needed;GetUserObjectInformation(handle,2,IntPtr.Zero,0,out needed);
+        if(needed<=0 || needed>65536)return "unavailable:"+Marshal.GetLastWin32Error();
+        var data=Marshal.AllocHGlobal(needed);
+        try {
+            if(!GetUserObjectInformation(handle,2,data,needed,out needed))return "unavailable:"+Marshal.GetLastWin32Error();
+            return Marshal.PtrToStringUni(data);
+        } finally {Marshal.FreeHGlobal(data);}
+    }
+    // Read-only evidence from the exact creation handle survives process exit
+    // and PID reuse. Keeping a handle does not keep Explorer running.
+    public static string ShellDiagnostic() {
+        string lifecycle="not observed";
+        if(observedShell!=IntPtr.Zero) {
+            uint code;
+            lifecycle=GetExitCodeProcess(observedShell,out code)
+                ? "PID="+observedShellPid+" wait="+WaitForSingleObject(observedShell,0)+" exit=0x"+code.ToString("X8")
+                : "PID="+observedShellPid+" query-error="+Marshal.GetLastWin32Error();
+        }
+        return "shell PID="+ShellPid()+"; launched shell="+lifecycle+
+            "; station="+ObjectName(GetProcessWindowStation())+
+            "; desktop="+ObjectName(GetThreadDesktop(GetCurrentThreadId()))+
+            "; session="+Process.GetCurrentProcess().SessionId;
+    }
+    public static void ReleaseShellObservation() {
+        if(observedShell!=IntPtr.Zero)CloseHandle(observedShell);
+        observedShell=IntPtr.Zero;observedShellPid=0;
+    }
     public static int Integrity(uint pid) {
         var process=OpenProcess(0x1000,false,pid);if(process==IntPtr.Zero)throw Error("Inspect process");
         try {var token=Token(process);try{SameUser(token,pid);return Level(token);}finally{CloseHandle(token);}}
@@ -73,6 +107,7 @@ public static class AtlasInstalledShell {
         } finally {CloseHandle(process);}
     }
     public static void Launch(uint desktopPid) {
+        if(observedShell!=IntPtr.Zero)throw new Exception("Shell fixture already owns a launch observation");
         var process=OpenProcess(0x1000,false,desktopPid);if(process==IntPtr.Zero)throw Error("Open desktop owner");
         try {
             var token=Token(process);
@@ -85,7 +120,7 @@ public static class AtlasInstalledShell {
                     string directory=Environment.GetFolderPath(Environment.SpecialFolder.Windows),exe=Path.Combine(directory,"explorer.exe");
                     var startup=new Startup{size=(uint)Marshal.SizeOf(typeof(Startup)),desktop="winsta0\\default"};Created created;
                     if(!CreateProcessWithTokenW(copy,0,exe,new StringBuilder("\""+exe+"\""),0,IntPtr.Zero,directory,ref startup,out created))throw Error("Launch limited notification area");
-                    CloseHandle(created.thread);CloseHandle(created.process);
+                    CloseHandle(created.thread);observedShell=created.process;observedShellPid=created.pid;
                 } finally {CloseHandle(copy);}
             } finally {CloseHandle(token);}
         } finally {CloseHandle(process);}
