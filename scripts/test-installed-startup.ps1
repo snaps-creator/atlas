@@ -98,7 +98,7 @@ try {
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($bootstrapOwners.Count -ne 1) { throw 'Shell bootstrap did not establish exactly one installed desktop owner' }
-    & (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot
+    & (Join-Path $PSScriptRoot 'initialize-installed-shell.ps1') -InstallRoot $InstallRoot -Action {
     Quiesce
     Fixture verify | Write-Output
     foreach ($case in $cases) {
@@ -215,4 +215,5 @@ try {
         } finally { [AtlasWindowHistory]::Stop(); Quiesce }
     }
     if ($failures.Count) { throw ($failures -join '; ') }
+    }
 } finally { Quiesce }

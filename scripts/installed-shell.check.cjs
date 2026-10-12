@@ -80,6 +80,72 @@ test(
 );
 
 test(
+  "installed shell setup requires a scoped action before inspecting the desktop",
+  { skip: process.platform !== "win32" },
+  (t) => {
+    const fs = require("node:fs");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-shell-action-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const result = run(
+      ["-File", path.join(__dirname, "initialize-installed-shell.ps1"), "-InstallRoot", fs.realpathSync.native(root)],
+      { ...process.env, GITHUB_ACTIONS: "true", RUNNER_OS: "Windows", RUNNER_TEMP: fs.realpathSync.native(root) },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Installed shell fixture requires a scoped test action/);
+  },
+);
+
+test(
+  "shell restart policy remains leased through the action and restores value, type and absence on success or failure",
+  { skip: process.platform !== "win32" },
+  () => {
+    const helper = path.join(__dirname, "shell-restart-policy.ps1").replaceAll("'", "''");
+    const result = run(
+      ["-ExecutionPolicy", "Bypass", "-Command", `
+$ErrorActionPreference='Stop'
+. '${helper}'
+$keyPath='Software\\Atlas-Shell-Lease-'+[Guid]::NewGuid().ToString('N')
+if($keyPath -notmatch '^Software\\\\Atlas-Shell-Lease-[a-f0-9]{32}$'){throw 'Invalid disposable key'}
+$key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($keyPath)
+try {
+  foreach($kind in 'Absent','DWord','QWord','String') {
+    foreach($fails in $false,$true) {
+      $key.DeleteValue('AutoRestartShell',$false)
+      if($kind -ne 'Absent') {
+        $original=if($kind -eq 'String'){'original-policy'}else{17}
+        $key.SetValue('AutoRestartShell',$original,[Microsoft.Win32.RegistryValueKind]::$kind)
+      }
+      $caught=$null
+      try {
+        $returned=Invoke-ShellRestartPolicyLease -Registry $key -Body {
+          if($key.GetValue('AutoRestartShell') -ne 0 -or $key.GetValueKind('AutoRestartShell') -ne 'DWord'){throw 'Policy not leased inside action'}
+          if($fails){throw 'fixture-body-failure'}
+          'body-result'
+        }
+      } catch { $caught=$_ }
+      if($fails) {
+        if(-not $caught -or $caught.Exception.Message -ne 'fixture-body-failure'){throw 'Original action exception not propagated'}
+      } elseif($caught -or $returned -ne 'body-result') {throw 'Action result not preserved'}
+      if($kind -eq 'Absent') {
+        if($key.GetValueNames() -contains 'AutoRestartShell'){throw 'Originally absent policy was retained'}
+      } elseif($key.GetValue('AutoRestartShell') -ne $original -or $key.GetValueKind('AutoRestartShell').ToString() -ne $kind) {
+        throw 'Original policy value or type not restored'
+      }
+    }
+  }
+} finally {
+  $key.Dispose()
+  [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($keyPath,$false)
+}`],
+      process.env,
+      "powershell.exe",
+    );
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  },
+);
+
+test(
   "tray restart refuses a workstation before any UI action",
   { skip: process.platform !== "win32" },
   () => {

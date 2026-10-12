@@ -66,6 +66,7 @@ jobs:
           path: |
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.error.txt
             ${{ runner.temp }}/atlas-ui-acceptance-*/**
           retention-days: 7
   baseline-243:
