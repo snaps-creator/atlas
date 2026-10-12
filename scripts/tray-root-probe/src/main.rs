@@ -33,6 +33,9 @@ fn probe(directory:&Path,label:&str) {
     unsafe {let data=NOTIFYICONDATAW{cbSize:std::mem::size_of::<NOTIFYICONDATAW>() as u32,hWnd:window as _,uID:101,..std::mem::zeroed()};Shell_NotifyIconW(NIM_DELETE,&data);}
 }
 fn main(){
+    if std::env::args().any(|a|a=="--shell-linked-bootstrap") {
+        let child=update_user::diagnostic_launch_linked_shell().unwrap();println!("LINKED_SHELL_STARTED={}",child.pid);return;
+    }
     if std::env::args().any(|a|a=="--shell-bootstrap" || a=="--shell-owner-bootstrap") {
         assert_eq!(std::env::var("GITHUB_ACTIONS").unwrap_or_default(),"true","Shell experiment only on a disposable GitHub runner");
         let child=update_user::diagnostic_launch_shell(std::env::args().any(|a|a=="--shell-owner-bootstrap")).unwrap();

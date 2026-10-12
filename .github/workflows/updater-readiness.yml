@@ -61,9 +61,16 @@ jobs:
             $policy.Dispose()
             if(-not [AtlasInstalledShell]::ShellPid()){Start-Process -FilePath "$env:WINDIR/explorer.exe" -WindowStyle Hidden}
           }
+      - name: Test a genuine split-token desktop identity without changing UAC or message filters
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/tray-probe-target
+        run: ./scripts/tray-root-probe/test-split-user.ps1
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: tray-root-probe-${{ matrix.runner }}
-          path: C:/Users/runneradmin/AppData/Local/AtlasTrayRootProbe-*/*.json
+          path: |
+            C:/Users/*/AppData/Local/AtlasTrayRootProbe-*/*.json
+            ${{ runner.temp }}/AtlasProbe*/split-user.log
           if-no-files-found: error
