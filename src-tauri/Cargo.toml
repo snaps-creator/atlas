@@ -19,6 +19,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [build-dependencies]
 tauri-build = { version = "=3.0.0-alpha.1", features = [] }
 
+[patch.crates-io]
+tray-icon = { path = "../vendor/tray-icon" }
+
 [dependencies]
 tauri = { version = "=3.0.0-alpha.2", default-features = false, features = ["tray-icon"] }
 tauri-runtime-cef = "=3.0.0-alpha.2"

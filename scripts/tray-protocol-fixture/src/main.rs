@@ -3,6 +3,14 @@ use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+unsafe extern "system" fn input_window_proc(
+    window: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    w: windows_sys::Win32::Foundation::WPARAM,
+    l: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    DefWindowProcW(window, message, w, l)
+}
 fn main() {
     let evidence = std::path::PathBuf::from(
         std::env::args_os()
@@ -43,6 +51,51 @@ fn main() {
         .with_menu_on_left_click(false)
         .build()
         .unwrap();
+    // Model the real installed startup-A desktop: a window belonging to this
+    // known child can receive genuine input and its normal foreground grant.
+    // A hidden tray-only process has no such grant when the test posts the
+    // shell callback, so its menu's first click can be eaten as activation.
+    let class: Vec<u16> = "AtlasTrayFixtureWindow\0".encode_utf16().collect();
+    let title: Vec<u16> = "Atlas isolated tray fixture\0".encode_utf16().collect();
+    let input_window = unsafe {
+        let instance =
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        let definition = WNDCLASSW {
+            lpfnWndProc: Some(input_window_proc),
+            hInstance: instance,
+            lpszClassName: class.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        assert_ne!(RegisterClassW(&definition), 0);
+        let window = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            20,
+            20,
+            300,
+            140,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        assert!(!window.is_null());
+        assert_ne!(
+            SetWindowPos(
+                window,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            ),
+            0
+        );
+        window
+    };
     std::fs::write(
         evidence.join("ready.txt"),
         format!(
@@ -75,5 +128,8 @@ fn main() {
             std::process::exit(2)
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe {
+        DestroyWindow(input_window);
     }
 }

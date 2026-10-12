@@ -2,6 +2,8 @@
 name="atlas-tray-protocol-fixture"
 version="0.0.0"
 edition="2021"
+[features]
+geometry-failure=["tray-icon/test-icon-rect-failure"]
 [dependencies]
-tray-icon={version="=0.25.1",default-features=false}
-windows-sys={version="0.59",features=["Win32_Foundation","Win32_UI_WindowsAndMessaging"]}
+tray-icon={path="../../vendor/tray-icon",default-features=false}
+windows-sys={version="0.59",features=["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_System_LibraryLoader","Win32_Graphics_Gdi"]}

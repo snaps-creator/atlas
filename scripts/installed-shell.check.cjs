@@ -171,6 +171,34 @@ test(
   },
 );
 test(
+  "parent tray registration query refuses a workstation before inspecting its image or windows",
+  { skip: process.platform !== "win32" },
+  () => {
+    const result = run(
+      ["-File", path.join(__dirname, "get-installed-tray-registration.ps1"),
+        "-ProcessId", String(process.pid), "-Executable", "absent-Atlas.exe",
+        "-OutputPath", "absent-proof.json"],
+      { ...process.env, GITHUB_ACTIONS: "false", RUNNER_OS: "Windows" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Disposable GitHub Windows runner required/);
+  },
+);
+test(
+  "parent tray registration query rejects an image outside RUNNER_TEMP before native access",
+  { skip: process.platform !== "win32" },
+  () => {
+    const result = run(
+      ["-File", path.join(__dirname, "get-installed-tray-registration.ps1"),
+        "-ProcessId", String(process.pid), "-Executable", process.execPath,
+        "-OutputPath", path.join(os.tmpdir(), "unused-tray-proof.json")],
+      { ...process.env, GITHUB_ACTIONS: "true", RUNNER_OS: "Windows", RUNNER_TEMP: os.tmpdir() },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Registration query requires the installed runner desktop image/);
+  },
+);
+test(
   "registered-tray diagnostic declarations compile without touching a window",
   { skip: process.platform !== "win32" },
   () => {

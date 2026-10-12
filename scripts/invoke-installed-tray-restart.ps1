@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][int]$ProcessId,[Parameter(Mandatory=$true)][string]$Name,[string]$EvidencePath)
+param([Parameter(Mandatory=$true)][int]$ProcessId,[Parameter(Mandatory=$true)][string]$Name,[string]$EvidencePath,[string]$RegistrationPath)
 $ErrorActionPreference='Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable GitHub Windows runner required' }
 if ($EvidencePath) {
@@ -74,15 +74,17 @@ public static class AtlasTrayAcceptance {
             } finally {CloseHandle(token);}
         } finally {CloseHandle(process);}
     }
-    [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref Icon icon,out Rect rect);
+    [DllImport("shell32.dll",SetLastError=true)] static extern int Shell_NotifyIconGetRect(ref Icon icon,out Rect rect);
     [DllImport("user32.dll",SetLastError=true)] static extern bool GetCursorPos(out Point point);
     [DllImport("user32.dll",SetLastError=true)] static extern bool SetCursorPos(int x,int y);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] static extern bool EnumWindows(WindowCallback callback,IntPtr state);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint pid);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window,StringBuilder name,int length);
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr window,uint message,UIntPtr w,IntPtr l);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window,out Rect rect);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point point);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window,uint flags);
     [DllImport("user32.dll",SetLastError=true)] static extern bool GetMenuBarInfo(IntPtr window,int obj,int item,ref MenuBar bar);
@@ -90,10 +92,41 @@ public static class AtlasTrayAcceptance {
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetMenuString(IntPtr menu,uint item,StringBuilder text,int length,uint flags);
     [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu,uint item,uint flags);
     [DllImport("user32.dll",SetLastError=true)] static extern bool GetMenuItemRect(IntPtr window,IntPtr menu,uint item,out Rect rect);
-    public static void Open(uint pid) {
-        using(var coordinates=new PhysicalCoordinates()){OpenPhysical(pid);}
+    public sealed class Registration {
+        public uint ProcessId,Id;
+        public long Window;
+        public int Left,Top,Right,Bottom;
     }
-    static void OpenPhysical(uint pid) {
+    public static bool HasForegroundOwner(uint pid) {
+        uint owner;GetWindowThreadProcessId(GetForegroundWindow(),out owner);return owner==pid;
+    }
+    public static void ActivateFixtureWindow(uint pid) {
+        using(var coordinates=new PhysicalCoordinates()) {
+            if(InputIntegrity(pid)!=InputIntegrity((uint)Process.GetCurrentProcess().Id))throw new Exception("Fixture input integrity mismatch");
+            IntPtr found=IntPtr.Zero;int matches=0;
+            EnumWindows((window,state)=> {
+                uint owner;GetWindowThreadProcessId(window,out owner);
+                var name=new StringBuilder(256);GetClassName(window,name,name.Capacity);
+                if(owner==pid && IsWindowVisible(window) && name.ToString()=="AtlasTrayFixtureWindow"){found=window;matches++;}
+                return true;
+            },IntPtr.Zero);
+            Rect rect;
+            if(matches!=1 || !GetWindowRect(found,out rect))throw new Exception("Owned fixture input window missing or ambiguous");
+            var point=new Point{x=rect.left+(rect.right-rect.left)/2,y=rect.top+(rect.bottom-rect.top)/2};
+            if(GetAncestor(WindowFromPoint(point),2)!=found)throw new Exception("Fixture input window is obscured");
+            if(!GetCursorPos(out originalCursor))throw new Exception("Fixture cursor unavailable");
+            cursorSaved=true;
+            SendMouseClick(point.x,point.y);
+        }
+    }
+    public static void Open(uint pid) {
+        Open(pid,QueryRegisteredIcon(pid));
+    }
+    public static Registration QueryRegisteredIcon(uint pid) {
+        using(var coordinates=new PhysicalCoordinates()){return QueryPhysicalIcon(pid);}
+    }
+    static Registration QueryPhysicalIcon(uint pid) {
+        InputIntegrity(pid); // Read-only same user/session verification.
         IntPtr found=IntPtr.Zero;
         EnumWindows((window,state)=> {
             uint owner; GetWindowThreadProcessId(window,out owner);
@@ -106,29 +139,54 @@ public static class AtlasTrayAcceptance {
         if(found==IntPtr.Zero) throw new Exception("Installed Atlas tray window not found");
         // A callback enqueue alone does not prove the shell registered the icon.
         // Query only this verified owner's tray HWND, with a bounded id inventory.
-        Rect rect=new Rect();bool registered=false;var failures=new StringBuilder();
+        Rect rect=new Rect();uint registeredId=0;var failures=new StringBuilder();
         for(uint id=1;id<=16;id++) {
             var icon=new Icon{size=(uint)Marshal.SizeOf(typeof(Icon)),window=found,id=id};
             int result=Shell_NotifyIconGetRect(ref icon,out rect);
-            if(result==0) { registered=true;break; }
-            failures.AppendFormat(" id={0}:0x{1:X8}",id,result);
+            if(result==0 && rect.right>rect.left && rect.bottom>rect.top) { registeredId=id;break; }
+            failures.AppendFormat(" id={0}:0x{1:X8}/Win32={2}",id,result,Marshal.GetLastWin32Error());
         }
-        if(!registered)throw new Exception("Cannot resolve installed tray rectangle; HWND="+found+" identifierSize="+Marshal.SizeOf(typeof(Icon))+failures);
+        if(registeredId==0)throw new Exception("Cannot resolve installed tray rectangle; HWND="+found+" identifierSize="+Marshal.SizeOf(typeof(Icon))+failures);
+        return new Registration{ProcessId=pid,Window=found.ToInt64(),Id=registeredId,Left=rect.left,Top=rect.top,Right=rect.right,Bottom=rect.bottom};
+    }
+    public static void Open(uint pid,Registration registration) {
+        using(var coordinates=new PhysicalCoordinates()){OpenPhysical(pid,registration);}
+    }
+    static void OpenPhysical(uint pid,Registration registration) {
+        if(registration==null || registration.ProcessId!=pid || registration.Id<1 || registration.Id>16 || registration.Right<=registration.Left || registration.Bottom<=registration.Top)
+            throw new Exception("Registered tray proof does not match the requested owner or valid rectangle");
+        InputIntegrity(pid);
+        var found=new IntPtr(registration.Window);uint owner;
+        GetWindowThreadProcessId(found,out owner);
+        var name=new StringBuilder(256);GetClassName(found,name,name.Capacity);
+        if(owner!=pid || name.ToString()!="tray_icon_app")throw new Exception("Registered tray proof no longer identifies the live owner window");
+        var rect=new Rect{left=registration.Left,top=registration.Top,right=registration.Right,bottom=registration.Bottom};
         trayDiagnostic="tray HWND="+found+" rect="+rect.left+","+rect.top+","+rect.right+","+rect.bottom;
         Point cursor;
         if(!GetCursorPos(out cursor))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Runner input desktop cursor unavailable");
-        originalCursor=cursor;cursorSaved=true;
+        if(!cursorSaved){originalCursor=cursor;cursorSaved=true;}
         if(rect.right>rect.left && rect.bottom>rect.top && !SetCursorPos(rect.left+(rect.right-rect.left)/2,rect.top+(rect.bottom-rect.top)/2))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Position runner cursor at registered Atlas icon");
         // tray-icon 0.25.1's shell callback, followed by the real native menu.
         if(!PostMessage(found,6002,UIntPtr.Zero,new IntPtr(0x205))) throw new Exception("Tray menu could not be opened");
     }
-    static void Click(int x,int y) {
+    static bool Click(uint pid,int x,int y) {
+        if(!HasForegroundOwner(pid)){menuDiagnostic+="; native menu owner is not foreground";return false;}
+        SendMouseClick(x,y);return true;
+    }
+    static void SendMouseClick(int x,int y) {
         if(!SetCursorPos(x,y))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Position cursor at verified native menu item");
         Point actual;
         if(!GetCursorPos(out actual) || actual.x!=x || actual.y!=y)throw new Exception("Native cursor did not reach the verified menu point");
-        var inputs=new[]{new Input{mouse=new Mouse{flags=2}},new Input{mouse=new Mouse{flags=4}}};
-        if(SendInput(2,inputs,Marshal.SizeOf(typeof(Input)))!=2)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Native menu input rejected");
+        int originX=GetSystemMetrics(76),originY=GetSystemMetrics(77),width=GetSystemMetrics(78),height=GetSystemMetrics(79);
+        if(width<=1 || height<=1)throw new Exception("Native virtual desktop bounds unavailable");
+        int absoluteX=(int)(((long)x-originX)*65535/(width-1));
+        int absoluteY=(int)(((long)y-originY)*65535/(height-1));
+        if(absoluteX<0 || absoluteX>65535 || absoluteY<0 || absoluteY>65535)throw new Exception("Verified menu point lies outside the input desktop");
+        var move=new Input{mouse=new Mouse{x=absoluteX,y=absoluteY,flags=0xC001}};
+        // Keep final movement and both button transitions in one ordered batch.
+        var inputs=new[]{move,new Input{mouse=new Mouse{flags=2}},new Input{mouse=new Mouse{flags=4}}};
+        if(SendInput(3,inputs,Marshal.SizeOf(typeof(Input)))!=3)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Native menu input rejected");
     }
     static bool ReadItem(IntPtr popup,IntPtr menu,uint index,string label,out Rect rect) {
         rect=new Rect();var name=new StringBuilder(1024);
@@ -188,12 +246,23 @@ public static class AtlasTrayAcceptance {
         if(InputIntegrity(owner)!=requiredIntegrity || InputIntegrity((uint)Process.GetCurrentProcess().Id)!=requiredIntegrity) {
             menuDiagnostic+="; native input integrity mismatch";return false;
         }
-        Click(point.x,point.y);return true;
+        return Click(pid,point.x,point.y);
     }
     public static void RestoreCursor(){if(cursorSaved){using(var coordinates=new PhysicalCoordinates()){SetCursorPos(originalCursor.x,originalCursor.y);cursorSaved=false;}}}
 }
 '@
-[AtlasTrayAcceptance]::Open([uint32]$ProcessId)
+if (-not $RegistrationPath) { throw 'Read-only parent registration proof required before installed tray input' }
+$proofRoot=[IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')+'\'
+if (-not [IO.Path]::GetFullPath($RegistrationPath).StartsWith($proofRoot,[StringComparison]::OrdinalIgnoreCase)) {throw 'Tray registration proof must stay under RUNNER_TEMP'}
+if ((Get-Item -LiteralPath $RegistrationPath).Length -gt 2048) {throw 'Tray registration proof exceeds limit'}
+$proof=Get-Content -LiteralPath $RegistrationPath -Raw | ConvertFrom-Json
+if (@($proof.PSObject.Properties.Name).Count -ne 7) {throw 'Invalid tray registration proof fields'}
+$registration=[AtlasTrayAcceptance+Registration]::new()
+foreach ($field in 'ProcessId','Id','Window','Left','Top','Right','Bottom') {
+    if ($proof.PSObject.Properties.Name -notcontains $field) {throw "Missing tray registration proof field: $field"}
+    $registration.$field=$proof.$field
+}
+[AtlasTrayAcceptance]::Open([uint32]$ProcessId,$registration)
 $deadline=[DateTime]::UtcNow.AddSeconds(10)
 do {
     if ([AtlasTrayAcceptance]::TryClickMenu([uint32]$ProcessId,$Name,8192)) {
