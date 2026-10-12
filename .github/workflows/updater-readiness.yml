@@ -29,6 +29,38 @@ jobs:
           Write-Output ('shell32=' + (Get-Item "$env:WINDIR/System32/shell32.dll").VersionInfo.FileVersion)
           cargo run --locked --manifest-path scripts/tray-root-probe/Cargo.toml
           if ($LASTEXITCODE -ne 0) { throw 'Native probe failed before producing complete evidence' }
+      - name: Compare clean profile environment and explicit user owner for a limited shell
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/tray-probe-target
+        run: |
+          Add-Type -Path scripts/installed-shell.cs
+          $policy=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',$true)
+          . ./scripts/shell-restart-policy.ps1
+          try {
+            Invoke-ShellRestartPolicyLease -Registry $policy -Body {
+              foreach($mode in '--shell-bootstrap','--shell-owner-bootstrap') {
+                $existing=[AtlasInstalledShell]::ShellPid()
+                if($existing) {
+                  if([AtlasInstalledShell]::Integrity($existing) -le 8192) {Write-Output 'Medium shell already available; keep it';break}
+                  [AtlasInstalledShell]::StopVerifiedShell($existing)
+                }
+                Write-Output ('SHELL EXPERIMENT '+$mode)
+                & "$env:CARGO_TARGET_DIR/debug/atlas-tray-root-probe.exe" $mode
+                if($LASTEXITCODE -ne 0){throw 'Shell bootstrap experiment failed'}
+                $created=[AtlasInstalledShell]::ShellPid()
+                if($created) {
+                  Write-Output ('New shell integrity='+[AtlasInstalledShell]::Integrity($created))
+                  & "$env:CARGO_TARGET_DIR/debug/atlas-tray-root-probe.exe"
+                  if($LASTEXITCODE -ne 0){throw 'Registration probe with limited shell failed'}
+                  break
+                }
+              }
+            }
+          } finally {
+            $policy.Dispose()
+            if(-not [AtlasInstalledShell]::ShellPid()){Start-Process -FilePath "$env:WINDIR/explorer.exe" -WindowStyle Hidden}
+          }
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -33,6 +33,23 @@ fn probe(directory:&Path,label:&str) {
     unsafe {let data=NOTIFYICONDATAW{cbSize:std::mem::size_of::<NOTIFYICONDATAW>() as u32,hWnd:window as _,uID:101,..std::mem::zeroed()};Shell_NotifyIconW(NIM_DELETE,&data);}
 }
 fn main(){
+    if std::env::args().any(|a|a=="--shell-bootstrap" || a=="--shell-owner-bootstrap") {
+        assert_eq!(std::env::var("GITHUB_ACTIONS").unwrap_or_default(),"true","Shell experiment only on a disposable GitHub runner");
+        let child=update_user::diagnostic_launch_shell(std::env::args().any(|a|a=="--shell-owner-bootstrap")).unwrap();
+        use std::os::windows::io::AsRawHandle;
+        let deadline=Instant::now()+Duration::from_secs(15);
+        while Instant::now()<deadline {
+            let mut pid=0;unsafe{GetWindowThreadProcessId(GetShellWindow(),&mut pid);}
+            let waited=unsafe{windows_sys::Win32::System::Threading::WaitForSingleObject(child.as_raw_handle(),0)};
+            if pid==child.pid {println!("MEDIUM_SHELL_READY={pid}");return;}
+            if waited==WAIT_OBJECT_0 {
+                let mut code=0;unsafe{windows_sys::Win32::System::Threading::GetExitCodeProcess(child.as_raw_handle(),&mut code);}
+                println!("MEDIUM_SHELL_EXIT=0x{code:08X}");return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("MEDIUM_SHELL_DEADLINE; pid={}",child.pid);child.terminate();return;
+    }
     if let Some(parent)=std::env::args().find_map(|a|a.strip_prefix("--parent=").map(|v|v.parse::<u32>().unwrap())) {
         probe(&root(parent),"medium");return;
     }
