@@ -1,74 +1,47 @@
-name: Isolated native tray root cause probe
-
+name: Isolated installed desktop remediation proof
 on:
   workflow_call:
-
 permissions:
   contents: read
-
+  actions: read
 jobs:
   readiness:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [windows-2025, windows-2022]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    runs-on: windows-2022
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.3
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
       - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Observe native registration with the exact production limited token
+      - uses: actions/download-artifact@v4
+        with:
+          name: remediation-candidate-b766b255376a64a440a6e83f59d152944cba7d9e
+          path: candidate
+          run-id: 38268646107
+          github-token: ${{ github.token }}
+      - name: Verify previously built signed runtime and run complete installed acceptance in a normal desktop
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/tray-probe-target
+          ATLAS_BUILD_ID: b766b255376a64a440a6e83f59d152944cba7d9e
         run: |
-          Add-Type -Path scripts/installed-shell.cs
-          $shell = [AtlasInstalledShell]::ShellPid()
-          Write-Output ('Shell context: ' + [AtlasInstalledShell]::ShellDiagnostic())
-          Write-Output ('Parent integrity=' + [AtlasInstalledShell]::Integrity([uint32]$PID) + '; shell integrity=' + [AtlasInstalledShell]::Integrity($shell))
-          Write-Output ('shell32=' + (Get-Item "$env:WINDIR/System32/shell32.dll").VersionInfo.FileVersion)
-          cargo run --locked --manifest-path scripts/tray-root-probe/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { throw 'Native probe failed before producing complete evidence' }
-      - name: Compare clean profile environment and explicit user owner for a limited shell
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/tray-probe-target
-        run: |
-          Add-Type -Path scripts/installed-shell.cs
-          $policy=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',$true)
-          . ./scripts/shell-restart-policy.ps1
-          try {
-            Invoke-ShellRestartPolicyLease -Registry $policy -Body {
-              foreach($mode in '--shell-bootstrap','--shell-owner-bootstrap') {
-                $existing=[AtlasInstalledShell]::ShellPid()
-                if($existing) {
-                  if([AtlasInstalledShell]::Integrity($existing) -le 8192) {Write-Output 'Medium shell already available; keep it';break}
-                  [AtlasInstalledShell]::StopVerifiedShell($existing)
-                }
-                Write-Output ('SHELL EXPERIMENT '+$mode)
-                & "$env:CARGO_TARGET_DIR/debug/atlas-tray-root-probe.exe" $mode
-                if($LASTEXITCODE -ne 0){throw 'Shell bootstrap experiment failed'}
-                $created=[AtlasInstalledShell]::ShellPid()
-                if($created) {
-                  Write-Output ('New shell integrity='+[AtlasInstalledShell]::Integrity($created))
-                  & "$env:CARGO_TARGET_DIR/debug/atlas-tray-root-probe.exe"
-                  if($LASTEXITCODE -ne 0){throw 'Registration probe with limited shell failed'}
-                  break
-                }
-              }
-            }
-          } finally {
-            $policy.Dispose()
-            if(-not [AtlasInstalledShell]::ShellPid()){Start-Process -FilePath "$env:WINDIR/explorer.exe" -WindowStyle Hidden}
-          }
-      - name: Test a genuine split-token desktop identity without changing UAC or message filters
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/tray-probe-target
-        run: ./scripts/tray-root-probe/test-split-user.ps1
+          $installer=(Resolve-Path 'candidate/Atlas-Setup-2.5.1.exe').Path
+          node scripts/verify-installer.cjs $installer
+          if($LASTEXITCODE -ne 0){throw 'Existing signed runtime did not verify'}
+          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$installer}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: tray-root-probe-${{ matrix.runner }}
-          path: ${{ runner.temp }}/AtlasProbe*/**
+          name: installed-desktop-proof
+          path: |
+            ${{ runner.temp }}/atlas-installed-desktop-*/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.error.txt
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
           if-no-files-found: error

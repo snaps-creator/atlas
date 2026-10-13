@@ -108,31 +108,6 @@ fn sid(handle:HANDLE)->Result<String,String>{unsafe{
     LocalFree(text.cast());result
 }}
 pub fn current_sid()->Result<String,String>{sid(token()?.as_raw_handle())}
-// Diagnostic branch only. This entry point is not part of PR #60.
-pub fn diagnostic_launch_shell(owner_is_user:bool)->Result<Process,String>{unsafe{
-    let current=token()?;let reduced=restricted_desktop(current.as_raw_handle())?;
-    let user=token_info(reduced.as_raw_handle(),TokenUser)?;
-    let user=&*user.as_ptr().cast::<TOKEN_USER>();
-    let old=token_info(reduced.as_raw_handle(),TokenOwner)?;
-    let old=&*old.as_ptr().cast::<TOKEN_OWNER>();
-    println!("Shell token before experiment: ownerIsUser={}",EqualSid(old.Owner,user.User.Sid)!=0);
-    if owner_is_user {
-        let owner=TOKEN_OWNER{Owner:user.User.Sid};
-        if SetTokenInformation(reduced.as_raw_handle(),TokenOwner,(&owner as *const TOKEN_OWNER).cast(),std::mem::size_of_val(&owner) as u32)==0{return Err(failure("Diagnostic owner selection"));}
-    }
-    let path=std::path::PathBuf::from(std::env::var_os("WINDIR").ok_or("Missing Windows directory")?).join("explorer.exe");
-    launch_with_token(&path,path.parent().unwrap(),&[],reduced.as_raw_handle()).map(|(process,_)|process)
-}}
-pub fn diagnostic_launch_linked_shell()->Result<Process,String>{unsafe{
-    let current=token()?;let info=token_info(current.as_raw_handle(),TokenLinkedToken)?;
-    let linked=(*info.as_ptr().cast::<TOKEN_LINKED_TOKEN>()).LinkedToken;
-    let linked=OwnedHandle::from_raw_handle(linked);
-    if !desktop_safe(linked.as_raw_handle())? || sid(current.as_raw_handle())?!=sid(linked.as_raw_handle())? {
-        return Err("Linked diagnostic shell is not the same limited user".into());
-    }
-    let path=std::path::PathBuf::from(std::env::var_os("WINDIR").ok_or("Missing Windows directory")?).join("explorer.exe");
-    launch_with_token(&path,path.parent().unwrap(),&[],linked.as_raw_handle()).map(|(process,_)|process)
-}}
 pub fn database()->Result<std::path::PathBuf,String>{unsafe{
     use windows_sys::Win32::{UI::Shell::{SHGetKnownFolderPath,FOLDERID_LocalAppData},System::Com::CoTaskMemFree};
     let mut raw=ptr::null_mut();
