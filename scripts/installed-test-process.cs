@@ -26,7 +26,7 @@ public sealed class AtlasInstalledTestProcess : IDisposable {
     static int Elevation(IntPtr token) {
         var data=Marshal.AllocHGlobal(4);try{int needed;if(!GetTokenInformation(token,18,data,4,out needed))throw Error("Inspect diagnostic elevation");return Marshal.ReadInt32(data);}finally{Marshal.FreeHGlobal(data);}
     }
-    public AtlasInstalledTestProcess(string name,string identity,string password,string command,string directory) {
+    public AtlasInstalledTestProcess(string name,string identity,string password,string application,string command,string directory) {
         if(Environment.GetEnvironmentVariable("GITHUB_ACTIONS")!="true" || !System.Text.RegularExpressions.Regex.IsMatch(name,"^AtlasProbe[0-9a-f]{8}$"))throw new Exception("Private disposable CI identity required");
         IntPtr token;if(!LogonUser(name,".",password,4,0,out token))throw Error("Log on private administrative batch worker");
         IntPtr linked=IntPtr.Zero,primary=IntPtr.Zero;
@@ -38,7 +38,9 @@ public sealed class AtlasInstalledTestProcess : IDisposable {
             if(!DuplicateTokenEx(selected,0x18B,IntPtr.Zero,2,1,out primary))throw Error("Prepare private primary installer token");
             IntPtr environment;if(!CreateEnvironmentBlock(out environment,primary,false))throw Error("Prepare private profile environment");
             try {
-                var app=System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),"WindowsPowerShell/v1.0/powershell.exe");
+                var expected=System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),"PowerShell/7/pwsh.exe");
+                if(!String.Equals(System.IO.Path.GetFullPath(application),System.IO.Path.GetFullPath(expected),StringComparison.OrdinalIgnoreCase))throw new Exception("Installation worker requires the trusted PowerShell 7 host");
+                var app=application;
                 var startup=new Startup{size=(uint)Marshal.SizeOf(typeof(Startup)),desktop="winsta0\\default",flags=1,show=0};Created child;
                 if(!CreateProcessWithTokenW(primary,1,app,new StringBuilder("\""+app+"\" "+command),0x08000400,environment,directory,ref startup,out child))throw Error("Start private elevated installer worker");
                 CloseHandle(child.thread);process=child.process;Id=child.pid;

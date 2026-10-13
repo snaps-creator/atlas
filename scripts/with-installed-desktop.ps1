@@ -95,7 +95,7 @@ try {
             if(Test-Path -LiteralPath (Join-Path $root 'bootstrap.log')){Get-Content -LiteralPath (Join-Path $root 'bootstrap.log') | Write-Output}
             if(-not (Test-Path -LiteralPath (Join-Path $root 'ready'))){throw 'Ordinary desktop did not pass real notification preflight'}
             $plain=[Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($credential.Password)
-            try{$workerProcess=[AtlasInstalledTestProcess]::new($name,$account.SID.Value,[Runtime.InteropServices.Marshal]::PtrToStringUni($plain),$command,$repository)}
+            try{$workerProcess=[AtlasInstalledTestProcess]::new($name,$account.SID.Value,[Runtime.InteropServices.Marshal]::PtrToStringUni($plain),(Get-Process -Id $PID).Path,$command,$repository)}
             finally{[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plain)}
             if(-not $workerProcess.WaitForExit(2100000)){throw 'Installed acceptance exceeded its bounded deadline'}
             if(Test-Path -LiteralPath (Join-Path $root 'installed-desktop.log')){Get-Content -LiteralPath (Join-Path $root 'installed-desktop.log') | Write-Output}
