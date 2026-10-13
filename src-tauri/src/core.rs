@@ -160,14 +160,14 @@ impl Core {
         let job = match crate::job::Job::attach(&c) {
             Ok(job) => job,
             Err(error) => {
-                let _ = crate::process_stop::stop(&mut c, || {}, Duration::from_secs(1));
+                let _ = crate::process_stop::stop(&mut c, || {}, crate::process_stop::CORE_EXIT_TIMEOUT);
                 return Err(error);
             }
         };
         let start = Instant::now();
         loop {
             if self.cancelled() {
-                crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(1))?;
+                crate::process_stop::stop(&mut c, || drop(job), crate::process_stop::CORE_EXIT_TIMEOUT)?;
                 return Err("Подключение отменено".into());
             }
             if let Some(status) = c.try_wait().map_err(|e| e.to_string())? {
@@ -177,7 +177,7 @@ impl Core {
                 return Err("Mihomo отклонил конфигурацию. Проверьте параметры серверов и DNS; предыдущая версия сохранена.".into());
             }
             if start.elapsed() > Duration::from_secs(20) {
-                crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(1))?;
+                crate::process_stop::stop(&mut c, || drop(job), crate::process_stop::CORE_EXIT_TIMEOUT)?;
                 return Err("Проверка конфигурации Mihomo превысила 20 секунд".into());
             }
             thread::sleep(Duration::from_millis(50));
@@ -614,7 +614,7 @@ impl Core {
             // Windows may finish pending socket I/O after accepting termination.
             // This is a maximum wait on the process handle, not a fixed delay;
             // a normally exited process returns immediately.
-            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), Duration::from_secs(1)) {
+            if let Err(error) = crate::process_stop::stop(&mut c, || drop(job), crate::process_stop::CORE_EXIT_TIMEOUT) {
                 self.child = Some(c);
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 return Err(error);
@@ -648,7 +648,7 @@ impl Drop for Core {
         // The service observes IPC loss and releases its dynamic WFP session.
         if let Some(mut child) = self.child.take() {
             let job = self.job.take();
-            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), Duration::from_secs(1)) {
+            if let Err(error) = crate::process_stop::stop(&mut child, || drop(job), crate::process_stop::CORE_EXIT_TIMEOUT) {
                 if let Ok(mut logs) = self.logs.lock() { logs.push_back(error.clone()); }
                 eprintln!("{error}");
             }

@@ -232,6 +232,10 @@ if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old
     $oldJournal=Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
     if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne $previousVersion) { throw "Real $previousVersion installation was not committed" }
     $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
+    if ($previousVersion -eq '2.4.2') {
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') wait-baseline
+        if ($LASTEXITCODE -ne 0) { throw 'Published baseline did not finish initial source parsing' }
+    }
     & $maintenance --prepare-install $previousRoot
     if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
     & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') prepare-upgrade
@@ -354,12 +358,16 @@ rules:
     Install-Checked $candidate
     Write-Output 'PASS: installation also succeeds with Atlas closed and tunnel disconnected.'
     if ($transactional) {
-        & (Join-Path $PSScriptRoot 'test-installed-recovery.ps1') -InstallRoot $installRoot -Maintenance $maintenance
+        & (Join-Path $PSScriptRoot 'test-installed-recovery.ps1') -InstallRoot $installRoot -Maintenance $maintenance -VerifySettings:(-not $LegacyBaseline)
         Install-Checked $candidate
         $reinstalled = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
         if ($reinstalled.stage -ne 'Committed' -or $reinstalled.active.id -ne $journal.candidate.id) { throw 'Reinstall after recovery did not commit the candidate' }
         Write-Output 'PASS: candidate reinstalls successfully after installed rollback and repeated recovery.'
         foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
+            if (-not $LegacyBaseline) {
+                & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
+                if ($LASTEXITCODE -ne 0) { throw "Reinstall changed preserved data before $cycle" }
+            }
             $runKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
             $approvedKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
             if (-not $LegacyBaseline) {

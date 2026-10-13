@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance)
+param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance, [switch]$VerifySettings)
 $ErrorActionPreference = 'Stop'
 function Write-InterruptedRecoveryFixture([string]$Root, $Journal) {
     $Journal.stage = 'HealthPending'
@@ -70,5 +70,9 @@ foreach ($attempt in 1..2) {
     $inspection = & $Maintenance --inspect | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Recovery left an unverified network baseline' }
     if (-not (Test-Path -LiteralPath (Join-Path $previousRoot 'Atlas.exe')) -or -not (Test-Path -LiteralPath (Join-Path $candidateRoot 'Atlas.exe'))) { throw 'Recovery lost a retained version' }
+    if ($VerifySettings) {
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify-rollback
+        if ($LASTEXITCODE -ne 0) { throw "Recovery $attempt changed baseline data before reinstall/uninstall" }
+    }
 }
 Write-Output 'PASS: real installed recovery from persisted HealthPending restores previous service, data/network state and retained versions; repeated recovery succeeds. Physical reboot not tested.'
