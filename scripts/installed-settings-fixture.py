@@ -130,12 +130,7 @@ with sqlite3.connect(database, timeout=10) as db:
         print("Synthetic encrypted URL + VLESS state and two user credentials seeded")
     else:
         state = json.loads(dpapi(db.execute("SELECT payload FROM state WHERE id=1").fetchone()[0], False))
-        if action == "diagnose":
-            nodes = [n for s in state["subscriptions"] for n in s["servers"]]
-            print(json.dumps(dict(schema=db.execute("PRAGMA user_version").fetchone()[0],
-                favorites=state["favorites"], selected=state["selected"], selectedNodeId=state.get("selectedNodeId"),
-                nodes=[dict(name=n["name"], nodeId=n.get("atlas", {}).get("nodeId")) for n in nodes])))
-        elif action == "prepare-upgrade":
+        if action == "prepare-upgrade":
             # Establish references after the baseline has loaded the fixture.
             # Published 2.4.2 uses names/schema 2; candidate 2.4.3 already uses
             # source-scoped identities/schema 3 and has a migration backup.
@@ -145,6 +140,8 @@ with sqlite3.connect(database, timeout=10) as db:
             nodes = [n for source in state["subscriptions"] for n in source["servers"]]
             assert len(nodes) == 2 and len({n["name"] for n in nodes}) == 2
             source = next(s for s in state["subscriptions"] if s["source"] == "VLESS")
+            if schema == 2:
+                assert source["servers"][0]["type"] == "xray", "Capture references only after the real baseline parsed VLESS"
             state["selected"] = source["servers"][0]["name"]
             if schema == 2:
                 state["activeSource"] = "VLESS"
@@ -164,6 +161,15 @@ with sqlite3.connect(database, timeout=10) as db:
                 favorites=state["favorites"], backupHash=backup_hash)), encoding="utf-8")
             db.execute("UPDATE state SET payload=? WHERE id=1", (dpapi(json.dumps(state).encode(), True),))
             print(f"PASS: stopped real schema-{schema} baseline has two valid favorites and an explicit VLESS selection before upgrade")
+        elif action == "verify-rollback":
+            expected = json.loads(upgrade_references.read_text(encoding="utf-8"))
+            assert db.execute("PRAGMA user_version").fetchone()[0] == expected["schema"], "Rollback schema differs"
+            nodes = [n for source in state["subscriptions"] for n in source["servers"]]
+            assert sorted(n["name"] for n in nodes) == expected["names"], "Rollback changed node names"
+            assert sorted(s["id"] for s in state["subscriptions"]) == expected["sourceIds"], "Rollback changed source IDs"
+            assert state["selected"] == expected["selected"], "Rollback changed selection"
+            assert set(state["favorites"]) == set(expected["favorites"]), "Rollback changed favorites"
+            print("PASS: rollback preserved baseline schema, names, source IDs, selection and favorites")
         elif action == "patch":
             patch = json.loads(sys.argv[2])
             state.update(patch)
@@ -174,7 +180,8 @@ with sqlite3.connect(database, timeout=10) as db:
             assert len(state["subscriptions"]) == 2
             nodes = [n for source in state["subscriptions"] for n in source["servers"]]
             ids = {n["atlas"]["nodeId"] for n in nodes}
-            assert len(ids) == 2 and set(state["favorites"]) == ids
+            assert len(ids) == 2, "Expected two distinct node IDs"
+            assert set(state["favorites"]) == ids, "Favorites no longer reference both preserved nodes"
             chosen = next(n for n in nodes if n["atlas"]["nodeId"] == state["selectedNodeId"])
             vless = next(s for s in state["subscriptions"] if s["source"] == "VLESS")
             assert chosen["atlas"]["sourceId"] == vless["id"] and chosen["name"] == state["selected"]

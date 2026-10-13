@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance)
+param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance, [switch]$VerifySettings)
 $ErrorActionPreference = 'Stop'
 function Write-InterruptedRecoveryFixture([string]$Root, $Journal) {
     $Journal.stage = 'HealthPending'
@@ -49,8 +49,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # pretend to kill the kernel, reboot Windows or reproduce physical power loss.
 Write-InterruptedRecoveryFixture -Root $root -Journal $journal
 foreach ($attempt in 1..2) {
-    Write-Output "STATE BEFORE RECOVERY $attempt"
-    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
     if ($attempt -eq 2) {
         # Reproduce an idle service/closed desktop deterministically before retry.
         Wait-RecoveryStartup
@@ -69,11 +67,12 @@ foreach ($attempt in 1..2) {
     if ($restored.stage -ne 'RolledBack' -or $restored.active.id -ne $previous -or $restored.network_state -ne 'restored' -or $restored.migration_state -ne 'restored') { throw 'Recovery did not durably restore the previous version and state' }
     $service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
     if ($service.PathName -ne ('"' + (Join-Path $previousRoot 'Atlas.Service.exe') + '" --network-service') -or $service.State -ne 'Running') { throw 'Recovery did not restore the running previous service' }
-    Start-Sleep -Seconds 5
-    Write-Output "STATE AFTER RECOVERY $attempt"
-    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
     $inspection = & $Maintenance --inspect | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Recovery left an unverified network baseline' }
     if (-not (Test-Path -LiteralPath (Join-Path $previousRoot 'Atlas.exe')) -or -not (Test-Path -LiteralPath (Join-Path $candidateRoot 'Atlas.exe'))) { throw 'Recovery lost a retained version' }
+    if ($VerifySettings) {
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify-rollback
+        if ($LASTEXITCODE -ne 0) { throw "Recovery $attempt changed baseline data before reinstall/uninstall" }
+    }
 }
 Write-Output 'PASS: real installed recovery from persisted HealthPending restores previous service, data/network state and retained versions; repeated recovery succeeds. Physical reboot not tested.'

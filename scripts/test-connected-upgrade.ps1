@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller,[switch]$AwaitBaseline)
+param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller)
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.
@@ -120,7 +120,6 @@ function Recovery-Root {
     return $installRoot
 }
 function Install-Checked([string]$path) {
-    if (Test-Path (Join-Path $env:LOCALAPPDATA 'net.atlasvpn.desktop/atlas.db')) { Write-Output "STATE BEFORE INSTALL $path"; & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose }
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
     if ($process.ExitCode -ne 0) {
@@ -233,7 +232,10 @@ if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old
     $oldJournal=Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
     if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne $previousVersion) { throw "Real $previousVersion installation was not committed" }
     $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
-    if ($AwaitBaseline) { & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') wait-baseline; if ($LASTEXITCODE -ne 0) {throw 'Baseline parsing failed'} }
+    if ($previousVersion -eq '2.4.2') {
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') wait-baseline
+        if ($LASTEXITCODE -ne 0) { throw 'Published baseline did not finish initial source parsing' }
+    }
     & $maintenance --prepare-install $previousRoot
     if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
     & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') prepare-upgrade
@@ -312,7 +314,7 @@ rules:
     if (-not $LegacyBaseline) {
         & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
         if ($LASTEXITCODE -ne 0) { throw 'Upgrade lost mixed sources or persisted references/credentials' }
-        Write-Output 'DIAGNOSTIC ONLY: startup matrix excluded to isolate rollback reference mutation'
+        & (Join-Path $PSScriptRoot 'test-installed-startup.ps1') -InstallRoot $installRoot -Maintenance $maintenance
     }
     $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
@@ -356,14 +358,16 @@ rules:
     Install-Checked $candidate
     Write-Output 'PASS: installation also succeeds with Atlas closed and tunnel disconnected.'
     if ($transactional) {
-        & (Join-Path $PSScriptRoot 'test-installed-recovery.ps1') -InstallRoot $installRoot -Maintenance $maintenance
+        & (Join-Path $PSScriptRoot 'test-installed-recovery.ps1') -InstallRoot $installRoot -Maintenance $maintenance -VerifySettings:(-not $LegacyBaseline)
         Install-Checked $candidate
         $reinstalled = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
         if ($reinstalled.stage -ne 'Committed' -or $reinstalled.active.id -ne $journal.candidate.id) { throw 'Reinstall after recovery did not commit the candidate' }
         Write-Output 'PASS: candidate reinstalls successfully after installed rollback and repeated recovery.'
-        Write-Output 'STATE AFTER RECOVERY REINSTALL'
-        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
         foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
+            if (-not $LegacyBaseline) {
+                & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
+                if ($LASTEXITCODE -ne 0) { throw "Reinstall changed preserved data before $cycle" }
+            }
             $runKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
             $approvedKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
             if (-not $LegacyBaseline) {
@@ -373,8 +377,6 @@ rules:
             }
             $offlineHive=Join-Path $fixture ('offline-startup-'+[guid]::NewGuid().ToString('N'))
             & (Join-Path $PSScriptRoot 'test-offline-startup-hive.ps1') -Mode Setup -Fixture $offlineHive -InstallRoot $installRoot
-            Write-Output 'STATE BEFORE UNINSTALL'
-            & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
             $uninstaller = Join-Path $installRoot 'uninstall.exe'
             $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
             $null = $remove.Handle
@@ -407,7 +409,6 @@ rules:
             & curl.exe --fail --silent --max-time 20 https://example.com/ --output NUL
             if ($LASTEXITCODE -ne 0) { throw 'Direct network control failed after uninstall' }
             if (-not $LegacyBaseline) {
-                & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
                 & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
                 if ($LASTEXITCODE -ne 0) { throw 'Uninstall changed preserved sources, settings, references or credentials' }
             }
