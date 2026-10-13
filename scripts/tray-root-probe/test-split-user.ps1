@@ -54,6 +54,8 @@ New-Item -ItemType Directory -Path $root | Out-Null
 & icacls.exe $root /grant ('*'+$account.SID.Value+':(OI)(CI)F') | Out-Null
 $report=Join-Path $root 'split-user.log'
 Add-Type -Path (Join-Path $repo 'scripts/installed-shell.cs')
+Add-Type -Path (Join-Path $PSScriptRoot 'desktop-lease.cs')
+$desktopLease=[AtlasDiagnosticDesktopLease]::new($account.SID.Value)
 . (Join-Path $repo 'scripts/shell-restart-policy.ps1')
 $policy=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',$true)
 try {
@@ -72,6 +74,7 @@ try {
     }
 } finally {
     $policy.Dispose()
+    $desktopLease.Dispose()
     Remove-LocalUser -SID $account.SID
     $credential=$null
     if(-not [AtlasInstalledShell]::ShellPid()){Start-Process -FilePath "$env:WINDIR/explorer.exe" -WindowStyle Hidden}
