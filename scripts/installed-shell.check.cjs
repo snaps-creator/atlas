@@ -29,16 +29,22 @@ test("ordinary desktop action helper refuses a workstation before launching Atla
 test("private desktop permission lease and cleanup refuse the workstation", {skip:process.platform!=="win32"},()=>{
   const lease=path.join(__dirname,"installed-desktop-lease.cs").replaceAll("'","''");
   const cleanup=path.join(__dirname,"installed-test-process.cs").replaceAll("'","''");
-  const result=run(["-Command",`$ErrorActionPreference='Stop'; Add-Type -Path '${lease}'; Add-Type -Path '${cleanup}'; try {[AtlasInstalledDesktopLease]::new([Security.Principal.WindowsIdentity]::GetCurrent().User.Value);throw 'Lease accepted'} catch {if($_.Exception.ToString() -notmatch 'Disposable CI desktop required'){throw}}; try {[AtlasInstalledTestProcess]::StopPrivateShell([uint32]$PID,[Security.Principal.WindowsIdentity]::GetCurrent().User.Value);throw 'Cleanup accepted'} catch {if($_.Exception.ToString() -notmatch 'Disposable GitHub Windows runner required'){throw}}; Write-Output 'PASS guarded native fixtures'`],{...process.env,GITHUB_ACTIONS:"false"});
+  // Use the same Windows PowerShell host as the other native declaration checks.
+  const result=run(["-Command",`$ErrorActionPreference='Stop'; Write-Output 'Compile desktop lease'; Add-Type -Path '${lease}'; Write-Output 'Compile process cleanup'; Add-Type -Path '${cleanup}'; Write-Output 'Check workstation guards'; try {[AtlasInstalledDesktopLease]::new([Security.Principal.WindowsIdentity]::GetCurrent().User.Value);throw 'Lease accepted'} catch {if($_.Exception.ToString() -notmatch 'Disposable CI desktop required'){throw}}; try {[AtlasInstalledTestProcess]::StopPrivateShell([uint32]$PID,[Security.Principal.WindowsIdentity]::GetCurrent().User.Value);throw 'Cleanup accepted'} catch {if($_.Exception.ToString() -notmatch 'Disposable GitHub Windows runner required'){throw}}; Write-Output 'PASS guarded native fixtures'`],{...process.env,GITHUB_ACTIONS:"false"},"powershell.exe");
   assert.equal(result.status,0,result.stdout+result.stderr);
+  assert.match(result.stdout,/PASS guarded native fixtures/);
 });
 
 function run(args, env = process.env, executable = "pwsh.exe") {
-  return spawnSync(executable, ["-NoProfile", ...args], {
+  const result = spawnSync(executable, ["-NoProfile", ...args], {
     encoding: "utf8",
     timeout: 20000,
     env,
   });
+  assert.ifError(result.error && Object.assign(result.error, {
+    message: `${executable}: ${result.error.message}\nstdout:\n${result.stdout || ""}\nstderr:\n${result.stderr || ""}`,
+  }));
+  return result;
 }
 
 test(
