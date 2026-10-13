@@ -43,12 +43,23 @@ if($Worker) {
             [AtlasInstalledTrayPreflight]::Verify()
             [IO.File]::WriteAllText((Join-Path $root 'ready'),[string]$shellPid)
             Write-Output "PASS: ordinary desktop and actual fixture notification registration; shell PID=$shellPid"
-            while(-not (Test-Path -LiteralPath (Join-Path $root 'stop'))) {
-                if(-not (Get-Process -Id $shellPid -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath (Join-Path $root 'stop'))){throw 'Ordinary shell terminated during installed acceptance'}
-                Start-Sleep -Milliseconds 250
-            }
+            $policy=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+            Write-Output ('Native UAC policy: EnableLUA='+$policy.EnableLUA+' ConsentPromptBehaviorAdmin='+$policy.ConsentPromptBehaviorAdmin)
+            if($policy.EnableLUA -ne 1 -or $policy.ConsentPromptBehaviorAdmin -ne 0){throw 'Hosted fixture requires its existing prompt-free UAC policy; it will not alter UAC'}
+            $hostPath=Join-Path $env:ProgramFiles 'PowerShell/7/pwsh.exe'
+            $command='-NoProfile -ExecutionPolicy Bypass -File "'+$PSCommandPath+'" -Worker -Ticket "'+$Ticket+'"'
+            # Let Windows elevate the very same interactive logon. A separate
+            # batch logon has a different authentication ID and is not an
+            # ordinary installer's parent context.
+            $elevated=Start-Process -FilePath $hostPath -Verb RunAs -ArgumentList $command -PassThru -WindowStyle Hidden
+            try {
+                if(-not $elevated.WaitForExit(2100000)){throw 'Interactive installation worker exceeded its bounded deadline'}
+                $elevated.WaitForExit()
+                [IO.File]::WriteAllText((Join-Path $root 'worker-exit'),[string]$elevated.ExitCode)
+                if($elevated.ExitCode -ne 0){throw "Interactive installed acceptance failed: exit=$($elevated.ExitCode)"}
+            } finally {if(-not $elevated.HasExited){$elevated.Kill();$null=$elevated.WaitForExit(5000)};$elevated.Dispose()}
         } else {
-            if(-not $admin){throw 'Installation worker requires its own administrative batch token'}
+            if(-not $admin){throw 'Installation worker requires its own elevated interactive token'}
             $shellPid=[AtlasInstalledShell]::ShellPid();[AtlasInstalledShell]::VerifyShell($shellPid)
             if([AtlasInstalledShell]::Integrity($shellPid) -ne 8192){throw 'Installation worker requires a normal medium shell of the same user'}
             $arguments=@{};foreach($property in $config.parameters.PSObject.Properties){$arguments[$property.Name]=$property.Value}
@@ -103,12 +114,12 @@ try {
             while(-not (Test-Path -LiteralPath (Join-Path $root 'ready')) -and -not $bootstrap.HasExited -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
             if(Test-Path -LiteralPath (Join-Path $root 'bootstrap.log')){Get-Content -LiteralPath (Join-Path $root 'bootstrap.log') | Write-Output}
             if(-not (Test-Path -LiteralPath (Join-Path $root 'ready'))){throw 'Ordinary desktop did not pass real notification preflight'}
-            $plain=[Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($credential.Password)
-            try{$workerProcess=[AtlasInstalledTestProcess]::new($name,$account.SID.Value,[Runtime.InteropServices.Marshal]::PtrToStringUni($plain),(Get-Process -Id $PID).Path,$command,$repository)}
-            finally{[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plain)}
-            if(-not $workerProcess.WaitForExit(2100000)){throw 'Installed acceptance exceeded its bounded deadline'}
+            if(-not $bootstrap.WaitForExit(2100000)){throw 'Installed acceptance exceeded its bounded deadline'}
+            $bootstrap.WaitForExit()
             if(Test-Path -LiteralPath (Join-Path $root 'installed-desktop.log')){Get-Content -LiteralPath (Join-Path $root 'installed-desktop.log') | Write-Output}
-            if($workerProcess.ExitCode -ne 0){throw "Installed acceptance worker failed: exit=$($workerProcess.ExitCode)"}
+            if(Test-Path -LiteralPath (Join-Path $root 'process-exits.log')){Get-Content -LiteralPath (Join-Path $root 'process-exits.log') | Write-Output}
+            if(Test-Path -LiteralPath (Join-Path $root 'bootstrap.log')){Get-Content -LiteralPath (Join-Path $root 'bootstrap.log') | Write-Output}
+            if($bootstrap.ExitCode -ne 0 -or -not(Test-Path -LiteralPath (Join-Path $root 'worker-exit')) -or (Get-Content -LiteralPath (Join-Path $root 'worker-exit') -Raw).Trim() -ne '0'){throw 'Interactive installed acceptance did not complete successfully'}
         } finally {
             if($workerProcess){$workerProcess.Dispose()}
             [IO.File]::WriteAllText((Join-Path $root 'stop'),'')
