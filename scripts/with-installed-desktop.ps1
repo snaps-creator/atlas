@@ -52,7 +52,16 @@ if($Worker) {
             $shellPid=[AtlasInstalledShell]::ShellPid();[AtlasInstalledShell]::VerifyShell($shellPid)
             if([AtlasInstalledShell]::Integrity($shellPid) -ne 8192){throw 'Installation worker requires a normal medium shell of the same user'}
             $arguments=@{};foreach($property in $config.parameters.PSObject.Properties){$arguments[$property.Name]=$property.Value}
-            & $config.script @arguments
+            $traceId='AtlasFixtureProcessStop'
+            Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStopTrace WHERE ProcessName='Atlas.exe' OR ProcessName='AtlasUpdater.exe' OR ProcessName='AtlasMaintenance.exe'" -SourceIdentifier $traceId | Out-Null
+            try { & $config.script @arguments }
+            finally {
+                Get-Event -SourceIdentifier $traceId -ErrorAction SilentlyContinue | ForEach-Object {
+                    $eventData=$_.SourceEventArgs.NewEvent
+                    'process='+$eventData.ProcessName+' pid='+$eventData.ProcessID+' parent='+$eventData.ParentProcessID+' exit=0x'+([uint32]$eventData.ExitStatus).ToString('X8')
+                } | Set-Content -LiteralPath (Join-Path $root 'process-exits.log')
+                Unregister-Event -SourceIdentifier $traceId -ErrorAction SilentlyContinue
+            }
         }
     } catch {$_ | Out-String | Write-Output;throw} finally {
         if($ownedShell -and (Get-Process -Id $ownedShell -ErrorAction SilentlyContinue)){[AtlasInstalledTestProcess]::StopPrivateShell([uint32]$ownedShell,$identity.User.Value)}
