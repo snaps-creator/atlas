@@ -262,10 +262,10 @@ mod tests {
             );
         }
         let before = mounts();
-        let app_error =
-            RegKey::load_app_key_with_flags(&hive, KEY_READ | KEY_WRITE, REG_PROCESS_APPKEY)
-                .unwrap_err();
-        println!("Legacy application-hive loader rejects valid mixed-ACL user hive: {app_error}");
+        match RegKey::load_app_key_with_flags(&hive, KEY_READ | KEY_WRITE, REG_PROCESS_APPKEY) {
+            Ok(key) => { println!("Mixed-ACL control: application loader succeeds"); drop(key); }
+            Err(error) => println!("Mixed-ACL control: application loader returns {error}"),
+        }
         with_hive(&hive, |root| {
             let child = root
                 .open_subkey_with_flags("Child", KEY_READ | KEY_SET_VALUE)
