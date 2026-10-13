@@ -43,6 +43,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Backend regression suite failed' }
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
           if ($LASTEXITCODE -ne 0) { throw 'Restricted desktop regression failed' }
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact uninstall_hive::tests::ordinary_hive_with_distinct_acls_roundtrips_and_unloads_after_errors --ignored
+          if ($LASTEXITCODE -ne 0) { throw 'Offline user hive cleanup regression failed' }
       - name: Verify packaged interface and publication preparation without publishing
         shell: pwsh
         run: |
@@ -71,8 +73,8 @@ jobs:
             temp/tray-protocol-*/**
   installed:
     needs: candidate
-    runs-on: windows-latest
-    timeout-minutes: 35
+    runs-on: windows-2022
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -93,12 +95,15 @@ jobs:
           $version=(Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           node scripts/verify-installer.cjs "candidate/Atlas-Setup-${version}.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed' }
-          ./scripts/test-connected-upgrade.ps1 -Installer "candidate/Atlas-Setup-${version}.exe"
+          $env:ATLAS_BUILD_ID = "${{ github.sha }}"
+          $installer=(Resolve-Path "candidate/Atlas-Setup-${version}.exe").Path
+          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$installer}
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: remediation-installed-evidence
           path: |
+            ${{ runner.temp }}/atlas-installed-desktop-*/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.error.txt

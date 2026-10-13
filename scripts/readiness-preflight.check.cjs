@@ -66,7 +66,14 @@ test('both pipelines run publication preparation after installed acceptance on t
   assert(!releaseRun.includes('-VerifyOnly'));
   assert(prRun.includes('github.event.pull_request.head.sha || github.sha'));
   assert.deepEqual(connected.jobs['connected-upgrade'].needs,['build-installer','baseline-243']);
-  assert.deepEqual(connected.jobs['connected-upgrade'].strategy.matrix.baseline,['legacy','2.4.2','2.4.3']);
+  const baselineMatrix=connected.jobs['connected-upgrade'].strategy.matrix.baseline;
+  assert.equal(connected.on.workflow_call.inputs.include_unpublished_243.default,false);
+  assert.equal(connected.on.workflow_dispatch.inputs.include_unpublished_243.default,false);
+  assert(baselineMatrix.includes(`'["legacy","2.4.2"]'`), 'deployed 2.4.2 must remain mandatory by default');
+  assert(baselineMatrix.includes(`inputs.include_unpublished_243 && '["legacy","2.4.2","2.4.3"]'`));
+  assert(connected.jobs['baseline-243'].if.startsWith('inputs.include_unpublished_243 &&'));
+  assert(connected.jobs['connected-upgrade'].if.includes("needs.build-installer.result == 'success'"));
+  assert(connected.jobs['connected-upgrade'].if.includes("needs.baseline-243.result == 'skipped'"), 'optional unpublished baseline must not skip deployed coverage');
   assert.equal(connected.jobs['build-installer'].needs,'release-readiness');
   assert.equal(connected.jobs['connected-upgrade'].steps.find(step=>step.uses?.startsWith('actions/download-artifact')).with['run-id'],'${{ github.run_id }}');
   const acceptance=fs.readFileSync('scripts/test-connected-upgrade.ps1','utf8');

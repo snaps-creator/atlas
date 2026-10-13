@@ -24,6 +24,7 @@ mod update_user;
 mod update_bundle;
 mod update_bootstrap;
 mod uninstall_startup;
+mod uninstall_hive;
 mod update_install;
 fn trust_key()->Result<String,String>{
     let config:serde_json::Value=serde_json::from_str(include_str!("../tauri.conf.json")).map_err(|_|"Embedded updater trust is invalid")?;

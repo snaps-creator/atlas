@@ -3,6 +3,35 @@ const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 const os = require("node:os");
+const fs = require("node:fs");
+
+test("normal installed desktop refuses a workstation before creating an account", {skip:process.platform!=="win32"},()=>{
+  const result=run(["-File",path.join(__dirname,"with-installed-desktop.ps1"),"-Script",path.join(__dirname,"test-connected-upgrade.ps1")],{...process.env,GITHUB_ACTIONS:"false",RUNNER_OS:"Windows"});
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/Disposable GitHub Windows runner required/);
+});
+
+test("installed desktop refuses an action outside this checkout before changing the shell", {skip:process.platform!=="win32"},t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),"atlas-external-action-"));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const action=path.join(root,"action.ps1");fs.writeFileSync(action,"throw 'external action ran'");
+  const result=run(["-File",path.join(__dirname,"with-installed-desktop.ps1"),"-Script",action],{...process.env,GITHUB_ACTIONS:"true",RUNNER_OS:"Windows"});
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/Installed action must belong to this checkout/);
+  assert.doesNotMatch(result.stderr,/external action ran/);
+});
+
+test("ordinary desktop action helper refuses a workstation before launching Atlas", {skip:process.platform!=="win32"},()=>{
+  const result=run(["-File",path.join(__dirname,"invoke-installed-desktop-check.ps1"),"-Action","ManualRestart","-EvidencePath",path.join(os.tmpdir(),"unused-atlas-proof.log")],{...process.env,GITHUB_ACTIONS:"false",RUNNER_OS:"Windows"});
+  assert.notEqual(result.status,0);assert.match(result.stderr,/Disposable GitHub Windows runner required/);
+});
+
+test("private desktop permission lease and cleanup refuse the workstation", {skip:process.platform!=="win32"},()=>{
+  const lease=path.join(__dirname,"installed-desktop-lease.cs").replaceAll("'","''");
+  const cleanup=path.join(__dirname,"installed-test-process.cs").replaceAll("'","''");
+  const result=run(["-Command",`$ErrorActionPreference='Stop'; Add-Type -Path '${lease}'; Add-Type -Path '${cleanup}'; try {[AtlasInstalledDesktopLease]::new([Security.Principal.WindowsIdentity]::GetCurrent().User.Value);throw 'Lease accepted'} catch {if($_.Exception.ToString() -notmatch 'Disposable CI desktop required'){throw}}; try {[AtlasInstalledTestProcess]::StopPrivateShell([uint32]$PID,[Security.Principal.WindowsIdentity]::GetCurrent().User.Value);throw 'Cleanup accepted'} catch {if($_.Exception.ToString() -notmatch 'Disposable GitHub Windows runner required'){throw}}; Write-Output 'PASS guarded native fixtures'`],{...process.env,GITHUB_ACTIONS:"false"});
+  assert.equal(result.status,0,result.stdout+result.stderr);
+});
 
 function run(args, env = process.env, executable = "pwsh.exe") {
   return spawnSync(executable, ["-NoProfile", ...args], {

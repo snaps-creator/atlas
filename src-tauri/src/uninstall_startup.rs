@@ -24,13 +24,38 @@ fn owned(command: &str, root: &Path) -> bool {
         || (target == format!("{root}\\atlas.exe") && args == ["--autostart"])
 }
 fn optional_key(user: &RegKey, path: &str) -> Result<Option<RegKey>, String> {
-    match user.open_subkey_with_flags(path, KEY_READ | KEY_SET_VALUE) {
-        Ok(key) => Ok(Some(key)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "Cannot inspect Atlas startup registration: {error}"
-        )),
+    let mut current = None;
+    let components = path.split('\\').collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let parent = current.as_ref().unwrap_or(user);
+        let access = if index + 1 == components.len() {
+            KEY_READ | KEY_SET_VALUE
+        } else {
+            KEY_READ
+        };
+        let key =
+            match parent.open_subkey_with_options_flags(component, REG_OPTION_OPEN_LINK, access) {
+                Ok(key) => key,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect Atlas startup registration: {error}"
+                    ))
+                }
+            };
+        match key.get_raw_value("SymbolicLinkValue") {
+            Ok(value) if value.vtype == REG_LINK => {
+                return Err(
+                    "Startup registry path contains a symbolic link; cleanup stopped".into(),
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot verify startup registry path: {error}")),
+        }
+        current = Some(key);
     }
+    Ok(current)
 }
 fn delete(key: &RegKey) -> Result<(), String> {
     match key.delete_value("Atlas") {
@@ -133,10 +158,11 @@ pub fn cleanup(root: &Path) -> Result<(), String> {
                 );
             }
         }
-        // Private process-scoped app hive: no global mount/name, RAII unload.
-        let user=RegKey::load_app_key_with_flags(&hive,KEY_READ|KEY_WRITE,REG_PROCESS_APPKEY)
-            .map_err(|e|format!("Cannot inspect offline user startup; uninstall stopped before payload removal: {e}"))?;
-        cleanup_user(&user, root)?;
+        // Load a normal user hive, including those rejected by RegLoadAppKey.
+        // A unique temporary mount is closed before payload removal; traversal
+        // rejects registry links rather than following them outside this hive.
+        crate::uninstall_hive::with_hive(&hive, |user| cleanup_user(user, root))
+            .map_err(|error| format!("Cannot clean offline startup for {sid}; uninstall stopped before payload removal: {error}"))?;
     }
     Ok(())
 }

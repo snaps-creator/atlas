@@ -1,7 +1,17 @@
 name: Verify connected upgrade
 on:
   pull_request: null
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      include_unpublished_243:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      include_unpublished_243:
+        description: Also test the unpublished 2.4.3 baseline
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -13,18 +23,16 @@ jobs:
     uses: ./.github/workflows/pr-installer.yml
     secrets: inherit
   connected-upgrade:
+    if: ${{ !cancelled() && needs.build-installer.result == 'success' && (needs.baseline-243.result == 'success' || needs.baseline-243.result == 'skipped') }}
     needs:
       - build-installer
       - baseline-243
     strategy:
       fail-fast: false
       matrix:
-        baseline:
-          - legacy
-          - 2.4.2
-          - 2.4.3
-    runs-on: windows-latest
-    timeout-minutes: 30
+        baseline: ${{ fromJSON(inputs.include_unpublished_243 && '["legacy","2.4.2","2.4.3"]' || '["legacy","2.4.2"]') }}
+    runs-on: windows-2022
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -56,14 +64,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed' }
           $legacy = '${{ matrix.baseline }}' -eq 'legacy'
           $baseline = if ('${{ matrix.baseline }}' -eq '2.4.3') { (Resolve-Path 'baseline-installer/Atlas_2.4.3_x64-setup.exe').Path } else { '' }
-          ./scripts/test-connected-upgrade.ps1 -Installer $candidates[0].FullName -LegacyBaseline:$legacy -PreviousInstaller $baseline
           $env:ATLAS_BUILD_ID = "${{ github.event.pull_request.head.sha || github.sha }}"
+          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$candidates[0].FullName;LegacyBaseline=$legacy;PreviousInstaller=$baseline}
           ./scripts/publish-verified-update.ps1 -Installer $candidates[0].FullName -VerifyOnly
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: connected-upgrade-evidence-${{ matrix.baseline }}
           path: |
+            ${{ runner.temp }}/atlas-installed-desktop-*/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.error.txt
@@ -72,7 +81,7 @@ jobs:
   baseline-243:
     runs-on: windows-latest
     timeout-minutes: 90
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: inputs.include_unpublished_243 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       ATLAS_BUILD_ID: 49dfcde7666a58847c48c65a8a29570174316710
     steps:
