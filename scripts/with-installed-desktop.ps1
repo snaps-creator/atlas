@@ -7,6 +7,7 @@ if($Worker) {
     if($config.sid -ne $identity.User.Value){throw 'Worker ticket does not match the private user'}
     $root=Split-Path $Ticket -Parent
     $report=Join-Path $root $(if($Bootstrap){'bootstrap.log'}else{'installed-desktop.log'})
+    $ownedShell=$null
     Start-Transcript -LiteralPath $report -Force | Out-Null
     try {
         $profile=(Get-ItemProperty -LiteralPath ('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\'+$identity.User.Value)).ProfileImagePath
@@ -20,6 +21,7 @@ if($Worker) {
         if($config.buildId){$env:ATLAS_BUILD_ID=$config.buildId}
         Set-Location -LiteralPath $config.repository
         Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
+        Add-Type -Path (Join-Path $PSScriptRoot 'installed-test-process.cs')
         $principal=[Security.Principal.WindowsPrincipal]::new($identity)
         $admin=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         if($Bootstrap) {
@@ -34,6 +36,7 @@ if($Worker) {
             } while([DateTime]::UtcNow -lt $deadline)
             if(-not $shellPid){throw 'Ordinary Explorer did not establish the notification area'}
             [AtlasInstalledShell]::VerifyShell($shellPid)
+            $ownedShell=$shellPid
             if([AtlasInstalledShell]::Integrity($shellPid) -ne 8192){throw 'Fixture Explorer must remain at medium integrity'}
             Start-Sleep -Seconds 20
             Add-Type -Path (Join-Path $PSScriptRoot 'installed-tray-preflight.cs') -ReferencedAssemblies System,System.Windows.Forms,System.Drawing
@@ -41,7 +44,7 @@ if($Worker) {
             [IO.File]::WriteAllText((Join-Path $root 'ready'),[string]$shellPid)
             Write-Output "PASS: ordinary desktop and actual fixture notification registration; shell PID=$shellPid"
             while(-not (Test-Path -LiteralPath (Join-Path $root 'stop'))) {
-                if(-not (Get-Process -Id $shellPid -ErrorAction SilentlyContinue)){throw 'Ordinary shell terminated during installed acceptance'}
+                if(-not (Get-Process -Id $shellPid -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath (Join-Path $root 'stop'))){throw 'Ordinary shell terminated during installed acceptance'}
                 Start-Sleep -Milliseconds 250
             }
         } else {
@@ -51,7 +54,10 @@ if($Worker) {
             $arguments=@{};foreach($property in $config.parameters.PSObject.Properties){$arguments[$property.Name]=$property.Value}
             & $config.script @arguments
         }
-    } catch {$_ | Out-String | Write-Output;throw} finally {Stop-Transcript | Out-Null}
+    } catch {$_ | Out-String | Write-Output;throw} finally {
+        if($ownedShell -and (Get-Process -Id $ownedShell -ErrorAction SilentlyContinue)){[AtlasInstalledTestProcess]::StopPrivateShell([uint32]$ownedShell,$identity.User.Value)}
+        Stop-Transcript | Out-Null
+    }
     return
 }
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows'){throw 'Disposable GitHub Windows runner required'}

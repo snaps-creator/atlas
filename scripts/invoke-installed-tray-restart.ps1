@@ -81,7 +81,8 @@ public static class AtlasTrayAcceptance {
     [DllImport("user32.dll")] static extern bool EnumWindows(WindowCallback callback,IntPtr state);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint pid);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window,StringBuilder name,int length);
-    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr window,uint message,UIntPtr w,IntPtr l);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr FindWindow(string name,string title);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr process,uint flags,StringBuilder path,ref uint length);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window,out Rect rect);
@@ -160,33 +161,41 @@ public static class AtlasTrayAcceptance {
         GetWindowThreadProcessId(found,out owner);
         var name=new StringBuilder(256);GetClassName(found,name,name.Capacity);
         if(owner!=pid || name.ToString()!="tray_icon_app")throw new Exception("Registered tray proof no longer identifies the live owner window");
-        var rect=new Rect{left=registration.Left,top=registration.Top,right=registration.Right,bottom=registration.Bottom};
+        var live=QueryPhysicalIcon(pid);
+        if(live.Window!=registration.Window || live.Id!=registration.Id)throw new Exception("Registered tray identity changed before input");
+        var rect=new Rect{left=live.Left,top=live.Top,right=live.Right,bottom=live.Bottom};
         trayDiagnostic="tray HWND="+found+" rect="+rect.left+","+rect.top+","+rect.right+","+rect.bottom;
         Point cursor;
         if(!GetCursorPos(out cursor))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Runner input desktop cursor unavailable");
         if(!cursorSaved){originalCursor=cursor;cursorSaved=true;}
         if(rect.right>rect.left && rect.bottom>rect.top && !SetCursorPos(rect.left+(rect.right-rect.left)/2,rect.top+(rect.bottom-rect.top)/2))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Position runner cursor at registered Atlas icon");
-        // tray-icon 0.25.1's shell callback, followed by the real native menu.
-        if(!PostMessage(found,6002,UIntPtr.Zero,new IntPtr(0x205))) throw new Exception("Tray menu could not be opened");
+        uint shellPid,hitPid;
+        GetWindowThreadProcessId(FindWindow("Shell_TrayWnd",null),out shellPid);
+        GetWindowThreadProcessId(WindowFromPoint(new Point{x=rect.left+(rect.right-rect.left)/2,y=rect.top+(rect.bottom-rect.top)/2}),out hitPid);
+        if(shellPid==0 || hitPid!=shellPid || InputIntegrity(shellPid)!=InputIntegrity((uint)Process.GetCurrentProcess().Id))throw new Exception("Registered icon point mismatch: shell="+shellPid+" hit="+hitPid+" caller="+InputIntegrity((uint)Process.GetCurrentProcess().Id)+" shellLevel="+(shellPid==0?0:InputIntegrity(shellPid)));
+        var shellProcess=OpenProcess(0x1000,false,shellPid);
+        if(shellProcess==IntPtr.Zero)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Inspect actual notification input owner");
+        try {
+            var image=new StringBuilder(32768);uint length=32768;
+            if(!QueryFullProcessImageName(shellProcess,0,image,ref length) || !String.Equals(image.ToString(),System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"explorer.exe"),StringComparison.OrdinalIgnoreCase))throw new Exception("Notification input owner is not Windows Explorer");
+        } finally {CloseHandle(shellProcess);}
+        // Genuine shell input gives the normal foreground grant and callback.
+        SendMouseClick(rect.left+(rect.right-rect.left)/2,rect.top+(rect.bottom-rect.top)/2,true);
     }
     static bool Click(uint pid,int x,int y) {
         if(!HasForegroundOwner(pid)){menuDiagnostic+="; native menu owner is not foreground";return false;}
         SendMouseClick(x,y);return true;
     }
-    static void SendMouseClick(int x,int y) {
+    static void SendMouseClick(int x,int y,bool right=false) {
         if(!SetCursorPos(x,y))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Position cursor at verified native menu item");
         Point actual;
         if(!GetCursorPos(out actual) || actual.x!=x || actual.y!=y)throw new Exception("Native cursor did not reach the verified menu point");
-        int originX=GetSystemMetrics(76),originY=GetSystemMetrics(77),width=GetSystemMetrics(78),height=GetSystemMetrics(79);
-        if(width<=1 || height<=1)throw new Exception("Native virtual desktop bounds unavailable");
-        int absoluteX=(int)(((long)x-originX)*65535/(width-1));
-        int absoluteY=(int)(((long)y-originY)*65535/(height-1));
-        if(absoluteX<0 || absoluteX>65535 || absoluteY<0 || absoluteY>65535)throw new Exception("Verified menu point lies outside the input desktop");
-        var move=new Input{mouse=new Mouse{x=absoluteX,y=absoluteY,flags=0xC001}};
-        // Keep final movement and both button transitions in one ordered batch.
-        var inputs=new[]{move,new Input{mouse=new Mouse{flags=2}},new Input{mouse=new Mouse{flags=4}}};
-        if(SendInput(3,inputs,Marshal.SizeOf(typeof(Input)))!=3)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Native menu input rejected");
+        // SetCursorPos above already proved the physical position. Inject only
+        // the ordered button transitions; a second normalized move can apply
+        // another coordinate mapping on a mixed-DPI virtual desktop.
+        var inputs=new[]{new Input{mouse=new Mouse{flags=right?8u:2u}},new Input{mouse=new Mouse{flags=right?16u:4u}}};
+        if(SendInput(2,inputs,Marshal.SizeOf(typeof(Input)))!=2)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Native menu input rejected");
     }
     static bool ReadItem(IntPtr popup,IntPtr menu,uint index,string label,out Rect rect) {
         rect=new Rect();var name=new StringBuilder(1024);

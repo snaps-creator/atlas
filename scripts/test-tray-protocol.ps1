@@ -36,10 +36,6 @@ try {
     $native=[regex]::Match($source,"@'\r?\n([\s\S]*?)\r?\n'@").Groups[1].Value
     if (-not $native) {throw 'Native tray implementation missing'}
     Add-Type -TypeDefinition $native
-    [AtlasTrayAcceptance]::ActivateFixtureWindow([uint32]$process.Id)
-    $foregroundDeadline=[DateTime]::UtcNow.AddSeconds(2)
-    while(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id) -and [DateTime]::UtcNow -lt $foregroundDeadline){Start-Sleep -Milliseconds 25}
-    if(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id)){throw 'Real fixture input did not grant foreground to its owner'}
     $registration=[AtlasTrayAcceptance]::QueryRegisteredIcon([uint32]$process.Id)
     $actualOwner=$registration.ProcessId
     $registration.ProcessId=[uint32]$PID
@@ -67,6 +63,7 @@ try {
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $found) {throw ('Fixture native popup unavailable: '+[AtlasTrayAcceptance]::Diagnostic)}
+    if(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id)){throw 'Actual notification-area input did not grant foreground to its native menu owner'}
     # Negative checks run only after the actual popup has been found.
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$PID,'Перезагрузить')) {throw 'Wrong popup owner accepted'}
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'not-a-fixture-action')) {throw 'Wrong popup action accepted'}

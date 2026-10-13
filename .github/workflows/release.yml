@@ -1,86 +1,14 @@
-name: Publish Atlas update
+name: Isolated installed desktop proof
 on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Separate authorization after merge: type Publish Atlas 2.5.1"
         required: true
         type: string
-concurrency:
-  group: atlas-release-main
-  cancel-in-progress: false
 permissions:
-  contents: write
+  contents: read
   actions: read
 jobs:
-  release-readiness:
+  desktop-proof:
+    if: github.ref == 'refs/heads/audit/tray-root-cause' && inputs.confirmation == 'Diagnostic only - do not publish'
     uses: ./.github/workflows/updater-readiness.yml
-  publish-windows:
-    needs:
-      - release-readiness
-      - release-acceptance
-      - release-backend
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
-    runs-on: windows-latest
-    env:
-      ATLAS_BUILD_ID: ${{ github.sha }}
-      CARGO_TARGET_DIR: ${{ github.workspace }}/t
-      CARGO_INCREMENTAL: "0"
-      RUST_TEST_THREADS: 1
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
-        with:
-          name: Atlas-Windows-x64-${{ github.run_id }}
-          path: artifacts/release
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22.23.3
-          cache: npm
-      - name: Pin npm
-        run: npm install --global npm@11.16.0
-      - name: Install dependencies
-        run: npm ci
-      - name: Check whether the version is already released
-        id: release-version
-        shell: pwsh
-        run: |
-          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          $existingTag = git ls-remote --tags origin "refs/tags/v$version"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not check whether tag v$version already exists."
-          }
-          if ($existingTag) {
-            "released=true" >> $env:GITHUB_OUTPUT
-            Write-Host "Version $version is already published; no duplicate Release is needed."
-          } else {
-            "released=false" >> $env:GITHUB_OUTPUT
-          }
-      - name: Publish the same signed installer that passed installed acceptance
-        if: steps.release-version.outputs.released != 'true'
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ATLAS_RELEASE_AUTHORIZATION: ${{ inputs.confirmation }}
-        run: |-
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $installer = "artifacts/release/Atlas-Setup-${version}.exe"
-          ./scripts/publish-verified-update.ps1 -Installer $installer
-      - name: Preserve generated installer and dependency evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: atlas-update-build-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            artifacts/release/
-          if-no-files-found: warn
-  release-acceptance:
-    needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
-    uses: ./.github/workflows/connected-upgrade.yml
-    secrets: inherit
-  release-backend:
-    needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
-    uses: ./.github/workflows/pr-check.yml
