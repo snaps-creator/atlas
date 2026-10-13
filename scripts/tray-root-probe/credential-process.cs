@@ -25,17 +25,12 @@ public sealed class AtlasDiagnosticCredentialProcess : IDisposable {
     }
     public AtlasDiagnosticCredentialProcess(string name,string identity,string password,string command,string directory) {
         if(Environment.GetEnvironmentVariable("GITHUB_ACTIONS")!="true" || !System.Text.RegularExpressions.Regex.IsMatch(name,"^AtlasProbe[0-9a-f]{8}$"))throw new Exception("Private disposable CI identity required");
-        IntPtr token;if(!LogonUser(name,".",password,2,0,out token))throw Error("Log on private diagnostic identity");
+        IntPtr token;if(!LogonUser(name,".",password,4,0,out token))throw Error("Log on private administrative batch worker");
         IntPtr linked=IntPtr.Zero,primary=IntPtr.Zero;
         try {
             var selected=token;
-            if(Elevation(token)==3) {
-                var data=Marshal.AllocHGlobal(IntPtr.Size);
-                try{int needed;if(!GetTokenInformation(token,19,data,IntPtr.Size,out needed))throw Error("Inspect diagnostic linked token");linked=Marshal.ReadIntPtr(data);selected=linked;}
-                finally{Marshal.FreeHGlobal(data);}
-            }
             using(var user=new WindowsIdentity(selected)) {
-                if(user.User.Value!=identity || !new WindowsPrincipal(user).IsInRole(WindowsBuiltInRole.Administrator) || Elevation(selected)!=2)throw new Exception("Credential worker requires the exact private user's full split token");
+                if(user.User.Value!=identity || !new WindowsPrincipal(user).IsInRole(WindowsBuiltInRole.Administrator) || Elevation(selected)==3)throw new Exception("Credential worker requires the exact private user's administrative batch token");
             }
             if(!DuplicateTokenEx(selected,0x18B,IntPtr.Zero,2,1,out primary))throw Error("Prepare private primary installer token");
             IntPtr environment;if(!CreateEnvironmentBlock(out environment,primary,false))throw Error("Prepare private profile environment");

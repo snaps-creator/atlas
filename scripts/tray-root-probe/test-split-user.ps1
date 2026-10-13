@@ -1,4 +1,4 @@
-param([switch]$Worker,[string]$Repository,[string]$Executable,[string]$Report)
+param([switch]$Worker,[switch]$Bootstrap,[string]$Repository,[string]$Executable,[string]$Report)
 $ErrorActionPreference='Stop'
 if ($Worker) {
     if([Environment]::UserName -notmatch '^AtlasProbe[0-9a-f]{8}$'){throw 'Worker requires the private disposable diagnostic identity'}
@@ -21,9 +21,11 @@ if ($Worker) {
         $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
         $admin=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         Write-Output ('NEW USER: admin='+$admin+'; integrity='+[AtlasInstalledShell]::Integrity([uint32]$PID))
-        if ($admin) { & $Executable --shell-linked-bootstrap; if($LASTEXITCODE -ne 0){throw 'Linked shell launch failed'} }
-        else { Start-Process -FilePath "$env:WINDIR/explorer.exe" -WindowStyle Hidden | Out-Null }
-        Start-Sleep -Seconds 20
+        if ($Bootstrap) {
+            if($admin){throw 'Interactive bootstrap must be an ordinary user process'}
+            Start-Process -FilePath "$env:WINDIR/explorer.exe" -WindowStyle Hidden | Out-Null
+            Start-Sleep -Seconds 20
+        } elseif(-not $admin) {throw 'Installation worker must have administrative access'}
         $shell=[AtlasInstalledShell]::ShellPid()
         if(-not $shell){throw 'Normal user shell did not stay alive'}
         [AtlasInstalledShell]::VerifyShell($shell)
@@ -37,6 +39,12 @@ if ($Worker) {
         foreach($file in $reports){$proof=Get-Content -LiteralPath $file.FullName -Raw|ConvertFrom-Json;if($proof.notifyAdd -ne 1){throw 'Native registration still failed for normal user'}}
         $reports | ForEach-Object {Copy-Item -LiteralPath $_.FullName -Destination (Split-Path $Report -Parent)}
         Write-Output 'PASS: actual native icon registration with a normal medium shell and unchanged application token logic'
+        if($Bootstrap) {
+            $root=Split-Path $Report -Parent
+            [IO.File]::WriteAllText((Join-Path $root 'bootstrap.ready'),[string]$shell)
+            $deadline=[DateTime]::UtcNow.AddSeconds(100)
+            while(-not (Test-Path -LiteralPath (Join-Path $root 'bootstrap.stop')) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
+        }
     } catch {$_ | Out-String | Write-Output;throw} finally {Stop-Transcript | Out-Null}
     return
 }
@@ -66,6 +74,13 @@ try {
         $shell=[AtlasInstalledShell]::ShellPid()
         if($shell){[AtlasInstalledShell]::StopVerifiedShell($shell)}
         $command='-NoProfile -ExecutionPolicy Bypass -File "'+$PSCommandPath+'" -Worker -Repository "'+$repo+'" -Executable "'+$exe+'" -Report "'+$report+'"'
+        $bootstrapReport=Join-Path $root 'bootstrap.log'
+        $bootstrapCommand=$command.Replace(' -Worker ',' -Worker -Bootstrap ').Replace($report,$bootstrapReport)
+        $bootstrap=Start-Process -FilePath "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -Credential $credential -LoadUserProfile -ArgumentList $bootstrapCommand -PassThru -WindowStyle Hidden
+        $deadline=[DateTime]::UtcNow.AddSeconds(70)
+        while(-not (Test-Path -LiteralPath (Join-Path $root 'bootstrap.ready')) -and -not $bootstrap.HasExited -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
+        if(Test-Path -LiteralPath $bootstrapReport){Get-Content -LiteralPath $bootstrapReport | Write-Output}
+        if(-not (Test-Path -LiteralPath (Join-Path $root 'bootstrap.ready'))){throw 'Interactive bootstrap did not establish a usable registered icon'}
         $plain=[Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($credential.Password)
         try {$worker=[AtlasDiagnosticCredentialProcess]::new($name,$account.SID.Value,[Runtime.InteropServices.Marshal]::PtrToStringUni($plain),$command,$repo)}
         finally {[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plain)}
@@ -73,7 +88,12 @@ try {
             if(-not $worker.WaitForExit(60000)){throw 'Normal user experiment timed out'}
             if(Test-Path -LiteralPath $report){Get-Content -LiteralPath $report | Write-Output}
             if($worker.ExitCode -ne 0){throw "Normal user experiment exit=$($worker.ExitCode)"}
-        } finally {$worker.Dispose()}
+        } finally {
+            $worker.Dispose()
+            [IO.File]::WriteAllText((Join-Path $root 'bootstrap.stop'),'')
+            if(-not $bootstrap.WaitForExit(10000)){$bootstrap.Kill();$bootstrap.WaitForExit()}
+            $bootstrap.Dispose()
+        }
     }
 } finally {
     $policy.Dispose()
