@@ -7,6 +7,20 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 struct History { entries: VecDeque<Value>, bytes: usize, sequence: u64, saved: u64, dropped: u64, rotate: bool }
 impl History {
     fn push(&mut self, value: Value) {
+        if matches!(value["kind"].as_str(), Some("service_operation_failed" | "request_failed")) {
+            if let Some(last)=self.entries.back_mut().filter(|last|last["kind"]==value["kind"] && last["sessionId"]==value["sessionId"] && last["evidence"]==value["evidence"]) {
+                self.bytes-=last.to_string().len();
+                last["repeatCount"]=json!(last["repeatCount"].as_u64().unwrap_or(1).saturating_add(1));
+                last["lastAt"]=value["at"].clone();
+                last["lastMonotonicMs"]=value["monotonicMs"].clone();
+                self.bytes+=last.to_string().len();
+                self.sequence+=1; self.rotate=true;
+                while self.bytes>MAX_BYTES {
+                    if let Some(old)=self.entries.pop_front() {self.bytes-=old.to_string().len();self.dropped+=1;}
+                }
+                return;
+            }
+        }
         // Large snapshots have their own quota; they must not evict an hour of
         // lightweight state merely because a failing app retries continuously.
         if value["kind"] == "automatic_incident" && self.entries.iter().filter(|v|v["kind"] == "automatic_incident").count() >= 8 {
@@ -27,15 +41,20 @@ impl History {
 static HISTORY: OnceLock<Mutex<History>> = OnceLock::new();
 fn history() -> &'static Mutex<History> { HISTORY.get_or_init(Default::default) }
 pub fn record(kind: &str, value: Value, secrets: &[String]) {
+    static SESSION: OnceLock<String> = OnceLock::new();
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
     let safe = crate::support_report::redact_value(&value, secrets).to_string();
     // Text intentionally remains text: redaction is allowed to change JSON syntax.
-    let item = json!({"at":crate::model::now(),"kind":kind,"evidence":safe});
+    let item = json!({"at":crate::model::now(),"kind":kind,"evidence":safe,
+        "sessionId":SESSION.get_or_init(||uuid::Uuid::new_v4().to_string()),
+        "buildId":env!("ATLAS_BUILD_ID"),"version":env!("CARGO_PKG_VERSION"),
+        "monotonicMs":START.get_or_init(std::time::Instant::now).elapsed().as_millis()});
     if let Ok(mut h) = history().lock() { h.push(item); }
 }
 pub fn snapshot() -> Value {
     history().lock().map(|h| json!({"maxEntries":MAX_ENTRIES,"maxBytes":MAX_BYTES,
         "retainedBytes":h.bytes,"droppedEntries":h.dropped,
-        "firstAt":h.entries.front().and_then(|v|v.get("at")),"lastAt":h.entries.back().and_then(|v|v.get("at")),
+        "firstAt":h.entries.front().and_then(|v|v.get("at")),"lastAt":h.entries.back().and_then(|v|v.get("lastAt").or_else(||v.get("at"))),
         "meaning":"Compact periodic state plus deduplicated logs; explicit coverage, not packet capture",
         "entries":h.entries})).unwrap_or_else(|_| json!({"error":"History lock poisoned"}))
 }
@@ -53,6 +72,7 @@ fn report_entry(value: &Value) -> Value {
     json!({
         "at": value["at"],
         "kind": value["kind"],
+        "sessionId":value["sessionId"],"buildId":value["buildId"],"version":value["version"],"monotonicMs":value["monotonicMs"],
         "evidence": {
             "revision": parsed["revision"],
             "before": {
@@ -78,7 +98,7 @@ pub fn snapshot_for_report() -> Value {
         json!({"maxEntries":MAX_ENTRIES,"maxBytes":MAX_BYTES,
             "retainedBytes":h.bytes,"exportedBytes":entries.iter().map(|v|v.to_string().len()).sum::<usize>(),
             "droppedEntries":h.dropped,
-            "firstAt":h.entries.front().and_then(|v|v.get("at")),"lastAt":h.entries.back().and_then(|v|v.get("at")),
+            "firstAt":h.entries.front().and_then(|v|v.get("at")),"lastAt":h.entries.back().and_then(|v|v.get("lastAt").or_else(||v.get("at"))),
             "meaning":"Compact periodic state and prior incident summaries; the current incident has full evidence below",
             "entries":entries})
     }).unwrap_or_else(|_| json!({"error":"History lock poisoned"}))
@@ -96,19 +116,21 @@ pub fn flush(path: &Path) -> Result<(), String> {
     static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
     let _writer = WRITER.get_or_init(Default::default).lock().map_err(|_| "History writer unavailable")?;
     use std::io::Write;
-    let (all, new, sequence, first) = {
+    let (contents, sequence, rewrite) = {
         let h = history().lock().map_err(|_| "History unavailable")?;
         if h.saved == h.sequence { return Ok(()); }
-        let lines: Vec<_> = h.entries.iter().map(|v|format!("{v}\n")).collect();
-        let count = (h.sequence - h.saved).min(lines.len() as u64) as usize;
-        (lines.concat(),lines[lines.len()-count..].concat(),h.sequence,h.saved == 0 || h.rotate)
+        let count = (h.sequence - h.saved).min(h.entries.len() as u64) as usize;
+        let new:String=h.entries.iter().skip(h.entries.len()-count).map(|v|format!("{v}\n")).collect();
+        let rewrite=h.saved==0 || h.rotate || std::fs::metadata(path).map_or(true,|m|m.len()+new.len() as u64>MAX_BYTES as u64);
+        let contents=if rewrite {h.entries.iter().map(|v|format!("{v}\n")).collect()} else {new};
+        (contents,h.sequence,rewrite)
     };
     // Append only newly recorded samples. Rewrite the bounded ring on rotation,
     // not every sampling tick (avoids gigabytes/day of redundant disk writes).
-    if first || std::fs::metadata(path).map_or(true,|m|m.len() + new.len() as u64 > MAX_BYTES as u64) {
-        std::fs::write(path,all).map_err(|e|e.to_string())?;
+    if rewrite {
+        std::fs::write(path,contents).map_err(|e|e.to_string())?;
     } else {
-        std::fs::OpenOptions::new().append(true).open(path).and_then(|mut f|f.write_all(new.as_bytes())).map_err(|e|e.to_string())?;
+        std::fs::OpenOptions::new().append(true).open(path).and_then(|mut f|f.write_all(contents.as_bytes())).map_err(|e|e.to_string())?;
     }
     if let Ok(mut h) = history().lock() { h.saved = sequence; if h.sequence == sequence { h.rotate = false; } }
     Ok(())
@@ -116,6 +138,19 @@ pub fn flush(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_error_storm_keeps_first_last_count_and_session_boundary() {
+        let mut h=History::default();
+        for at in 0..86400 { h.push(json!({"kind":"service_operation_failed","at":at,"sessionId":"a","evidence":"x".repeat(4096)})); }
+        assert_eq!(h.entries.len(),1);
+        let item=&h.entries[0];
+        assert_eq!(item["at"],0); assert_eq!(item["lastAt"],86399); assert_eq!(item["repeatCount"],86400);
+        assert!(h.bytes<8192);
+        h.push(json!({"kind":"service_operation_failed","at":86400,"sessionId":"b","evidence":"x".repeat(4096)}));
+        assert_eq!(h.entries.len(),2);
+        h.push(json!({"kind":"service_operation_failed","at":86401,"sessionId":"b","evidence":"different"}));
+        assert_eq!(h.entries.len(),3);
+    }
     #[test]
     fn one_hour_survives_repeated_large_incidents() {
         let mut h=History::default();

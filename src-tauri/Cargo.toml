@@ -1,6 +1,6 @@
 [package]
 name = "atlas-vpn"
-version = "2.4.2"
+version = "2.5.1"
 edition = "2021"
 default-run = "atlas-vpn"
 
@@ -18,6 +18,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
 tauri-build = { version = "=3.0.0-alpha.1", features = [] }
+
+[patch.crates-io]
+tray-icon = { path = "../vendor/tray-icon" }
 
 [dependencies]
 tauri = { version = "=3.0.0-alpha.2", default-features = false, features = ["tray-icon"] }

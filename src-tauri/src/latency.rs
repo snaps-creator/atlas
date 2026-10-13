@@ -12,7 +12,7 @@ const DISPLAY_WORKERS: usize = 6;
 pub fn node_identity(node: &Value) -> String {
     use sha2::{Digest, Sha256};
     let mut node=node.clone();
-    if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");}
+    if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");fields.remove("atlas");}
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
 // Match Clash Verge's per-node measurement without saturating the controller.
@@ -175,9 +175,8 @@ pub(crate) fn batch_at(client: ApiClient, names: &[String], endpoint: &str) -> R
     }
     Ok(Value::Object(results))
 }
-// Same Cloudflare connectivity endpoint over TLS, not an independent provider.
-// /cdn-cgi/trace does not reliably support the HEAD request used by Mihomo.
-pub const SECONDARY_URL: &str = "https://cp.cloudflare.com/generate_204";
+// Independent provider; Android/Chromium also use this HTTP 204 control.
+pub const SECONDARY_URL: &str = "https://www.google.com/generate_204";
 pub const ENDPOINTS: [&str; 2] = [DISPLAY_URL, SECONDARY_URL];
 pub fn expected_status(_endpoint: &str) -> u16 {
     204

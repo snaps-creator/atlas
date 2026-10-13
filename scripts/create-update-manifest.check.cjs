@@ -4,7 +4,7 @@ test('manifest binds verified artifact and staged runtime without reading a sign
   const fixture=JSON.parse(fs.readFileSync('src-tauri/testdata/update-crypto.json'));
   const signed=JSON.parse(Buffer.from(fixture.manifest,'base64'));
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'atlas-manifest-test-'));
-  const installer=path.join(dir,`Atlas_${signed.version}_x64-setup.exe`);
+  const installer=path.join(dir,`Atlas-Setup-${signed.version}.exe`);
   try{
     fs.writeFileSync(installer,Buffer.from(fixture.artifact,'base64'));fs.writeFileSync(installer+'.sig',signed.signature);
     const files=[...signed.files.filter(f=>f.path!=='Atlas.Service.exe'),{...signed.files[0],path:'AtlasUpdater.exe'}].map(f=>({...f,stagedSha256:f.sha256,extractedSha256:f.sha256}));

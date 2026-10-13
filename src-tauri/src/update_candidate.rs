@@ -14,11 +14,12 @@ pub struct Candidate {child:Desktop,keep:bool,pub report:Report}
 impl Drop for Candidate {fn drop(&mut self){if !self.keep{self.child.terminate();}}}
 impl Candidate {
     pub fn commit(&mut self){self.keep=true;}
-    pub fn launch(executable:&Path,transaction:&str,nonce:&str,version:&str,build:&str)->Result<Self,String>{
-        if let Some((child,stdout))=crate::update_user::limited(executable,&["--update-health",transaction,nonce])? {
+    pub fn launch(executable:&Path,transaction:&str,nonce:&str,version:&str,build:&str,first_install:bool)->Result<Self,String>{
+        let arguments=["--update-health",transaction,nonce,if first_install {"--installer-first-launch"} else {"--updater-restart"}];
+        if let Some((child,stdout))=crate::update_user::limited(executable,&arguments)? {
             return Self::from_parts(Desktop::Limited(child),stdout,transaction,nonce,version,build,Duration::from_secs(45));
         }
-        let mut command=Command::new(executable);command.args(["--update-health",transaction,nonce]);
+        let mut command=Command::new(executable);command.args(arguments);
         command.current_dir(executable.parent().ok_or("Candidate installation directory missing")?);
         Self::from_command(command,transaction,nonce,version,build,Duration::from_secs(45))
     }

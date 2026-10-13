@@ -70,7 +70,7 @@ impl Prepared {
         std::fs::create_dir_all(&prepared.directory).map_err(|_|"Не удалось создать каталог Xray")?;
         let mut simple_inbounds=Vec::new(); let mut simple_outbounds=Vec::new(); let mut simple_rules=Vec::new();
         let mut simple_ports=Vec::new(); let mut profiles=Vec::new(); let mut index=0;
-        for sub in prepared.settings.active_subscriptions_mut() {
+        for sub in prepared.settings.subscriptions.iter_mut() {
             for node in &mut sub.servers {
                 if node["type"]!="xray" {continue;}
                 let reservation=reserve()?;
@@ -219,7 +219,7 @@ impl Runtime {
         if settings.mode=="tun" && default_interface().ok()!=self.prepared.interface {return None;}
         let mapped=self.prepared.settings.servers();
         let mut result=settings.clone();
-        for node in result.active_subscriptions_mut().flat_map(|s|&mut s.servers) {
+        for node in result.subscriptions.iter_mut().flat_map(|s|&mut s.servers) {
             if node["type"]=="xray" {
                 *node=mapped.iter().find(|m|m["name"]==node["name"])?.clone();
             }

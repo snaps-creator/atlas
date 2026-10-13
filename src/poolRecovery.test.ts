@@ -7,6 +7,23 @@ it("never conceals a failed selected node behind healthy alternatives or stale h
   expect(observedHealth(["bad","good"],p,30000,now+60000).phase).toBe("idle");
 });
 describe("shared subscription pool", () => {
+  it("uses fresh independent HTTPS evidence when the primary control fails", () => {
+    const now = Date.now();
+    const history = [{ delay: 25, time: new Date(now).toISOString() }];
+    const proxies = {
+      ATLAS: { now: "node" }, node: { extra: {
+        "http://cp.cloudflare.com/generate_204": { alive: false, history },
+        "https://www.google.com/generate_204": { alive: true, history },
+      } },
+    };
+    expect(observedHealth(["node"], proxies, 30000, now).phase).toBe("healthy");
+    proxies.node.extra["https://www.google.com/generate_204"].alive = false;
+    expect(observedHealth(["node"], proxies, 30000, now).phase).toBe("degraded");
+    proxies.node.extra["https://www.google.com/generate_204"] = {
+      alive: true, history: [{ delay: 25, time: new Date(now - 60000).toISOString() }],
+    };
+    expect(observedHealth(["node"], proxies, 30000, now).phase).toBe("degraded");
+  });
   it("does not confuse untested, missing, or empty nodes with total failure", () => {
     expect(exhausted([], {})).toBe(false);
     expect(exhausted(["a", "b"], { a: { alive: false, history: [{ delay: 0 }] } })).toBe(false);

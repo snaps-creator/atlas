@@ -1,5 +1,7 @@
-param([Parameter(Mandatory=$true)][string]$Updater,[Parameter(Mandatory=$true)][string]$OutputDirectory)
+param([Parameter(Mandatory=$true)][string]$Updater,[Parameter(Mandatory=$true)][string]$OutputDirectory,[string]$Makensis)
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'resolve-makensis.ps1')
+$compiler = Resolve-AtlasMakensis -ExplicitPath $Makensis
 $source=(Resolve-Path -LiteralPath $Updater).Path
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $output=(Resolve-Path -LiteralPath $OutputDirectory).Path
@@ -47,7 +49,7 @@ function Literal([string]$value) { $value.Replace('$','$$').Replace('"','$\"') }
 $nsis=$nsis.Replace('@OUTPUT@',(Literal $output)).Replace('@SOURCE@',(Literal $source)).Replace('@STAGE@',(Literal $stage))
 $script=Join-Path $output 'context-regression.nsi'
 [IO.File]::WriteAllText($script,$nsis,[Text.UTF8Encoding]::new($true))
-& 'C:/Users/Никита/AppData/Local/tauri/NSIS/makensis.exe' /V2 $script *> (Join-Path $output 'build.log')
+& $compiler /V2 $script *> (Join-Path $output 'build.log')
 if ($LASTEXITCODE -ne 0) { throw 'NSIS regression build failed' }
 $process=Start-Process -FilePath (Join-Path $output 'context-regression.exe') -PassThru -WindowStyle Hidden
 $handle=$process.Handle

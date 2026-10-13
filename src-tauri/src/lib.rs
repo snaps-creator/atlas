@@ -51,7 +51,13 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 mod startup;
+mod node_name;
+mod settings_write;
+mod startup_coordinator;
+type StartupState = Arc<Mutex<startup_coordinator::StartupCoordinator>>;
+struct WindowVisibility(Arc<std::sync::atomic::AtomicBool>);
 struct App {
+    baseline_ready: bool,
     revision: u64,
     published: published_state::PublishedState,
     reads: published_state::ReadState,
@@ -63,6 +69,7 @@ struct App {
     status: String,
     error: Option<String>,
     control_error: Option<String>,
+    startup_status: Value,
     logs: Vec<Value>,
     reconnect: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -100,12 +107,14 @@ impl App {
             sub.options.parameters.clear();
             sub.options.provider_id = None;
             for p in &mut sub.servers {
-                *p = json!({"name":p["name"],"type":p["type"],"protocol":p["xray"]["outbounds"][0]["protocol"].as_str().or_else(||p["type"].as_str()),"country":country::detect(p),"probeId":latency::node_identity(p)});
+                *p = json!({"name":p["name"],"type":p["type"],"protocol":p["xray"]["outbounds"][0]["protocol"].as_str().or_else(||p["type"].as_str()),"nodeId":p["atlas"]["nodeId"],"sourceId":sub.id,"sourceName":sub.name,"sourceType":sub.source,"stableIdentity":p["atlas"]["stableIdentity"],"transport":p["atlas"]["transport"],"country":country::detect(p),"probeId":latency::node_identity(p)});
             }
         }
         let value = json!({"settings":s,"status":self.status,"running":running,"guardActive":self.core.guard_active(),"error":self.error,"duration":self.core.started.map(|t|t.elapsed().as_secs()).unwrap_or(0),"logs":self.logs,"buildId":env!("ATLAS_BUILD_ID")});
         let mut value = value;
         value["controlError"] = json!(self.control_error);
+        value["startupStatus"] = self.startup_status.clone();
+        value["desiredConnected"] = json!(self.reconnect.load(std::sync::atomic::Ordering::SeqCst));
         value["refreshingSubscriptions"] = json!(subscription_refresh::active());
         value["revision"] = json!(self.revision);
         self.published.set(value.clone());
@@ -139,13 +148,13 @@ impl App {
                 } else {
                     next.subscriptions.push(sub)
                 }
+                model::repository::reconcile_references(&self.settings,&mut next);
                 if !next.servers().iter().any(|s| s["name"] == next.selected)
                     && !["AUTO", "FAILOVER"].contains(&next.selected.as_str())
                 {
                     next.selected = "AUTO".into()
                 };
                 let mut validation=next.clone();
-                if validation.active_source!=source {validation.switch_source(source);}
                 if let Err(batch_error)=self.core.validate(&validation) {
                     let index=next.subscriptions.iter().position(|s|s.id==id).ok_or("Подписка отсутствует")?;
                     let candidates=next.subscriptions[index].servers.clone();
@@ -154,7 +163,6 @@ impl App {
                     for (position,node) in candidates.into_iter().enumerate() {
                         let mut probe=Settings::default();
                         probe.mode="system".into();
-                        probe.active_source=source;
                         let mut sub=next.subscriptions[index].clone();sub.servers=vec![node.clone()];
                         probe.subscriptions=vec![sub];
                         if self.core.validate(&probe).is_ok() {accepted.push(node);}
@@ -169,19 +177,30 @@ impl App {
                     });
                     if !next.servers().iter().any(|s|s["name"]==next.selected) && !["AUTO","FAILOVER"].contains(&next.selected.as_str()) {next.selected="AUTO".into();}
                     validation=next.clone();
-                    if validation.active_source!=source {validation.switch_source(source);}
-                    self.core.validate(&validation)?;
+                        self.core.validate(&validation)?;
                 }
                 if let Some(sub)=next.subscriptions.iter_mut().find(|s|s.id==id) {
                     if let Some(details)=sub.error.take() {sub.error=Some(format!("Импортировано: {}. Пропущено: {skipped}. {details}",sub.servers.len()));}
                 }
-                if let Some(entry) = entry { entry.set_password(&url).map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?; }
-                self.save(next)?;
+                if let Some(entry) = entry {
+                    // Never overwrite an existing credential with an add request.
+                    match entry.get_password() {
+                        Err(keyring::Error::NoEntry) => {},
+                        Ok(_) => return Err("Идентификатор секрета уже занят".into()),
+                        Err(_) => return Err("Не удалось проверить хранилище Windows".into()),
+                    }
+                    self.store.prepare_credential(&id)?;
+                    entry.set_password(&url).map_err(|_| "Не удалось сохранить ссылку в хранилище Windows")?;
+                }
+                if let Err(error) = self.save(next) {
+                    let cleanup = self.store.reconcile_credentials(delete_source_credential);
+                    return Err(match cleanup { Ok(()) => error, Err(cleanup) => format!("{error}; {cleanup}") });
+                }
                 self.log("INFO", "Подписка обновлена и проверена Mihomo");
         Ok(())
     }
     fn save(&mut self, mut next: Settings) -> Result<(), String> {
-        if next.active_source!=self.settings.active_source {return Err("Используйте переключатель источника подписок".into());}
+        model::repository::normalize(&mut next);
         next.reconcile_selection();
         next.mode = "tun".into();
         if next.rules_semantics_version < self.settings.rules_semantics_version {
@@ -247,7 +266,8 @@ impl App {
         Ok(())
     }
     fn connect(&mut self) -> Result<(), String> {
-        if self.settings.servers().is_empty() {return Err("Нет серверов в активном источнике. Добавьте подписку.".into());}
+        if !self.baseline_ready {return Err("Atlas ещё восстанавливает сетевое состояние".into());}
+        if self.settings.servers().is_empty() {return Err("Нет серверов. Добавьте подписку.".into());}
         if self.status == "CleanupError" {
             if self.core.running() {
                 incident_history::record("recovery_reattached", json!({"previousState":self.status,
@@ -287,18 +307,27 @@ impl App {
             return Err("Подключение отменено".into());
         }
         self.settings.mode = "tun".into();
+        // Commit durable connection intent before attempting the tunnel.
+        self.settings.was_connected = true;
+        self.settings.user_disconnected = false;
+        if let Err(error) = self.store.save_runtime(&self.settings) {
+            self.core.continue_running = None;
+            self.status = "Error".into();
+            self.error = Some(error.clone());
+            return Err(error);
+        }
         let result = windows::restore(&self.core.directory.join("proxy-restore.json"))
             .and_then(|_| self.core.start(&self.settings));
         if result.is_ok() { _connecting.complete(); } else { drop(_connecting); }
         match result {
             Ok(()) => {
                 if !self.reconnect.load(std::sync::atomic::Ordering::SeqCst) {
-                    self.disconnect()?;
+                    self.stop_session(false)?;
                     return Err("Подключение отменено".into());
                 }
                 self.settings.was_connected = true;
-                if let Err(e) = self.store.save(&self.settings) {
-                    self.settings.was_connected = false;
+                self.settings.user_disconnected = false;
+                if let Err(e) = self.store.save_runtime(&self.settings) {
                     let directory = self.core.directory.clone();
                     let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
                     let cleanup_failed = cleanup.is_err();
@@ -369,6 +398,13 @@ impl App {
         }
     }
     fn disconnect(&mut self) -> Result<(), String> {
+        self.stop_session(true)
+    }
+    fn stop_session(&mut self, explicit: bool) -> Result<(), String> {
+        let intent_error=if explicit {
+            self.settings.was_connected=false;self.settings.user_disconnected=true;
+            self.store.save_runtime(&self.settings).err()
+        } else {None};
         self.revision = self.revision.wrapping_add(1);
         self.status = "Stopping".into();
         self.reconnect
@@ -378,13 +414,13 @@ impl App {
         let cleanup = cleanup_network_session(Some(&mut self.core), &directory, false);
         self.core.continue_running = None;
         if let Err(error) = cleanup {
+            let error=match intent_error {Some(persist)=>format!("{error}; не удалось сохранить отключение: {persist}"),None=>error};
             self.status = "CleanupError".into();
             self.error = Some(error.clone());
             self.log("ERROR", &error);
             return Err(error);
         }
-        self.settings.was_connected = false;
-        if let Err(error) = self.store.save(&self.settings) {
+        if let Err(error) = self.store.save_runtime(&self.settings) {
             self.status = "Disconnected".into();
             self.error = Some(format!("Сеть восстановлена, но не удалось сохранить отключённое состояние: {error}"));
             return Err(self.error.clone().unwrap());
@@ -397,8 +433,12 @@ impl App {
         );
         Ok(())
     }
+    fn persist_visibility(&mut self,hidden:bool)->Result<(),String> {
+        self.settings.last_window_hidden=hidden;
+        self.store.save_visibility(hidden)
+    }
     fn prepare_restart(&mut self) -> Result<(), String> {
-        self.disconnect()?;
+        self.stop_session(false)?;
         self.log(
             "INFO",
             "Приложение перезапускается; сетевые настройки восстановлены",
@@ -498,41 +538,43 @@ impl App {
                 next.rules_semantics_version = 2;
                 self.save(next)?;
             }
+            "select" => {
+                let reference=p["nodeId"].as_str().or_else(||p["name"].as_str()).ok_or("Не выбран сервер")?;
+                let mut next=self.settings.clone();next.select_node(reference)?;self.save(next)?;
+            }
+            "favorite" => {
+                let id=p["nodeId"].as_str().ok_or("Нет nodeId")?;
+                let enabled=p["enabled"].as_bool().ok_or("Нет состояния избранного")?;
+                self.save(settings_write::favorite(&self.settings,id,enabled)?)?;
+            }
             "connect" => self.connect()?,
             "disconnect" => self.disconnect()?,
-            "subscription_source" => {
-                let source: SubscriptionSource=serde_json::from_value(p["source"].clone()).map_err(|_|"Неизвестный источник подписок")?;
-                if source!=self.settings.active_source {
-                    incident_history::record("source_switch_started",json!({"previousSource":self.settings.active_source,"requestedSource":source,"state":self.status}),&[]);
-                    let restored=self.disconnect();
-                    incident_history::record("source_switch_network_restored",json!({"requestedSource":source,"success":restored.is_ok(),"state":self.status}),&[]);
-                    restored?;
-                    let mut next=self.settings.clone();
-                    next.switch_source(source);
-                    self.store.save(&next)?;
-                    self.settings=next;
-                    self.revision=self.revision.wrapping_add(1);
-                    self.error=None;
-                    self.control_error=None;
-                    incident_history::record("source_switch_completed",json!({"activeSource":source,"state":self.status,"connected":false}),&[]);
-                }
-            }
             "save" => {
-                let mut next: Settings =
-                    serde_json::from_value(p).map_err(|_| "Некорректные настройки")?;
-                next.subscriptions = self.settings.subscriptions.clone();
-                if next.active_source!=self.settings.active_source {return Err("Источник изменился. Обновите настройки.".into());}
-                next.source_selections=self.settings.source_selections.clone();
+                let write: settings_write::Write = serde_json::from_value(p).map_err(|_| "Некорректные настройки или revision")?;
+                let next = write.apply(&self.settings, self.revision)?;
                 let enabled = next.startup.launch_with_windows;
                 let previous = self.settings.startup.launch_with_windows;
                 self.save(next)?;
-                let result = startup::configure(enabled,true);
+                let result = startup::configure(enabled,enabled!=previous);
+                self.startup_status = startup::status(enabled);
                 if let Err(e) = result {
                     let mut back = self.settings.clone();
                     back.startup.launch_with_windows = previous;
                     self.save(back)?;
+                    self.startup_status = startup::status(previous);
+                    self.startup_status["error"] = json!(e);
                     return Err(format!("Автозапуск Windows: {e}"));
                 }
+            }
+            "subscription_rename" => {
+                let id=p["id"].as_str().ok_or("Нет ID")?;
+                let name=p["name"].as_str().ok_or("Нет названия")?.trim();
+                if name.is_empty() || name.chars().count()>128 || name.chars().any(char::is_control) {
+                    return Err("Название должно содержать от 1 до 128 символов без управляющих знаков".into());
+                }
+                let mut next=self.settings.clone();
+                next.subscriptions.iter_mut().find(|s|s.id==id).ok_or("Источник не найден")?.name=name.into();
+                self.save(next)?;
             }
             "subscription_user_agent" => {
                 let id = p["id"].as_str().ok_or("Не выбрана подписка")?;
@@ -545,6 +587,7 @@ impl App {
                 // Download metadata does not alter the active network configuration.
                 self.store.save(&next)?;
                 self.settings = next;
+                self.revision = self.revision.wrapping_add(1);
             }
             "subscription_delete" => {
                 let id = p["id"].as_str().ok_or("Нет ID")?;
@@ -553,9 +596,9 @@ impl App {
                 }
                 let mut next = self.settings.clone();
                 next.subscriptions.retain(|s| s.id != id);
-                next.reconcile_selection();
+                model::repository::reconcile_references(&self.settings,&mut next);
                 self.save(next)?;
-                let _ = keyring::Entry::new("AtlasVPN", id).and_then(|e| e.delete_credential());
+                self.store.reconcile_credentials(delete_source_credential)?;
             }
             "import_preview" => {
                 return serde_json::to_value(rules::import(p["text"].as_str().ok_or("Нет YAML")?)?)
@@ -571,8 +614,18 @@ impl App {
                 self.save(next)?;
             }
             "rollback" => {
-                let s = self.store.previous()?;
-                self.save(s)?;
+                let mut s = self.store.previous()?;
+                settings_write::require_credentials(&s, |id| keyring::Entry::new("AtlasVPN",id).and_then(|entry|entry.get_password()).is_ok())?;
+                s.was_connected=self.settings.was_connected;
+                s.user_disconnected=self.settings.user_disconnected;
+                s.last_window_hidden=self.settings.last_window_hidden;
+                let enabled=s.startup.launch_with_windows;
+                let previous=self.settings.startup.launch_with_windows;
+                startup::configure(enabled,false)?;
+                if let Err(error)=self.save(s) {
+                    startup::configure(previous,false).map_err(|rollback|format!("{error}; автозапуск не восстановлен: {rollback}"))?;
+                    return Err(error);
+                }
                 self.log("INFO", "Настройки восстановлены из резервной копии");
             }
             "connections" => return self.core.api("GET", "/connections", None),
@@ -610,6 +663,8 @@ impl App {
                 let mut s = self.settings.clone();
                 s.subscriptions.clear();
                 s.selected = "AUTO".into();
+                s.selected_node_id = "AUTO".into();
+                s.favorites.clear();
                 s.was_connected = false;
                 return Ok(
                     json!({"version":1,"settings":s,"note":"Subscription URLs and server credentials excluded"}),
@@ -621,7 +676,14 @@ impl App {
     }
 }
 type Shared = Arc<Mutex<App>>;
+fn delete_source_credential(id: &str) -> Result<(), String> {
+    match keyring::Entry::new("AtlasVPN", id).and_then(|entry| entry.delete_credential()) {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Не удалось очистить секрет источника".into()),
+    }
+}
 struct ConnectionIntent(Arc<std::sync::atomic::AtomicBool>);
+struct ManualRestart(std::sync::atomic::AtomicBool);
 type ShuttingDown = Arc<std::sync::atomic::AtomicBool>;
 pub fn cleanup() -> Result<(), String> {
     let dir = std::path::PathBuf::from(
@@ -728,6 +790,11 @@ async fn request_inner(
     if update_health::pending() && !matches!(action.as_str(),"snapshot"|"frontend_diagnostic"|"quit") {return Err("Atlas проверяет обновление; изменения доступны после завершения проверки".into());}
     let shared = state.inner().clone();
     if action=="update_install" {
+        app.state::<StartupState>().lock().unwrap_or_else(|e|e.into_inner()).cancel();
+        let visibility=app.state::<WindowVisibility>().0.clone();let state=shared.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            state.lock().map_err(|_|"Состояние Atlas недоступно")?.persist_visibility(visibility.load(std::sync::atomic::Ordering::SeqCst))
+        }).await.map_err(|e|e.to_string())??;
         let payload=payload.unwrap_or(Value::Null);
         update_frontend::start(app,payload["version"].as_str().ok_or("Не указана версия обновления")?)?;
         return Ok(json!({"started":true}));
@@ -779,6 +846,7 @@ async fn request_inner(
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "connect" || action == "disconnect" {
+        app.state::<StartupState>().lock().unwrap_or_else(|e|e.into_inner()).cancel();
         app.state::<ConnectionIntent>()
             .0
             .store(action == "connect", std::sync::atomic::Ordering::SeqCst);
@@ -1032,6 +1100,7 @@ async fn request_inner(
             let url = if adding { p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned() }
                 else { entry.get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")? };
             if source==SubscriptionSource::Url {subscription_options::https_url(&url)?;}
+            else if !url.trim().starts_with("vless://") {return Err("Введите один VLESS-ключ".into());}
             // Download never owns the mutation lock: Quit must not wait for HTTPS.
             let options=captured.settings.subscriptions.iter().find(|s|s.id==id)
                 .map(|s|s.options.clone()).unwrap_or_default();
@@ -1050,7 +1119,7 @@ async fn request_inner(
                 Err(error) => {
                     if let Some(sub) = a.settings.subscriptions.iter_mut().find(|s|s.id == id) { sub.error=Some(error.clone()); }
                     let settings = a.settings.clone();
-                    a.store.save(&settings)?;
+                    a.store.save_source_status(&settings)?;
                     a.snapshot();
                     return Err(error);
                 }
@@ -1058,13 +1127,11 @@ async fn request_inner(
             Ok(a.snapshot())
         }).await.map_err(|e|e.to_string())?;
     }
-    let settings_change = if action == "subscription_source" {
-        serde_json::from_value::<SubscriptionSource>(payload.as_ref().unwrap_or(&Value::Null)["source"].clone()).map_err(|_|"Неизвестный источник подписок")?;
-        Some(app.state::<cancellation::Cancellation>().settings_change())
-    } else if action == "save" {
-        // Reject malformed requests before yielding a connection attempt.
-        serde_json::from_value::<Settings>(payload.clone().unwrap_or(Value::Null))
+    let settings_change = if action == "save" {
+        // Reject malformed/stale requests before yielding a connection attempt.
+        let write=serde_json::from_value::<settings_write::Write>(payload.clone().unwrap_or(Value::Null))
             .map_err(|_| "Некорректные настройки")?;
+        write.validate_revision(app.state::<published_state::ReadState>().get()?.revision)?;
         Some(app.state::<cancellation::Cancellation>().settings_change())
     } else { None };
     tauri::async_runtime::spawn_blocking(move || {
@@ -1092,53 +1159,48 @@ async fn request_inner(
     .await
     .map_err(|e| e.to_string())?
 }
+fn persist_window_hidden(app:&tauri::AppHandle,hidden:bool) {
+    let visibility=app.state::<WindowVisibility>().0.clone();
+    visibility.store(hidden,std::sync::atomic::Ordering::SeqCst);
+    let shared=app.state::<Shared>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(mut a)=shared.lock() {
+            a.settings.last_window_hidden=visibility.load(std::sync::atomic::Ordering::SeqCst);
+            let settings=a.settings.clone();let _=a.store.save_runtime(&settings);
+        }
+    });
+}
+fn show_main(app:&tauri::AppHandle) {
+    if let Some(w)=app.get_webview_window("main") {
+        let _=w.show();let _=w.unminimize();let _=w.set_focus();
+        if app.try_state::<Shared>().is_some() {persist_window_hidden(app,false);}
+    }
+}
 pub fn run() {
     tauri::Builder::default()
+        .manage(ManualRestart(std::sync::atomic::AtomicBool::new(false)))
         .runtime(tauri_runtime_cef::Cef::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if startup_coordinator::LaunchReason::from_args(&args)==startup_coordinator::LaunchReason::ManualLaunch {
+                show_main(app);
             }
         }))
-        .plugin(
-            tauri_plugin_autostart::Builder::new()
-                .app_name("Atlas")
-                .args(["--autostart"])
-                .build(),
-        )
         .setup(|app| {
             let _startup_update_guard=if update_health::challenge().is_none(){Some(update_lock::UpdateLock::admit_session().map_err(std::io::Error::other)?)}else{None};
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            // A previous UI may have crashed while its on-demand service was
-            // still alive. Finish that Atlas-owned session before enabling a
-            // new connection. A cleanup error must not abort Tauri setup and
-            // leave a blank window; publish it as recoverable application state.
-            let startup_cleanup = (|| -> Result<(),String> {
-                if update_health::challenge().is_some() {
-                    // The supervisor already quiesced the previous session and
-                    // started the candidate service. Health must inspect that
-                    // service, not stop it as a stale desktop session.
-                    return network_guard::wait_for_clean_baseline(std::time::Duration::from_secs(3));
-                }
-                let _ = network_guard::tun_identity();
-                if service::is_running() { service::stop_and_wait()?; }
-                windows::restore(&dir.join("proxy-restore.json"))?;
-                network_guard::wait_for_tun_release(std::time::Duration::from_secs(3))?;
-                network_guard::clear_routes_for_reusable_tun()?;
-                let _ = std::fs::remove_file(dir.join("tun-guard.active"));
-                Ok(())
-            })();
-            let store =
+            let mut store =
                 storage::Store::open(&dir.join("atlas.db")).map_err(std::io::Error::other)?;
+            let credential_error = store.reconcile_credentials(delete_source_credential).err();
             let mut settings = store.load().map_err(std::io::Error::other)?;
             settings.mode = "tun".into();
+            let mut startup_error = None;
             // Repair stale startup registration to match the saved user preference.
             if update_health::challenge().is_none() {
                 if let Err(error)=startup::configure(settings.startup.launch_with_windows,false) {
                     eprintln!("Atlas startup registration failed: {error}");
+                    startup_error = Some(format!("Автозапуск Windows: {error}"));
                 }
                 if !settings.startup.launch_with_windows && std::env::args().any(|arg| arg == "--autostart") {
                     app.handle().exit(0);
@@ -1150,16 +1212,19 @@ pub fn run() {
             incident_history::load(&history_path);
             incident_history::record("application_start", json!({"version":env!("CARGO_PKG_VERSION"),"buildId":env!("ATLAS_BUILD_ID")}), &[]);
             let core = core::Core::new(binary, dir.clone());
-            // A stale service or marker is crash residue, never permission to
-            // resume VPN traffic. Only the explicit user preference can start it.
-            let auto = update_health::challenge().is_none() && settings.startup.auto_connect && startup_cleanup.is_ok();
-            let delay = settings.startup.delay_seconds.min(300);
-            if settings.startup.start_in_tray {
-                if let Some(w) = app.get_webview_window("main") {
-                    w.hide()?
-                }
-            }
-            let intent = Arc::new(std::sync::atomic::AtomicBool::new(auto));
+            let mut startup_status = startup::status(settings.startup.launch_with_windows);
+            if let Some(error) = startup_error { startup_status["error"]=json!(error); }
+            let reason=startup_coordinator::LaunchReason::from_args(&std::env::args().collect::<Vec<_>>());
+            let coordinator=startup_coordinator::StartupCoordinator::new(reason,&settings.startup,
+                settings.was_connected,settings.user_disconnected,settings.last_window_hidden);
+            let show_initial=coordinator.should_show_window();
+            // Durable restore intent survives startup, visibility and failures.
+            // Only an explicit Disconnect clears it.
+            settings.last_window_hidden = !show_initial;
+            app.manage(WindowVisibility(Arc::new(std::sync::atomic::AtomicBool::new(!show_initial))));
+            let coordinator:StartupState=Arc::new(Mutex::new(coordinator));
+            app.manage(coordinator.clone());
+            let intent = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.manage(ConnectionIntent(intent.clone()));
             let published = published_state::PublishedState::default();
             app.manage(published.clone());
@@ -1169,11 +1234,8 @@ pub fn run() {
             app.manage(diagnostic_access.clone());
             let cancellation = cancellation::Cancellation::default();
             app.manage(cancellation.clone());
-            let startup_error = startup_cleanup.err().map(|error| format!("Предыдущая сессия Atlas не завершила очистку сети: {error}"));
-            if let Some(error)=&startup_error {
-                incident_history::record("startup_cleanup_failed",json!({"error":error,"tun":network_guard::tun_diagnostic()}),&[]);
-            }
             let shared = Arc::new(Mutex::new(App {
+                baseline_ready: false,
                 revision: 0,
                 published,
                 reads,
@@ -1182,9 +1244,10 @@ pub fn run() {
                 settings,
                 store,
                 core,
-                status: if startup_error.is_some() { "CleanupError" } else { "Disconnected" }.into(),
-                error: startup_error,
-                control_error: None,
+                status: "Initializing".into(),
+                error: None,
+                control_error: credential_error,
+                startup_status,
                 logs: vec![],
                 reconnect: intent.clone(),
             }));
@@ -1253,22 +1316,28 @@ pub fn run() {
                 Menu::with_items(app, &[&show, &connect, &disconnect, &restart, &quit])?;
             let tray_icon = app.default_window_icon()
                 .ok_or("В сборке отсутствует иконка Atlas")?.clone();
-            tauri::tray::TrayIconBuilder::new()
+            tauri::tray::TrayIconBuilder::with_id("atlas")
                 .icon(tray_icon)
                 .tooltip("Atlas VPN")
                 .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray,event| {
+                    if matches!(event,tauri::tray::TrayIconEvent::Click {button:tauri::tray::MouseButton::Left,button_state:tauri::tray::MouseButtonState::Up,..}) {
+                        show_main(tray.app_handle());
+                    }
+                })
                 .on_menu_event(|app, event| {
                     if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { return; }
                     let id = event.id.as_ref();
                     if update_health::pending() && !matches!(id,"show"|"quit") {return;}
                     if id == "show" {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
+                        show_main(app);
                     } else {
                         let handle = app.clone();
                         let action = id.to_owned();
+                        if matches!(action.as_str(),"connect"|"disconnect"|"restart"|"quit") {
+                            app.state::<StartupState>().lock().unwrap_or_else(|e|e.into_inner()).cancel();
+                        }
                         if action == "connect" || action == "disconnect" {
                             app.state::<ConnectionIntent>().0.store(action == "connect", std::sync::atomic::Ordering::SeqCst);
                         }
@@ -1299,7 +1368,8 @@ pub fn run() {
                                 let result = handle.state::<Shared>().lock()
                                     .map_err(|_| "Состояние Atlas недоступно".to_owned())
                                     .and_then(|mut state| {
-                                        let outcome = state.disconnect();
+                                        let saved=state.persist_visibility(handle.state::<WindowVisibility>().0.load(std::sync::atomic::Ordering::SeqCst));
+                                        let outcome = state.stop_session(false).and(saved);
                                         state.snapshot();
                                         outcome
                                     });
@@ -1325,9 +1395,12 @@ pub fn run() {
                                 // Work queued before Quit must not reopen the VPN.
                                 if handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { return; }
                                 if action == "restart" {
-                                    if a.prepare_restart().is_ok() {
+                                    let saved=a.persist_visibility(handle.state::<WindowVisibility>().0.load(std::sync::atomic::Ordering::SeqCst));
+                                    if saved.and_then(|_|a.prepare_restart()).is_ok() {
                                         drop(a);
-                                        handle.restart()
+                                        handle.state::<ShuttingDown>().store(true,std::sync::atomic::Ordering::SeqCst);
+                                        handle.state::<ManualRestart>().0.store(true,std::sync::atomic::Ordering::SeqCst);
+                                        handle.exit(0)
                                     }
                                 } else {
                                     let _ = a.dispatch(&handle, &action, Value::Null);
@@ -1338,18 +1411,77 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            persist_window_hidden(app.handle(),!show_initial);
+            if show_initial {show_main(app.handle());}
+            // Cleanup runs away from the window thread. No connect path is ready
+            // until the baseline has completed (including the updater challenge).
+            {
+                let shared=shared.clone();let dir=dir.clone();let shutdown=shutdown.clone();
+                std::thread::spawn(move || {
+                    let Ok(mut a)=shared.lock() else {return;};
+                    if shutdown.load(std::sync::atomic::Ordering::SeqCst) {return;}
+            let startup_cleanup = (|| -> Result<(),String> {
+                if update_health::challenge().is_some() {
+                    // The supervisor already quiesced the previous session and
+                    // started the candidate service. Health must inspect that
+                    // service, not stop it as a stale desktop session.
+                    return network_guard::wait_for_clean_baseline(std::time::Duration::from_secs(3));
+                }
+                let _ = network_guard::tun_identity();
+                if service::is_running() { service::stop_and_wait()?; }
+                windows::restore(&dir.join("proxy-restore.json"))?;
+                network_guard::wait_for_tun_release(std::time::Duration::from_secs(3))?;
+                network_guard::clear_routes_for_reusable_tun()?;
+                let _ = std::fs::remove_file(dir.join("tun-guard.active"));
+                Ok(())
+            })();
+                    {
+                        a.baseline_ready=true;
+                        match startup_cleanup {
+                            Ok(())=>{a.status="Disconnected".into();a.error=None;},
+                            Err(error)=>{a.status="CleanupError".into();a.error=Some(error);}
+                        }
+                        a.snapshot();
+                    }
+                });
+            }
+            {
+                let shared=shared.clone();let shutdown=shutdown.clone();let intent=intent.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if shutdown.load(std::sync::atomic::Ordering::SeqCst)
+                            || coordinator.lock().unwrap_or_else(|e|e.into_inner()).is_finished() {break;}
+                        let shared=shared.clone();let coordinator=coordinator.clone();let intent=intent.clone();let shutdown=shutdown.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            let Ok(mut a)=shared.try_lock() else {return;};
+                            let ready=a.baseline_ready && a.status=="Disconnected" && !a.settings.servers().is_empty()
+                                && !a.cancellation.settings_pending() && !update_health::pending()
+                                && !shutdown.load(std::sync::atomic::Ordering::SeqCst);
+                            // Keep coordinator locked until intent is committed; a
+                            // manual action cancels policy before changing intent.
+                            let mut policy=coordinator.lock().unwrap_or_else(|e|e.into_inner());
+                            let due=policy.poll(std::time::Instant::now(),ready,&a.settings.startup);
+                            if due {intent.store(true,std::sync::atomic::Ordering::SeqCst);}
+                            drop(policy);
+                            if due {let _=a.connect();a.snapshot();}
+                        }).await.ok();
+                    }
+                });
+            }
             let refresh_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
             subscription_refresh::start(shared.clone(), app.state::<published_state::ReadState>().inner().clone(), shutdown.clone(), refresh_done.clone());
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                let mut startup_at = auto.then(|| std::time::Instant::now() + std::time::Duration::from_secs(delay));
                 let mut reconnect_retry = connection_retry::ConnectionRetry::default();
                 let mut cleanup_retry = connection_retry::ConnectionRetry::default();
+                let mut uplink = network_change::Monitor::default();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if shutdown.load(std::sync::atomic::Ordering::SeqCst)
                         || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
                     if update_health::pending() {continue;}
+                    let network_changed = uplink.tick();
                     // Query the service without holding the mutation lock. A
                     // result from an earlier revision cannot affect a new session.
                     let observed=handle.state::<published_state::ReadState>().get().ok()
@@ -1368,12 +1500,6 @@ pub fn run() {
                             }
                         }
                     });
-                    if !a.cancellation.settings_pending() && refresh_done.load(std::sync::atomic::Ordering::SeqCst) && startup_at.is_some_and(|at| std::time::Instant::now() >= at) {
-                        startup_at = None;
-                        if intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Disconnected" {
-                            let _ = a.connect();
-                        }
-                    }
                     if !intent.load(std::sync::atomic::Ordering::SeqCst) && a.status == "Connected" {
                         let _ = a.disconnect();
                         a.snapshot();
@@ -1404,15 +1530,27 @@ pub fn run() {
                         reconnect_retry.reset();
                     }
                     let wants_connection = intent.load(std::sync::atomic::Ordering::SeqCst);
+                    if network_changed {
+                        reconnect_retry.network_changed(wants_connection);
+                        incident_history::record("desktop_network_epoch", json!({"desiredConnected":wants_connection}), &[]);
+                    }
+                    if wants_connection && matches!(a.status.as_str(), "Error" | "Disconnected" | "WaitingForNetwork") {
+                        if uplink.online() == Some(false) {
+                            a.status = "WaitingForNetwork".into();
+                        } else if a.status == "WaitingForNetwork" && uplink.online() == Some(true) {
+                            a.status = "Error".into();
+                        }
+                    }
+                    uplink.update_warning(&mut a.control_error);
                     if !wants_connection && a.status == "CleanupError"
                         && cleanup_retry.due(std::time::Instant::now(), true, true) {
-                        match a.disconnect() {
+                        match a.stop_session(false) {
                             Ok(()) => cleanup_retry.reset(),
                             Err(_) => cleanup_retry.failed(std::time::Instant::now()),
                         }
                     }
-                    if !a.cancellation.settings_pending()
-                        && reconnect_retry.due(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
+                    if !a.cancellation.settings_pending() && uplink.online() != Some(false)
+                        && reconnect_retry.due_connection(std::time::Instant::now(), wants_connection, matches!(a.status.as_str(), "Error" | "CleanupError")) {
                         a.log("WARN", "Служба Atlas недоступна; выполняется повторное подключение с ограниченной задержкой");
                         match a.connect() {
                             Ok(()) => reconnect_retry.reset(),
@@ -1424,6 +1562,7 @@ pub fn run() {
                         }
                     }
                     a.snapshot();
+                    if let Some(tray)=handle.tray_by_id("atlas") {let _=tray.set_tooltip(Some(format!("Atlas — {}",a.status)));}
                 }
             });
             Ok(())
@@ -1433,6 +1572,7 @@ pub fn run() {
                 if !window.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
                     api.prevent_close();
                     let _ = window.hide();
+                    persist_window_hidden(window.app_handle(),true);
                 }
             }
         })
@@ -1442,8 +1582,17 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![request,update_health_ready])
-        .run(tauri::generate_context!())
-        .expect("Atlas failed to initialize");
+        .build(tauri::generate_context!())
+        .expect("Atlas failed to initialize")
+        .run(|handle,event| {
+            if matches!(event,tauri::RunEvent::Exit) && handle.state::<ManualRestart>().0.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut environment=handle.env();
+                environment.args_os=startup_coordinator::manual_restart_args(environment.args_os[0].clone());
+                // Same plugin/runtime cleanup as Tauri restart, with fresh arguments.
+                handle.cleanup_before_exit();
+                tauri::process::restart(&environment);
+            }
+        });
 }
 
 pub fn network_service() -> Result<(), String> {
@@ -1453,6 +1602,11 @@ pub fn network_service() -> Result<(), String> {
 #[tauri::command]
 async fn update_health_ready(state:tauri::State<'_,Arc<Mutex<App>>>)->Result<(),String> {
     let (transaction_id,nonce)=update_health::challenge().ok_or("No updater health challenge")?;
+    for _ in 0..200 {
+        let initializing=state.lock().map_err(|_|"Application state unavailable")?.status=="Initializing";
+        if !initializing {break;}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     {
         let app=state.lock().map_err(|_|"Application state unavailable")?;
         if app.status!="Disconnected" || app.error.is_some() {return Err("Candidate startup baseline is not clean".into());}

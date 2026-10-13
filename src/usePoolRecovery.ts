@@ -1,4 +1,4 @@
-import { activeSubscriptions } from "./subscriptionSource";
+import { allSubscriptions } from "./subscriptionSource";
 import { useEffect, useRef, useState } from "react";
 import { request } from "./api";
 import type { Snapshot } from "./types";
@@ -6,7 +6,7 @@ import type { Snapshot } from "./types";
 export type PoolHealth = { phase: "idle" | "checking" | "refreshing" | "healthy" | "degraded" | "all_timeout" | "local_error"; text: string; checkedAt: number };
 type Proxy = { now?: string; testUrl?: string; alive?: boolean; history?: { delay: number; time?: string }[]; extra?: Record<string, Proxy> };
 const PRIMARY = "http://cp.cloudflare.com/generate_204";
-const SECONDARY = "https://www.cloudflare.com/cdn-cgi/trace";
+const SECONDARY = "https://www.google.com/generate_204";
 export function observedHealth(names: string[], proxies: Record<string, Proxy>, maxAgeMs: number, now = Date.now()): PoolHealth {
   let selected = "ATLAS";
   const seen = new Set<string>();
@@ -52,7 +52,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
       const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");
       if (!valid(revision)) return;
       const settings = latest.current!.settings;
-      publish(observedHealth(activeSubscriptions(settings).flatMap(sub => sub.servers.map(server => server.name)), proxies,
+      publish(observedHealth(allSubscriptions(settings).flatMap(sub => sub.servers.map(server => server.name)), proxies,
         Math.max(30000, (settings.autoTestIntervalSeconds ?? 300) * 2000)));
     };
     const check = async (force = false) => {
@@ -62,7 +62,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
       if (!initial?.running) { pending = false; return; }
       let revision = initial.revision;
       try {
-        const names = activeSubscriptions(initial.settings).flatMap(sub => sub.servers.map(server => server.name));
+        const names = allSubscriptions(initial.settings).flatMap(sub => sub.servers.map(server => server.name));
         if (!names.length) return;
         if (!force) {
           const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");

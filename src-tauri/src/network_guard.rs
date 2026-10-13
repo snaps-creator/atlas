@@ -327,6 +327,8 @@ fn diagnostic_probe(probe: &TunProbe, owned: Option<u64>) -> serde_json::Value {
         "verifiedWintunDriver": probe.verified_wintun,
         "driverEvidence": probe.driver_observed,
         "ownershipRecorded": probe.alias_luid.is_some_and(owns_current_tun),
+        "liveOwnershipConfirmed": owned.is_some() && owned == probe.alias_luid,
+        "classificationMeaning": "Marker ownership is historical evidence; Unknown requires live session ownership confirmation and does not mean a routing failure",
         "state": classify_tun(probe, owned),
         "adapterName": "Atlas-TUN",
         "routeCount": probe.route_count,

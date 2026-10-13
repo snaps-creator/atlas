@@ -1,8 +1,16 @@
 # Atlas
 
+## Скачать Atlas для Windows
+
+**[Скачать последнюю опубликованную версию — GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest)**
+
+Windows 10/11 x64. В Assets выберите полный EXE-установщик: он включает приложение, сетевую службу, Mihomo, Xray и CEF; отдельно загружать ядра не нужно.
+
+Исходники в этой ветке — **2.5.1**, релиз ещё не опубликован. После проверки и отдельного разрешения файл `Atlas-Setup-2.5.1.exe` появится в Releases. Кнопка выше открывает фактически опубликованную версию. `Source code (zip)` предназначен для разработки.
+
 **Atlas** — VPN-клиент для Windows с быстрым выбором сервера, гибкими правилами маршрутизации и понятной диагностикой соединения. Добавьте подписку, подключитесь и управляйте трафиком из одного приложения: вручную, автоматически или по правилам для конкретных сайтов и программ.
 
-Текущая версия исходников — **2.4.2**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
+Текущая версия исходников — **2.5.1**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
@@ -23,7 +31,7 @@
 
 ## Установка
 
-Нужна **Windows 10/11 x64**. Скачайте установщик нужной версии из [выпусков](https://github.com/snaps-creator/atlas/releases). Для 2.4.2 используется транзакционный EXE из сборки этой версии. Комплект `Install Atlas.exe` в ZIP исходников — историческая офлайн-сборка, а не автоматически пересобранный 2.4.2.
+Скачайте полный EXE из [GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest), запустите мастер и выберите папку установки. Обновление сохраняет источники, избранное, выбранный сервер и настройки запуска. Установка выполняет переключение версии и может прервать действующее VPN-соединение. Установщик и его части не хранятся в Git или Git LFS.
 
 Windows может показать «Неизвестный издатель»: у установщика пока нет сертификата Authenticode. Подпись обновления Atlas и подпись издателя Windows — разные вещи. Детали установки и проверки файлов — в [INSTALLER.md](INSTALLER.md).
 

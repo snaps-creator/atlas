@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance)
+param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$Maintenance, [switch]$VerifySettings)
 $ErrorActionPreference = 'Stop'
 function Write-InterruptedRecoveryFixture([string]$Root, $Journal) {
     $Journal.stage = 'HealthPending'
@@ -22,6 +22,26 @@ $previousRoot = Join-Path $root ('versions/' + $previous)
 $candidateRoot = Join-Path $root ('versions/' + $journal.candidate.id)
 $service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
 if ($service.PathName -ne ('"' + (Join-Path $candidateRoot 'Atlas.Service.exe') + '" --network-service')) { throw 'Refusing recovery of a service outside this candidate fixture' }
+# A same-version installer returns after launching the desktop. Its setup holds
+# the production update lease briefly; recovery must begin after that hand-off,
+# not race it with a zero-timeout maintenance request. Never bypass the lease.
+function Wait-RecoveryStartup {
+    $lease = $null
+    try { $lease = [Threading.Mutex]::OpenExisting('Global\Atlas.Update.Transaction.v1') }
+    catch [Threading.WaitHandleCannotBeOpenedException] { } # No remaining owner/handle.
+    if ($lease) {
+        $acquired = $false
+        try {
+            try { $acquired = $lease.WaitOne(30000) }
+            catch [Threading.AbandonedMutexException] { $acquired = $true }
+            if (-not $acquired) { throw 'Installed startup did not release the update lease within 30 seconds' }
+        } finally {
+            if ($acquired) { $lease.ReleaseMutex() }
+            $lease.Dispose()
+        }
+    }
+}
+Wait-RecoveryStartup
 & $Maintenance --prepare-install $candidateRoot
 if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # Inject a persisted interrupted-activation state into this disposable fixture.
@@ -31,6 +51,7 @@ Write-InterruptedRecoveryFixture -Root $root -Journal $journal
 foreach ($attempt in 1..2) {
     if ($attempt -eq 2) {
         # Reproduce an idle service/closed desktop deterministically before retry.
+        Wait-RecoveryStartup
         & $Maintenance --prepare-install $previousRoot
         if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce restored fixture before recovery retry' }
     }
@@ -49,5 +70,9 @@ foreach ($attempt in 1..2) {
     $inspection = & $Maintenance --inspect | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Recovery left an unverified network baseline' }
     if (-not (Test-Path -LiteralPath (Join-Path $previousRoot 'Atlas.exe')) -or -not (Test-Path -LiteralPath (Join-Path $candidateRoot 'Atlas.exe'))) { throw 'Recovery lost a retained version' }
+    if ($VerifySettings) {
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify-rollback
+        if ($LASTEXITCODE -ne 0) { throw "Recovery $attempt changed baseline data before reinstall/uninstall" }
+    }
 }
 Write-Output 'PASS: real installed recovery from persisted HealthPending restores previous service, data/network state and retained versions; repeated recovery succeeds. Physical reboot not tested.'

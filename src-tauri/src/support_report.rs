@@ -225,9 +225,9 @@ pub(crate) fn configuration_evidence(settings: &crate::model::Settings) -> Value
             }
             Value::Object(safe)
         }).collect();
-        serde_json::json!({"name":sub.name,"source":sub.source,"active":sub.source==settings.active_source,"updatedAt":sub.updated_at,"nodes":nodes})
+        serde_json::json!({"name":sub.name,"source":sub.source,"updatedAt":sub.updated_at,"nodes":nodes})
     }).collect();
-    serde_json::json!({"subscriptions":subscriptions,"activeSource":settings.active_source,"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
+    serde_json::json!({"subscriptions":subscriptions,"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
         "compiledRules":crate::rules::compile(settings).ok(),"dns":settings.dns,"tunStack":settings.tun_stack,
         "meaning":"Endpoints and transport settings, not credentials. Matching names do not imply matching endpoints."})
 }

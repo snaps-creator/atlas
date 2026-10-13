@@ -82,17 +82,27 @@ fn stop_owned(root: &Path, desktop: bool) -> Result<(), String> {
         more = unsafe {Process32NextW(snapshot.0, &mut entry)};
     }
     // Signal every owned process before waiting, so N workers don't cost N timeouts.
-    for handle in &handles {
+    let signal_errors: Vec<_> = handles.iter().map(|handle| {
         if unsafe {WaitForSingleObject(handle.0, 0)} != WAIT_OBJECT_0
-            && unsafe {TerminateProcess(handle.0, 0)} == 0
-            && unsafe {WaitForSingleObject(handle.0, 0)} != WAIT_OBJECT_0 {return Err(error("Stop Atlas process"));}
-    }
+            && unsafe {TerminateProcess(handle.0, 0)} == 0 {
+            Some(error("Stop Atlas process"))
+        } else { None }
+    }).collect();
     let deadline = Instant::now() + Duration::from_secs(4);
-    for handle in handles {
+    for (handle, signal_error) in handles.into_iter().zip(signal_errors) {
         let left = deadline.saturating_duration_since(Instant::now()).as_millis() as u32;
-        if unsafe {WaitForSingleObject(handle.0, left)} != WAIT_OBJECT_0 {return Err("Atlas process did not exit".into());}
+        confirm_shutdown(signal_error, || unsafe {WaitForSingleObject(handle.0, left)} == WAIT_OBJECT_0)?;
     }
     Ok(())
+}
+
+fn confirm_shutdown(signal_error: Option<String>, wait_exit: impl FnOnce() -> bool) -> Result<(), String> {
+    // A sibling's exit can terminate a CEF worker before its handle is signalled.
+    // TerminateProcess then returns ACCESS_DENIED. Success still requires the
+    // verified handle to signal within the shared deadline; never ignore a live
+    // process or replace the original Windows error with a later API's error.
+    if wait_exit() { Ok(()) }
+    else { Err(signal_error.unwrap_or_else(|| "Atlas process did not exit".into())) }
 }
 
 fn service(root: &Path) -> Result<Option<Service>, String> {
@@ -199,6 +209,19 @@ pub fn prepare_transaction(roots:&[PathBuf])->Result<(),String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_termination_requires_confirmed_exit_even_when_signal_fails() {
+        let waited=std::cell::Cell::new(false);
+        let result=confirm_shutdown(Some("Stop Atlas process: Windows 5".into()),|| {
+            waited.set(true);
+            true
+        });
+        assert_eq!(result,Ok(()));
+        assert!(waited.get());
+        assert_eq!(confirm_shutdown(Some("Stop Atlas process: Windows 5".into()),||false),
+            Err("Stop Atlas process: Windows 5".into()));
+        assert_eq!(confirm_shutdown(None,||false),Err("Atlas process did not exit".into()));
+    }
     use super::*;
     #[test]
     fn exit_during_image_query_is_not_an_ownership_failure() {

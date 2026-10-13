@@ -84,3 +84,10 @@ incident-history.ndjson
 /artifacts/
 /LOCAL-UPDATE.md
 /scripts/update-local.ps1
+
+# Releases-only distribution; never add an offline installer to Git/LFS.
+/Atlas-Setup-*.exe
+/Atlas-Setup-*.exe.sig
+/Install Atlas.exe
+/installer/
+/temp-*.json

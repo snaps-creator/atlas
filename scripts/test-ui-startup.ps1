@@ -6,6 +6,11 @@ $evidenceRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $evidence = Join-Path $evidenceRoot ('atlas-ui-acceptance-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $evidence | Out-Null
 $report = Join-Path $evidence 'report.json'
+function Write-SmokeFailureEvidence {
+    Write-Output "UI process evidence: $evidence"
+    if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
+    Get-Content -LiteralPath (Join-Path $evidence 'stderr.log') -Tail 40
+}
 $previousMode = $env:ATLAS_UI_PROCESS_SMOKE
 $previousReport = $env:ATLAS_UI_SMOKE_REPORT
 try {
@@ -31,16 +36,31 @@ try {
             Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json |
             Set-Content (Join-Path $evidence 'processes.json')
         if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
+        if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
         Get-Content (Join-Path $evidence 'stderr.log') -Tail 40
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         if ($renderAcknowledged) { throw 'Atlas UI rendered but did not exit within the additional 25-second shutdown deadline' }
         throw 'Atlas UI did not acknowledge rendering/IPC within 25 seconds'
     }
     $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { throw "Isolated Atlas UI exited with failure code $($process.ExitCode)" }
-    if (-not (Test-Path -LiteralPath $report)) { throw 'Atlas created a process but failed to render its interface and acknowledge IPC' }
+    if ($process.ExitCode -ne 0) { Write-SmokeFailureEvidence; throw "Isolated Atlas UI exited with failure code $($process.ExitCode)" }
+    if (-not (Test-Path -LiteralPath $report)) { Write-SmokeFailureEvidence; throw 'Atlas created a process but failed to render its interface and acknowledge IPC' }
     $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
     if (-not $result.rendered -or $result.buttons -lt 5) { throw 'Atlas UI acceptance report is incomplete' }
+    # Historical binaries have no trace. Current candidates must prove one exit
+    # flow and normal CEF return, not merely exit(0) from a duplicate IPC call.
+    $currentVersion = (Get-Content (Join-Path $PSScriptRoot '../package.json') -Raw | ConvertFrom-Json).version
+    if ($result.version -eq $currentVersion -and -not (Test-Path -LiteralPath "$report.lifecycle.log")) {
+        throw 'Current candidate did not record its UI completion lifecycle'
+    }
+    if (Test-Path -LiteralPath "$report.lifecycle.log") {
+        $stages = @(Get-Content -LiteralPath "$report.lifecycle.log")
+        foreach ($stage in @('RenderAcknowledged','ExitRequested','Exit','RunReturned')) {
+            if (@($stages | Where-Object { $_.EndsWith(' '+$stage) }).Count -ne 1) {
+                throw "Isolated UI lifecycle must contain exactly one $stage"
+            }
+        }
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         $remaining = @(Get-CimInstance Win32_Process -Filter "Name='Atlas.exe'" | Where-Object { $_.ExecutablePath -eq $exe })

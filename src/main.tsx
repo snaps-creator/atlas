@@ -1,7 +1,6 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { SubscriptionCard } from "./SubscriptionCard";
-import { SubscriptionSourceSwitch } from "./SubscriptionSourceSwitch";
-import { activeSubscriptions, sourceLabels } from "./subscriptionSource";
+import { allSubscriptions, sourceLabels, validSubscriptionInput, serverSelectionPayload, isServerSelected, isFavorite } from "./subscriptionSource";
 import type { SubscriptionSource } from "./types";
 import { diagnosticEvent } from "./diagnosticEvents";
 import React, { useEffect, useState, useCallback, useRef } from "react";
@@ -13,17 +12,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { startUpdatePolling } from "./updatePolling";
 import {
   Activity,
-  ArrowDown,
-  ArrowUp,
   ArrowUpRight,
   Check,
   ChevronRight,
   Compass,
   Download,
   Globe2,
-  GripVertical,
   LayoutDashboard,
-  ListFilter,
   LoaderCircle,
   Plus,
   Power,
@@ -35,15 +30,13 @@ import {
   SlidersHorizontal,
   Star,
   Stethoscope,
-  Trash2,
   Wifi,
   X,
   FileText,
-  Copy,
 } from "lucide-react";
 import { request, download, bytes, native } from "./api";
-import { RouteSelect, routeName } from "./RuleEditor";
-import type { Snapshot, Settings, Group, Connection } from "./types";
+import { RouteSelect } from "./RuleEditor";
+import type { Snapshot, Settings, Connection } from "./types";
 import "./style.css";
 
 import { RulesPanel } from "./RulesPanel";
@@ -56,7 +49,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, latencyLabel, LatencyEpoch, type Latency } from "./latency";
+import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, LatencyEpoch, type Latency } from "./latency";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
@@ -108,12 +101,11 @@ function App() {
   const [error, setError] = useState("");
   const [pendingOperations, setPendingOperations] = useState(0);
   const busy = pendingOperations > 0;
-  const [switchingSource, setSwitchingSource] = useState(false);
-  const sourceSwitchPending = useRef(false);
   const [reportBusy, setReportBusy] = useState(false);
   const [reportSaved, setReportSaved] = useState(false);
   const [query, setQuery] = useState("");
   const [adding, setAdding] = useState(false);
+  const [source, setSource] = useState<SubscriptionSource>("URL");
   const [url, setUrl] = useState("");
   const [name, setName] = useState("");
   const [latencies, setLatencies] = useState<Record<string, Latency>>({});
@@ -129,11 +121,6 @@ function App() {
     { name: string; ok: boolean | null; detail: string }[]
   >([]);
   const [publicIp, setPublicIp] = useState("");
-  const [importText, setImportText] = useState("");
-  const [preview, setPreview] = useState<{
-    groups: Group[];
-    warnings: string[];
-  } | null>(null);
   const [dnsText, setDnsText] = useState("");
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [logLevel, setLogLevel] = useState("ALL");
@@ -216,7 +203,7 @@ function App() {
         data.settings.routingMode,
         data.settings.tunStack,
         data.settings.selected,
-        data.settings.activeSource,
+        data.settings.selectedNodeId,
         data.settings.dns.servers.join("|"),
         data.settings.groups
           .filter((group) => group.enabled)
@@ -320,7 +307,7 @@ function App() {
     }
   }
   async function save(s: Settings) {
-    await act("save", s);
+    await act("save", { settings: s, revision: data?.revision });
   }
   function run(f: () => Promise<unknown>) {
     void f().catch(() => {});
@@ -346,32 +333,16 @@ function App() {
     }
   }
   const s = data?.settings;
-  const source = s?.activeSource ?? "URL";
-  const subscriptions = activeSubscriptions(s);
+  const subscriptions = allSubscriptions(s);
   const servers = subscriptions.flatMap((v) => v.servers);
-  async function switchSource(next: SubscriptionSource) {
-    if (sourceSwitchPending.current || next === source) return;
-    sourceSwitchPending.current = true;
-    setSwitchingSource(true);
-    try {
-      await act("subscription_source", { source: next });
-      setQuery(""); setOnlyFavorites(false); setConnections([]); setTrafficError("");
-    } finally {
-      sourceSwitchPending.current = false;
-      setSwitchingSource(false);
-      await refresh();
-    }
-  }
-  const sourceSwitch = <SubscriptionSourceSwitch value={source} pending={switchingSource}
-    disabled={!s || adding}
-    onChange={next => run(() => switchSource(next))} />;
   const connected = data?.running ?? false;
   const connecting = data?.status === "Connecting";
+  const initializing = data?.status === "Initializing";
   const protectedPause = data?.status === "ProtectedPause";
   const header = (
-    eyebrow: string,
+    _eyebrow: string,
     title: string,
-    description: string,
+    _description: string,
     action?: React.ReactNode,
   ) => (
     <div className="page-head">
@@ -401,7 +372,7 @@ function App() {
     </div>
   );
   const addButton = (
-    <button className="primary" disabled={busy || switchingSource} onClick={() => setAdding(true)}>
+    <button className="primary" disabled={busy} onClick={() => setAdding(true)}>
       <Plus size={16} />
       Добавить подписку
     </button>
@@ -529,7 +500,7 @@ function App() {
             }
             onClick={() =>
               run(() =>
-                act(connected || data?.guardActive ? "disconnect" : "connect"),
+                act(connected || data?.guardActive || data?.desiredConnected ? "disconnect" : "connect"),
               )
             }
           >
@@ -541,7 +512,7 @@ function App() {
           {nav.map(([p, Icon]) => (
             <button
               key={p}
-              className={page === p ? "active" : ""}
+              className={`${page === p ? "active" : ""}${p === "Updates" ? " update-attention" : ""}`}
               onClick={() => setPage(p)}
             >
               <Icon size={18} strokeWidth={1.7} />
@@ -688,6 +659,7 @@ function App() {
               </button>
             </div>
           )}
+          {data?.controlError && <div className="alert" role="status"><span>{data.controlError}</span></div>}
           {error && (
             <div role="alert" className="alert">
               <span>{error}</span>
@@ -729,7 +701,7 @@ function App() {
                     <div className="hero-top">
                       <span className="badge">
                         <i className={connected ? "dot online" : "dot"} />
-                        {connecting ? "ПОДКЛЮЧЕНИЕ…" : data.status === "Stopping" ? "ОТКЛЮЧЕНИЕ…" : connected
+                        {initializing ? "ПОДГОТОВКА…" : connecting ? "ПОДКЛЮЧЕНИЕ…" : data.status === "Stopping" ? "ОТКЛЮЧЕНИЕ…" : connected
                           ? "ТУННЕЛЬ ЗАПУЩЕН"
                           : protectedPause
                             ? "ЗАЩИЩЁННАЯ ПАУЗА"
@@ -750,11 +722,11 @@ function App() {
                           connecting ? "Отменить подключение" : connected || protectedPause ? "Отключить VPN" : "Подключить VPN"
                         }
                         className="power"
-                        disabled={(busy && !connecting) || !servers.length || data.status === "CleanupError"}
+                        disabled={initializing || (busy && !connecting) || !servers.length || data.status === "CleanupError"}
                         onClick={() =>
                           run(() =>
                             act(
-                              connected || connecting || data?.guardActive
+                              connected || connecting || data?.guardActive || data?.desiredConnected
                                 ? "disconnect"
                                 : "connect",
                             ),
@@ -768,7 +740,7 @@ function App() {
                         )}
                       </button>
                       <div>
-                        <h2>{connecting ? "Подключение…" : data.status === "Stopping" ? "Отключение…" : connected ? "Туннель запущен" : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
+                        <h2>{initializing ? "Подготовка сети…" : connecting ? "Подключение…" : data.status === "WaitingForNetwork" ? "Ожидание сети…" : data.status === "Stopping" ? "Отключение…" : connected ? "Туннель запущен" : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
                         <p>
                           {connected
                             ? protection.detail
@@ -779,18 +751,18 @@ function App() {
                       </div>
                       <button
                         className="primary connect-btn"
-                        disabled={(busy && !connecting) || !servers.length || data.status === "CleanupError"}
+                        disabled={initializing || (busy && !connecting) || !servers.length || data.status === "CleanupError"}
                         onClick={() =>
                           run(() =>
                             act(
-                              connected || connecting || data?.guardActive
+                              connected || connecting || data?.guardActive || data?.desiredConnected
                                 ? "disconnect"
                                 : "connect",
                             ),
                           )
                         }
                       >
-                        {connecting ? "Отменить" : connected || protectedPause ? "Отключить" : "Подключить"}
+                        {connecting || (!connected && data?.desiredConnected) ? "Отменить" : connected || protectedPause ? "Отключить" : "Подключить"}
                         <ArrowUpRight size={17} />
                       </button>
                     </div>
@@ -869,7 +841,7 @@ function App() {
                         <span className="eyebrow">ПЕРВЫЙ ШАГ</span>
                         <h2>Добавьте вашу подписку.</h2>
                         <p>
-                          Вставьте HTTPS-ссылку от VPN-провайдера. Atlas
+                          Добавьте HTTPS-подписку или VLESS-ключ. Atlas
                           загрузит и проверит серверы.
                         </p>
                       </div>
@@ -880,7 +852,6 @@ function App() {
               )}
               {page === "Servers" && (
                 <>
-                  {sourceSwitch}
                   {header(
                     "GLOBAL NETWORK",
                     "Найдите свой маршрут.",
@@ -916,12 +887,12 @@ function App() {
                     </button>
                   </div>
                   <div className="auto-options">
-                    {["AUTO", "FAILOVER"].map((n) => (
+                    {(["AUTO", "FAILOVER"] as const).map((n) => (
                       <button
                         key={n}
-                        className={s?.selected === n ? "selected" : ""}
+                        className={(s?.selectedNodeId ?? s?.selected) === n ? "selected" : ""}
                         onClick={() =>
-                          s && run(() => save({ ...s, selected: n }))
+                          s && run(() => act("select", serverSelectionPayload(n)))
                         }
                       >
                         <Wifi size={20} />
@@ -937,7 +908,7 @@ function App() {
                               : `Рабочий резерв при потере ответа · контроль каждые 10 с`}
                           </small>
                         </span>
-                        {s?.selected === n && <Check size={17} />}
+                        {(s?.selectedNodeId ?? s?.selected) === n && <Check size={17} />}
                       </button>
                     ))}
                   </div>
@@ -948,7 +919,7 @@ function App() {
                             n.name
                               .toLowerCase()
                               .includes(query.toLowerCase()) &&
-                            (!onlyFavorites || s?.favorites.includes(n.name)),
+                            (!onlyFavorites || isFavorite(s?.favorites ?? [], n)),
                         )
                         .sort((a, b) =>
                           sortLatency
@@ -958,21 +929,21 @@ function App() {
                         )
                         .map((n) => (
                           <ServerCard
-                            key={n.name} server={n}
-                            selected={s?.selected === n.name || (connected && activeServer === n.name)}
-                            favorite={s?.favorites.includes(n.name) ?? false}
+                            key={n.nodeId ?? n.name} server={n}
+                            selected={isServerSelected(s, n) || (connected && activeServer === n.name)}
+                            favorite={isFavorite(s?.favorites ?? [], n)}
                             latency={latencies[n.name]} disabled={busy}
                             testing={latencies[n.name]?.status === "testing"}
-                            onSelect={() => s && run(() => save({ ...s, selected: n.name }))}
+                            onSelect={() => s && run(() => act("select", serverSelectionPayload(n)))}
                             onTest={() => run(() => test(n.name))}
-                            onFavorite={() => s && run(() => save({ ...s, favorites: s.favorites.includes(n.name) ? s.favorites.filter(f => f !== n.name) : [...s.favorites, n.name] }))}
+                            onFavorite={() => s && run(() => act("favorite", { nodeId: n.nodeId, enabled: !isFavorite(s.favorites, n) }))}
                           />
                         ))}
                     </div>
                   ) : (
                     empty(
-                      sourceLabels[source].empty,
-                      sourceLabels[source].hint,
+                      "Нет серверов",
+                      "Добавьте URL-подписку или VLESS-ключ.",
                       addButton,
                     )
                   )}
@@ -987,7 +958,6 @@ function App() {
               )}
               {page === "Subscriptions" && (
                 <>
-                  {sourceSwitch}
                   {header(
                     "YOUR PROVIDERS",
                     "Одна ссылка. Вся сеть.",
@@ -997,9 +967,15 @@ function App() {
                   {subscriptions.length ? (
                     <div className="list">
                       {subscriptions.map((sub) => (
-                        <SubscriptionCard key={sub.id} sub={sub}
+                        <div className="subscription-entry" key={sub.id}>
+                          <span className="subscription-type-badge">{sourceLabels[sub.source ?? "URL"].title}</span>
+                          <SubscriptionCard sub={sub}
                           refreshing={data?.refreshingSubscriptions?.includes(sub.id) ?? false}
                           canDelete={!busy && !connected}
+                          rename={async (name) => {
+                            await request<Snapshot>("subscription_rename", { id: sub.id, name });
+                            await refresh();
+                          }}
                           saveUserAgent={async (userAgent) => {
                             await request<Snapshot>("subscription_user_agent", { id: sub.id, userAgent });
                             await refresh();
@@ -1009,13 +985,14 @@ function App() {
                             await refresh();
                           }}
                           remove={() => run(() => act("subscription_delete", { id: sub.id }))}
-                        />
+                          />
+                        </div>
                       ))}
                     </div>
                   ) : (
                     empty(
-                      sourceLabels[source].empty,
-                      sourceLabels[source].hint,
+                      "Нет подписок",
+                      "Добавьте URL-подписку или VLESS-ключ.",
                       addButton,
                     )
                   )}
@@ -1333,8 +1310,6 @@ function App() {
               )}
               {page === "Settings" && s && (
                 <>
-                  <h2>Активный тип подписок</h2>
-                  {sourceSwitch}
                   {header(
                     "MAKE IT YOURS",
                     "Всё под вашим контролем.",
@@ -1389,6 +1364,12 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Автопереключение</h2>
+                    <Toggle
+                      title="Оптимизировать работающий VPN"
+                      text="Разрешить переход на более быстрый сервер. Восстановление при отказе работает независимо."
+                      value={s.autoOptimize ?? false}
+                      onChange={(value) => run(() => save({ ...s, autoOptimize: value }))}
+                    />
                     <div className="setting-row">
                       <div>
                         <strong>Искать быстрее при пинге выше</strong>
@@ -1414,6 +1395,10 @@ function App() {
                   </section>
                   <section className="settings-section">
                     <h2>Запуск</h2>
+                    {data.startupStatus?.error && <p className="error">{data.startupStatus.error}</p>}
+                    {data.startupStatus?.desired && !data.startupStatus.effective && <p className="error">
+                      {data.startupStatus.disabledByWindows ? "Автозапуск отключён в Windows. Включите его в Диспетчере задач, если хотите запускать Atlas автоматически." : "Регистрация автозапуска не подтверждена."}
+                    </p>}
                     <Toggle
                       title="Запускать с Windows"
                       text="Автозапуск после входа в вашу учётную запись"
@@ -1429,7 +1414,7 @@ function App() {
                     />
                     <Toggle
                       title="Подключаться при запуске"
-                      text="Запустить Mihomo и применить системный прокси"
+                      text="Подключаться к VPN при каждом запуске Atlas"
                       value={s.startup.autoConnect}
                       onChange={(v) =>
                         run(() =>
@@ -1442,7 +1427,7 @@ function App() {
                     />
                     <Toggle
                       title="Запускать в трее"
-                      text="Главное окно будет скрыто"
+                      text="Запускать без показа главного окна"
                       value={s.startup.startInTray}
                       onChange={(v) =>
                         run(() =>
@@ -1455,7 +1440,7 @@ function App() {
                     />
                     <Toggle
                       title="Восстанавливать подключение"
-                      text="Подключаться, если предыдущая сессия не была отключена"
+                      text="Восстановить ранее активный VPN, если вы не нажимали «Отключить»"
                       value={s.startup.restoreConnection}
                       onChange={(v) =>
                         run(() =>
@@ -1469,7 +1454,7 @@ function App() {
                     <div className="setting-row">
                       <div>
                         <strong>Задержка автоподключения</strong>
-                        <p>Время для запуска сетевых служб Windows</p>
+                        <p>Ожидание после готовности приложения; ручное подключение — без задержки</p>
                       </div>
                       <select
                         value={s.startup.delaySeconds}
@@ -1485,7 +1470,7 @@ function App() {
                           )
                         }
                       >
-                        {[0, 3, 5, 10, 15, 30].map((n) => (
+                        {[0, 1, 3, 5, 10, 15, 30].map((n) => (
                           <option key={n} value={n}>
                             {n} сек.
                           </option>
@@ -1548,18 +1533,24 @@ function App() {
             aria-label="Новая подписка"
           >
             <div className="section-head">
-              <h2>{sourceLabels[source].title}: добавить источник</h2>
+              <h2>Добавить подписку</h2>
               <button aria-label="Закрыть" onClick={() => setAdding(false)}>
                 <X size={18} />
               </button>
             </div>
-            <p>
-              {source === "VLESS" ? "Вставьте HTTPS-подписку с VLESS-серверами или один VLESS-ключ." : "Вставьте HTTPS-ссылку на подписку вашего провайдера."}
-            </p>
+            <label>
+              Тип подписки
+              <select autoFocus value={source} disabled={busy}
+                onChange={e => { setSource(e.target.value as SubscriptionSource); setUrl(""); setError(""); }}>
+                <option value="URL">URL-подписка</option>
+                <option value="VLESS">VLESS-ключ</option>
+              </select>
+            </label>
+            <p>{sourceLabels[source].hint}</p>
             <label>
               Название
               <input
-                autoFocus
+                disabled={busy}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="Моя подписка"
@@ -1571,25 +1562,28 @@ function App() {
                 type="password"
                 autoComplete="off"
                 spellCheck={false}
+                disabled={busy}
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder={source === "VLESS" ? "https://… или vless://…" : "https://provider.example/sub/…"}
+                placeholder={sourceLabels[source].placeholder}
+                aria-invalid={!!url.trim() && !validSubscriptionInput(source, url)}
               />
             </label>
             <p className="footnote">
               <Shield size={14} />
-              Ссылка хранится в диспетчере учётных данных Windows. Никому не
-              передавайте её.
+              Ссылка или ключ хранится в диспетчере учётных данных Windows.
+              Никому не передавайте эти данные.
             </p>
             {error && <p className="error">{error}</p>}
             <footer>
               <button onClick={() => setAdding(false)}>Отмена</button>
               <button
-                disabled={busy || !url || !name.trim()}
+                disabled={busy || !validSubscriptionInput(source, url) || !name.trim()}
                 className="primary"
                 onClick={() =>
                   run(async () => {
-                    await act("subscription_add", { name, url, source });
+                    if (!validSubscriptionInput(source, url) || !name.trim()) return;
+                    await act("subscription_add", { name: name.trim(), url: url.trim(), source });
                     setUrl("");
                     setName("");
                     setAdding(false);

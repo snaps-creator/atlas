@@ -1,7 +1,14 @@
 use std::{process::Child, time::{Duration, Instant}};
 
+// TerminateProcess accepts the request before Windows finishes cancelling I/O.
+// Keep one bounded handle wait; normal exits return immediately. A one-second
+// ceiling rejected the real DNS core on hosted Windows despite an accepted kill.
+pub(crate) const CORE_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub fn stop(child: &mut Child, release_job: impl FnOnce(), timeout: Duration) -> Result<(), String> {
     let wait = process_waiter(child);
+    let pid = child.id();
+    let started = Instant::now();
     stop_with(
         || child.kill().map_err(|e| e.to_string()),
         release_job,
@@ -9,7 +16,7 @@ pub fn stop(child: &mut Child, release_job: impl FnOnce(), timeout: Duration) ->
         // The handle stays owned by the caller throughout this function.
         wait,
         timeout,
-    )
+    ).map_err(|error| format!("{error}; PID={pid}; elapsed={} ms; budget={} ms", started.elapsed().as_millis(), timeout.as_millis()))
 }
 fn process_waiter(child: &Child) -> impl FnMut(Duration) -> Result<bool, String> + 'static {
     use std::os::windows::io::AsRawHandle;
@@ -44,6 +51,27 @@ fn stop_with(
 mod tests {
     use super::*;
     #[test]
+    fn delayed_exit_driver() {
+        if std::env::var_os("ATLAS_DELAYED_EXIT_FIXTURE").is_some() {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    }
+    #[test]
+    fn accepted_termination_waits_for_late_process_exit() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process_stop::tests::delayed_exit_driver"])
+            .env("ATLAS_DELAYED_EXIT_FIXTURE", "1")
+            .creation_flags(0x08000000).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).spawn().unwrap();
+        // Inject an accepted asynchronous termination request; the real process
+        // handle becomes signalled later, as with pending kernel I/O cancellation.
+        let result = stop_with(|| Ok(()), || {}, process_waiter(&child), CORE_EXIT_TIMEOUT);
+        if result.is_err() { let _ = child.kill(); }
+        child.wait().unwrap();
+        assert!(result.is_ok(), "accepted request must wait for confirmed delayed exit: {result:?}");
+    }
+    #[test]
     fn failed_kill_releases_job_before_wait_and_reports_unconfirmed_exit() {
         let released = std::cell::Cell::new(false);
         let result = stop_with(|| Err("access denied".into()), || released.set(true), |duration| {
@@ -56,6 +84,11 @@ mod tests {
     #[test]
     fn confirmed_job_exit_recovers_from_failed_kill() {
         assert!(stop_with(|| Err("kill failed".into()), || {}, |_| Ok(true), Duration::ZERO).is_ok());
+    }
+    #[test]
+    fn accepted_kill_is_not_success_while_the_process_remains_alive() {
+        let error = stop_with(|| Ok(()), || {}, |_| Ok(false), Duration::ZERO).unwrap_err();
+        assert!(error.contains("не подтверждено") && error.contains("запрос принят"));
     }
     #[test]
     fn job_fallback_really_terminates_owned_process_when_kill_fails() {

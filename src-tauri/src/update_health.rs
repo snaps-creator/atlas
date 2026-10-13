@@ -14,7 +14,14 @@ pub fn challenge()->Option<(String,String)> {
 }
 /// A health candidate may render/read settings but cannot refresh subscriptions
 /// or accept mutations until its own transaction is durably committed.
+static ADMITTED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+fn admission_pending(admitted:&std::sync::atomic::AtomicBool,committed:impl FnOnce()->bool)->bool {
+    use std::sync::atomic::Ordering;
+    if admitted.load(Ordering::SeqCst) {return false;}
+    if committed() {admitted.store(true,Ordering::SeqCst);false} else {true}
+}
 pub fn pending()->bool {
+    if ADMITTED.load(std::sync::atomic::Ordering::SeqCst) {return false;}
     let Some((transaction,_))=challenge() else{return false;};
     let committed=(||->Option<bool>{
         use std::io::Read;
@@ -25,7 +32,7 @@ pub fn pending()->bool {
         let value:serde_json::Value=serde_json::from_slice(&bytes).ok()?;
         Some(committed_for(&value,&transaction,directory.file_name()?.to_str()?))
     })();
-    committed!=Some(true)
+    admission_pending(&ADMITTED,||committed==Some(true))
 }
 fn committed_for(value:&serde_json::Value,transaction:&str,directory:&str)->bool {
     value["schema"]==1 && value["transaction_id"]==transaction && value["stage"]=="Committed" &&
@@ -33,6 +40,7 @@ fn committed_for(value:&serde_json::Value,transaction:&str,directory:&str)->bool
     value["active"]["version"]==env!("CARGO_PKG_VERSION") && value["active"]["build"]==env!("ATLAS_BUILD_ID")
 }
 impl Report {
+#[allow(dead_code, reason = "Used by the native updater target; shared with the desktop target")]
     pub fn validate(&self,transaction:&str,nonce:&str,version:&str,build:&str,pid:u32)->Result<(),String> {
         if self.transaction_id!=transaction || self.nonce!=nonce || self.version!=version || self.build!=build || self.pid!=pid || pid==0 || self.service_pid==0 ||
             !self.ui_ready || !self.settings_readable || !self.subscriptions_readable || !self.service_ready || self.helper_protocol!=1 {return Err("Candidate health contract failed".into());}Ok(())
@@ -40,6 +48,13 @@ impl Report {
 }
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]
+    fn admitted_process_stays_ready_when_next_update_replaces_journal() {
+        let admitted=std::sync::atomic::AtomicBool::new(false);
+        assert!(admission_pending(&admitted,||false));
+        assert!(!admission_pending(&admitted,||true));
+        assert!(!admission_pending(&admitted,||panic!("A later transaction cannot revoke this process admission")));
+    }
     #[test]fn only_own_durable_commit_releases_candidate_mutations(){
         use serde_json::json;let active=json!({"id":"candidate","version":env!("CARGO_PKG_VERSION"),"build":env!("ATLAS_BUILD_ID")});
         let mut value=json!({"schema":1,"transaction_id":"tx","stage":"HealthPending","active":active,"candidate":active});
