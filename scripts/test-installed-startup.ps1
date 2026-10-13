@@ -110,7 +110,11 @@ try {
         try {
             $arguments=@('--launch'); if ($case.windows) { $arguments+='--autostart' }
             if ($case.name -eq 'H') {
-                $launch=Start-Process -FilePath $desktopExe -ArgumentList '--manual-restart' -PassThru -WindowStyle Hidden
+                $hostPath=(Get-Process -Id $PID).Path
+                $restartEvidence=Join-Path (Split-Path $InstallRoot -Parent) 'medium-manual-restart.log'
+                $restartCommand='"'+$hostPath+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'invoke-installed-desktop-check.ps1')+'" -Action ManualRestart -Executable "'+$desktopExe+'" -EvidencePath "'+$restartEvidence+'"'
+                if([AtlasInstalledShell]::RunHelper([AtlasInstalledShell]::ShellPid(),$hostPath,$restartCommand,$PSScriptRoot,10000) -ne 0){throw 'Ordinary manual restart launch failed'}
+                Get-Content -LiteralPath $restartEvidence | Write-Output
             } else {
                 $launch=Start-Process -FilePath (Join-Path $InstallRoot 'AtlasUpdater.exe') -ArgumentList $arguments -PassThru -WindowStyle Hidden
                 if (-not $launch.WaitForExit(30000) -or $launch.ExitCode -ne 0) { throw 'Stable launcher failed' }
@@ -166,7 +170,12 @@ try {
                 $trayHelper=Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1'
                 $trayEvidence=Join-Path (Split-Path $InstallRoot -Parent) 'tray-restart.log'
                 $registrationPath=Join-Path (Split-Path $InstallRoot -Parent) 'tray-registration.json'
-                & (Join-Path $PSScriptRoot 'show-installed-tray-overflow.ps1')
+                $hostPath=(Get-Process -Id $PID).Path
+                $overflowEvidence=Join-Path (Split-Path $InstallRoot -Parent) 'medium-tray-overflow.log'
+                $overflowCommand='"'+$hostPath+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'invoke-installed-desktop-check.ps1')+'" -Action Overflow -EvidencePath "'+$overflowEvidence+'"'
+                $overflowExit=[AtlasInstalledShell]::RunHelper([uint32]$oldPid,$hostPath,$overflowCommand,$PSScriptRoot,10000)
+                Get-Content -LiteralPath $overflowEvidence | Write-Output
+                if($overflowExit -ne 0){throw 'Ordinary notification overflow action failed'}
                 & (Join-Path $PSScriptRoot 'get-installed-tray-registration.ps1') -ProcessId $oldPid -Executable $desktopExe -OutputPath $registrationPath
                 $trayCommand='"'+$powershell+'" -NoProfile -ExecutionPolicy Bypass -File "'+$trayHelper+'" -ProcessId '+$oldPid+' -Name "Перезагрузить" -EvidencePath "'+$trayEvidence+'" -RegistrationPath "'+$registrationPath+'"'
                 Write-Output ('Parent context before tray helper: '+[AtlasInstalledShell]::ShellDiagnostic())

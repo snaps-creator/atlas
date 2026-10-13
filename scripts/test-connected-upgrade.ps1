@@ -298,7 +298,14 @@ rules:
     # Retain the original first-post-upgrade smoke position. A failure remains
     # fatal at the end, but must not hide independent installed acceptance.
     $isolatedUiError = $null
-    try { & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $activeRoot 'Atlas.exe') }
+    try {
+        Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
+        $hostPath=(Get-Process -Id $PID).Path
+        $smokeCommand='"'+$hostPath+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'invoke-installed-desktop-check.ps1')+'" -Action UiSmoke -Executable "'+(Join-Path $activeRoot 'Atlas.exe')+'" -EvidencePath "'+(Join-Path $fixture 'medium-ui-smoke.log')+'"'
+        $smokeExit=[AtlasInstalledShell]::RunHelper([AtlasInstalledShell]::ShellPid(),$hostPath,$smokeCommand,$PSScriptRoot,60000)
+        Get-Content -LiteralPath (Join-Path $fixture 'medium-ui-smoke.log') | Write-Output
+        if($smokeExit -ne 0){throw "Ordinary installed UI smoke failed: exit=$smokeExit"}
+    }
     catch { $isolatedUiError = $_.Exception.Message; Write-Warning "Isolated UI failure retained: $isolatedUiError" }
     if (-not $LegacyBaseline) {
         & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify

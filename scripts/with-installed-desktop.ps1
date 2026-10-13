@@ -85,7 +85,7 @@ $repository=(Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $scriptPath=(Resolve-Path -LiteralPath $Script).Path
 if(-not $scriptPath.StartsWith($repository+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Installed action must belong to this checkout'}
 $root=Join-Path $env:RUNNER_TEMP ('atlas-installed-desktop-'+[guid]::NewGuid().ToString('N'))
-$account=$null;$desktopLease=$null;$policy=$null;$bootstrap=$null;$workerProcess=$null
+$account=$null;$desktopLease=$null;$policy=$null;$bootstrap=$null
 Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
 Add-Type -Path (Join-Path $PSScriptRoot 'installed-desktop-lease.cs')
 Add-Type -Path (Join-Path $PSScriptRoot 'installed-test-process.cs')
@@ -121,7 +121,6 @@ try {
             if(Test-Path -LiteralPath (Join-Path $root 'bootstrap.log')){Get-Content -LiteralPath (Join-Path $root 'bootstrap.log') | Write-Output}
             if($bootstrap.ExitCode -ne 0 -or -not(Test-Path -LiteralPath (Join-Path $root 'worker-exit')) -or (Get-Content -LiteralPath (Join-Path $root 'worker-exit') -Raw).Trim() -ne '0'){throw 'Interactive installed acceptance did not complete successfully'}
         } finally {
-            if($workerProcess){$workerProcess.Dispose()}
             [IO.File]::WriteAllText((Join-Path $root 'stop'),'')
             if($bootstrap){if(-not $bootstrap.WaitForExit(10000)){$bootstrap.Kill();$bootstrap.WaitForExit()};$bootstrap.Dispose()}
             $privateShell=[AtlasInstalledShell]::ShellPid()
