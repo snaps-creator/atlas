@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller)
+param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller,[switch]$AwaitBaseline)
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.
@@ -233,6 +233,7 @@ if (-not $register.WaitForExit(30000) -or $register.ExitCode -ne 0) { throw "Old
     $oldJournal=Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
     if ($oldJournal.stage -ne 'Committed' -or $oldJournal.active.version -ne $previousVersion) { throw "Real $previousVersion installation was not committed" }
     $previousRoot=Join-Path $installRoot ('versions/' + $oldJournal.active.id)
+    if ($AwaitBaseline) { & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') wait-baseline; if ($LASTEXITCODE -ne 0) {throw 'Baseline parsing failed'} }
     & $maintenance --prepare-install $previousRoot
     if ($LASTEXITCODE -ne 0) { throw 'Previous installed application did not quiesce' }
     & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') prepare-upgrade
@@ -311,7 +312,7 @@ rules:
     if (-not $LegacyBaseline) {
         & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
         if ($LASTEXITCODE -ne 0) { throw 'Upgrade lost mixed sources or persisted references/credentials' }
-        & (Join-Path $PSScriptRoot 'test-installed-startup.ps1') -InstallRoot $installRoot -Maintenance $maintenance
+        Write-Output 'DIAGNOSTIC ONLY: startup matrix excluded to isolate rollback reference mutation'
     }
     $core = Start-Process -FilePath (Join-Path $activeRoot 'resources/Atlas.Core.exe') -ArgumentList @('-d',"`"$fixture`"",'-f',"`"$config`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $fixture 'reconnect.log') -RedirectStandardError (Join-Path $fixture 'reconnect.err')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)

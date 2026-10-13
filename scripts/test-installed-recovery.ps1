@@ -65,13 +65,13 @@ foreach ($attempt in 1..2) {
         Get-Content -LiteralPath (Join-Path $root "recovery-$attempt.err")
         throw "Installed recovery failed: $($process.ExitCode)"
     }
-    Start-Sleep -Seconds 5
-    Write-Output "STATE AFTER RECOVERY $attempt"
-    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
     $restored = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
     if ($restored.stage -ne 'RolledBack' -or $restored.active.id -ne $previous -or $restored.network_state -ne 'restored' -or $restored.migration_state -ne 'restored') { throw 'Recovery did not durably restore the previous version and state' }
     $service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"
     if ($service.PathName -ne ('"' + (Join-Path $previousRoot 'Atlas.Service.exe') + '" --network-service') -or $service.State -ne 'Running') { throw 'Recovery did not restore the running previous service' }
+    Start-Sleep -Seconds 5
+    Write-Output "STATE AFTER RECOVERY $attempt"
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
     $inspection = & $Maintenance --inspect | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $inspection.baselineReady) { throw 'Recovery left an unverified network baseline' }
     if (-not (Test-Path -LiteralPath (Join-Path $previousRoot 'Atlas.exe')) -or -not (Test-Path -LiteralPath (Join-Path $candidateRoot 'Atlas.exe'))) { throw 'Recovery lost a retained version' }

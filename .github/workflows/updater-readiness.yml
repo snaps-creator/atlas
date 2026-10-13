@@ -36,7 +36,7 @@ jobs:
           $installer=(Resolve-Path 'candidate/Atlas-Setup-2.5.1.exe').Path
           node scripts/verify-installer.cjs $installer
           if($LASTEXITCODE -ne 0){throw 'Signed runtime did not verify'}
-          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$installer}
+          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$installer;AwaitBaseline=('${{ matrix.attempt }}' -eq '2')}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
