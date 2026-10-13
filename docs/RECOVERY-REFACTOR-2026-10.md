@@ -262,53 +262,44 @@ favorite не удаляется, но соответствие совершен
 
 ## G. Сборка
 
-Ниже сначала зафиксирована первоначальная сборка 2.3.1-alpha.1 от 13 октября.
-Она не является артефактом PR 3.0.1. Для нового PR применяется существующий
-`build-release-installer.ps1`: полный transactional installer с receipt-bound
-AtlasUpdater; промежуточный Tauri setup не предназначен для распространения.
-
-Команды из корня PowerShell:
+Финальная версия PR — **3.0.1**, source commit `43e6266`, поверх main `972af18`.
+Команда из отдельного checkout `temp/atlas-3.0.1-pr`:
 
 ```powershell
-. ./scripts/initialize-msvc.ps1
-$env:CARGO_TARGET_DIR = Join-Path (Get-Location) 't'
-npm.cmd test
-npm.cmd run build
-cargo test --manifest-path src-tauri/Cargo.toml --lib
-cargo test --manifest-path src-tauri/Cargo.toml --lib scheduler_load_profile -- --ignored --nocapture
-./scripts/test-recovery-load.ps1 -Executable t/debug/deps/atlas-0b9fa84c02ef3b93.exe
+$env:CEF_PATH = '<workspace CEF cache>/cef_windows_x86_64'
+$env:CARGO_BUILD_JOBS = '2'
+./scripts/build-release-installer.ps1 -TargetDirectory '../../t' -OutputDirectory 'artifacts/release' -BuildId 'atlas-3.0.1-recovery-local'
 ```
 
-Release собран Tauri CLI с CEF_PATH на уже имеющийся workspace CEF.
-Локальный override отключает только создание updater-signature artifacts
-и задаёт NSIS zlib; проверенный updater public key в исходниках не изменён.
-Финальная команда: `npm.cmd run tauri -- build --bundles nsis --config
-temp/atlas-build-config.json`. Это локальная unsigned сборка, не публикация.
-Финальный build завершился с exit code 0; release-компиляция заняла 2 мин 33 с.
-Получены файлы (пути относительно корня репозитория):
+Build завершился с exit code 0. Применён неизменённый transactional release
+pipeline из main: промежуточный Tauri bundle, встроенная опись файлов пакета
+в AtlasUpdater, финальная NSIS-обёртка и распаковка для проверки. Распространяемый
+файл — `artifacts/release/Atlas-Setup-3.0.1.exe` внутри PR checkout.
+Промежуточный `t/release/bundle/nsis/Atlas_3.0.1_x64-setup.exe` не предназначен
+для установки пользователем.
 
-| Артефакт | Размер, байт | SHA-256 |
-|---|---:|---|
-| `t/release/Atlas.exe` | 157368832 | `D7A73B4053CC85A0AC310F6EC486620DE67938E6813AF4E5C94FCFDDDE0BAC9E` |
-| `t/release/bundle/nsis/Atlas_2.3.1-alpha.1_x64-setup.exe` | 265507590 | `340AF320CC164117FAA7DF24C5EAF5B1578101D8A8EB3E43C9DCBD9194AC60FD` |
+- Размер: **190495551 байт** (181.67 MiB).
+- SHA-256: `a96edfb8f7684c9b70a8af8d114491b7a7c47f9a3d1cee6149df1fa9da78f398`.
+- Сверены **32 файлов**, x64 PE, версии приложения/службы/updater/maintenance,
+  CEF и хеши закреплённых Mihomo/Xray resources.
+- Native verifier принял исходный payload, отклонил намеренно изменённую
+  временную копию и снова принял восстановленную. Installer не запускался.
+- `test-ui-startup.ps1`: версия 3.0.1, rendered=true, 12 кнопок, IPC работает,
+  все изолированные UI-процессы завершились.
+- `test-service-identity.ps1 -RequirePackagedService` на готовом payload:
+  Atlas.Service.exe принимает точного sibling Atlas.exe-владельца; SCM/VPN
+  не запускались.
 
-NSIS сообщает 253,21 MiB. Оставшиеся предупреждения: большой Vite chunk,
-неиспользуемая `subscriptions::parse`, информационное сообщение linker и
-canonicalize родительского пути. Они не остановили production build.
-Проверка `node scripts/verify-installer.check.cjs` прошла: verifier отклоняет
-изменённые bytes/key/trusted comment. Это тест verifier, не утверждение о
-наличии цифровой подписи у данного локального пакета.
+Локальный пакет **без цифровой подписи**, release не опубликован. Updater
+trust и обязательные signing/publication gates сохранены. Большой Vite chunk
+и информационный linker stdout остаются предупреждениями; build успешен.
 
-На финальном `Atlas.exe` изолированный `test-ui-startup.ps1` подтвердил
-версию `2.3.1-alpha.1`, `rendered=true`, 12 кнопок,
-работающий IPC и отсутствие оставшихся процессов. `test-service-identity.ps1`
-подтвердил, что Atlas.Service.exe принимает своего Atlas.exe-владельца.
-Оба smoke mode обходят настройки, SCM и запуск VPN. Первоначальный вызов UI
-скрипта остановился на недоступном WMI после успешного рендера; проверка
-завершения переведена на разрешённый Get-Process и повторно прошла целиком.
-Логи: `temp/atlas-release-final.log`, `temp/atlas-tests-rust-final.log`,
-`temp/atlas-tests-ui-final.log`, `temp/atlas-ui-smoke-final.log`,
-`temp/atlas-service-identity-final.log`. `git diff --check` прошёл.
+Полная опись/результаты: `artifacts/release/build.json`,
+`artifacts/release/verification/verification.json`, `artifacts/release/SHA256SUMS.txt`.
+Логи в исходном workspace: `temp/atlas-301-release.log`,
+`temp/atlas-301-tests-rust.log`, `temp/atlas-301-tests-ui.log`,
+`temp/atlas-301-check-scripts.log`, `temp/atlas-301-ui-smoke.log`,
+`temp/atlas-301-service-identity.log`. Артефакты EXE не добавлены в Git.
 
 ## H. Ограничения и оставшаяся приёмка
 
