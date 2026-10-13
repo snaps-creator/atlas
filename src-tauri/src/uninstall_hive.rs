@@ -1,5 +1,5 @@
-//! Normal user hives can contain different key ACLs. RegLoadAppKey requires
-//! uniform security descriptors and is not a loader for arbitrary NTUSER.DAT.
+//! Load offline user profiles through the normal registry hive API. Valid
+//! NTUSER.DAT files can be rejected by the application-hive loader (ERROR_BADDB).
 use std::{
     os::windows::{
         ffi::OsStrExt,
@@ -262,10 +262,6 @@ mod tests {
             );
         }
         let before = mounts();
-        match RegKey::load_app_key_with_flags(&hive, KEY_READ | KEY_WRITE, REG_PROCESS_APPKEY) {
-            Ok(key) => { println!("Mixed-ACL control: application loader succeeds"); drop(key); }
-            Err(error) => println!("Mixed-ACL control: application loader returns {error}"),
-        }
         with_hive(&hive, |root| {
             let child = root
                 .open_subkey_with_flags("Child", KEY_READ | KEY_SET_VALUE)

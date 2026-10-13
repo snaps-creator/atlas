@@ -158,7 +158,7 @@ pub fn cleanup(root: &Path) -> Result<(), String> {
                 );
             }
         }
-        // Normal user hives have per-key ACLs and cannot be treated as app hives.
+        // Load a normal user hive, including those rejected by RegLoadAppKey.
         // A unique temporary mount is closed before payload removal; traversal
         // rejects registry links rather than following them outside this hive.
         crate::uninstall_hive::with_hive(&hive, |user| cleanup_user(user, root))

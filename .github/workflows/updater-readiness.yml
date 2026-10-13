@@ -25,7 +25,6 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Registry probe build failed'}
           ./scripts/with-installed-desktop.ps1 -Script scripts/probe-offline-hive.ps1
   candidate:
-    if: false
     needs: registry-proof
     runs-on: windows-latest
     timeout-minutes: 90
@@ -44,6 +43,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.1
       - run: npm install --global npm@11.16.0
       - run: npm ci
+      - run: npm test
+      - run: node --test scripts/*.check.cjs
       - name: Build and verify one complete signed candidate
         shell: pwsh
         env:
@@ -56,6 +57,8 @@ jobs:
           . ./scripts/initialize-msvc.ps1
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
           if($LASTEXITCODE -ne 0){throw 'Backend tests failed'}
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact uninstall_hive::tests::ordinary_hive_with_distinct_acls_roundtrips_and_unloads_after_errors --ignored
+          if($LASTEXITCODE -ne 0){throw 'Offline hive regression failed'}
           ./scripts/test-tray-protocol.ps1
       - uses: actions/upload-artifact@v7
         with:
