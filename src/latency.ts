@@ -1,17 +1,27 @@
 export type Latency = {
-  status: "testing" | "ok" | "unreachable" | "not_connected" | "error";
+  status: "queued" | "testing" | "ok" | "high_latency" | "timeout" | "unreachable" | "stale" | "not_connected" | "error";
   delay: number | null;
   attempts: number;
   error?: string | null;
   measuredAt?: number;
+  lastSuccessAt?: number;
+  lastDelay?: number;
+  measurement?: "http_via_node_ms";
 };
 
 export type LatencyProgress = { batchId: string; probeId: string; name: string; result: Latency };
 
+export function recordLatency(old: Latency | undefined, result: Latency): Latency {
+  const now=result.measuredAt ?? Date.now();
+  return {...result,measuredAt:now,measurement:"http_via_node_ms",
+    lastSuccessAt:result.status === "ok" ? now : old?.lastSuccessAt ?? (old?.status === "ok" ? old.measuredAt : undefined),
+    lastDelay:result.delay ?? old?.lastDelay ?? old?.delay ?? undefined};
+}
+
 export function applyLatencyProgress(previous: Record<string, Latency>, event: LatencyProgress,
   batchId: string, identities: Record<string,string>, names: Set<string>): Record<string, Latency> {
   if (event.batchId !== batchId || event.probeId !== identities[event.name] || !names.has(event.name)) return previous;
-  return {...previous, [event.name]: {...event.result, measuredAt: Date.now()}};
+  return {...previous, [event.name]: recordLatency(previous[event.name],event.result)};
 }
 
 export function retainNodeLatencies(values: Record<string,Latency>, before: Record<string,string>, after: Record<string,string>) {
@@ -22,9 +32,9 @@ export function retainNodeLatencies(values: Record<string,Latency>, before: Reco
 export function failPendingLatencies(previous: Record<string, Latency>, names: string[], error: unknown): Record<string, Latency> {
   const next = {...previous};
   for (const name of names) {
-    if (next[name]?.status === "testing") next[name] = {
+    if (next[name]?.status === "testing" || next[name]?.status === "queued") next[name] = recordLatency(next[name],{
       status: "error", delay: null, attempts: 0, error: String(error), measuredAt: Date.now(),
-    };
+    });
   }
   return next;
 }
@@ -75,11 +85,27 @@ export class LatencyEpoch {
 export function latencyLabel(value?: Latency): string {
   if (value?.status === "ok" && value.delay !== null)
     return `${value.delay} мс`;
-  if (value?.status === "unreachable") return "Таймаут";
+  if (value?.status === "high_latency") return `${value.delay} мс · выше порога`;
+  if (value?.status === "timeout") return "Таймаут";
+  if (value?.status === "unreachable") return "Недоступен";
+  if (value?.status === "stale") return "Устарело";
+  if (value?.status === "queued") return "В очереди";
   if (value?.status === "testing") return "Проверка…";
   if (value?.status === "error") return "Ошибка проверки";
   if (value?.status === "not_connected") return "Нет подключения";
-  return "—";
+  return "Не проверен";
+}
+
+export function freshLatency(value?: Latency, threshold = Infinity, now = Date.now()): Latency | undefined {
+  if (!value) return;
+  if (value.status !== "testing" && value.status !== "queued" && value.measuredAt !== undefined &&
+      (now - value.measuredAt > 30_000 || value.measuredAt > now + 5000)) return {...value,status:"stale"};
+  if (value.status === "ok" && value.delay !== null && value.delay > threshold) return {...value,status:"high_latency"};
+  return value;
+}
+export function latencyRank(value?: Latency): number {
+  const fresh = freshLatency(value);
+  return fresh?.status === "ok" && fresh.delay !== null ? fresh.delay : Infinity;
 }
 
 // Bound the UI even if the native invocation never returns. Late completion

@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "version": "2.5.1",
+  "version": "3.0.1",
   "requiredChecks": [
     "frontend",
     "verificationContracts",
@@ -22,9 +22,8 @@
     }
   ],
   "evidence": {
-    "report": "docs/releases/2.5.1/10-RELEASE-READINESS.md",
-    "previousSignedAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37690808789",
-    "mainBuildAndAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37695482741"
+    "report": "docs/RECOVERY-REFACTOR-2026-10.md",
+    "previousSignedAcceptance": "https://github.com/snaps-creator/atlas/actions/runs/37690808789"
   },
   "notes": "This is publication policy, not a cached test result. Every required check must run for the candidate in CI; successful preflight alone does not mean release-ready."
 }

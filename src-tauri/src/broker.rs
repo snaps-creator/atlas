@@ -591,7 +591,7 @@ impl HealthState {
             core.client().event(json!({"at":crate::model::now(),"kind":"uplink_changed",
                 "networkEpoch":*network_epoch,"action":"validate selected path before recovery"}));
         }
-        if *configured && self.last_recovery_scan.elapsed() >= Duration::from_millis(500) {
+        if *configured && self.last_recovery_scan.elapsed() >= Duration::from_millis(100) {
             self.last_recovery_scan = now;
             if let Some(s) = settings { recovery.tick(core.client(), s); }
         }
@@ -599,7 +599,7 @@ impl HealthState {
             if let Some(healthy) = self.probe.poll() {
                 self.failures = if healthy { 0 } else { self.failures + 1 };
             }
-            if self.last_health.elapsed() >= Duration::from_secs(5) {
+            if self.last_health.elapsed() >= Duration::from_secs(1) {
                 let observer_ok = observer.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)));
                 let observed = network_guard::tun_identity();
                 let guard_ready = match tun_guard_action(self.tun_identity, observed) {
@@ -1037,7 +1037,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 // Health policy changes must not reload Mihomo or recreate TUN.
                 if previous.selected == s.selected
                     && crate::config::generate(&previous, "compare")? == crate::config::generate(&s, "compare")? {
-                    recovery.invalidate();
+                    recovery.configuration_changed();
                     *active_settings = Some(s);
                     return Ok(json!({"running":true,"policyUpdated":true}));
                 }
@@ -1045,7 +1045,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                     confirm_route(&probe.client(), &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
                 queries.invalidate();
                 *network_epoch = network_epoch.wrapping_add(1);
-                recovery.invalidate();
+                recovery.configuration_changed();
                 if let Err(error) = core.apply_verified(&s, |core, rollback| {
                     let policy = guard.as_ref().ok_or("Защита сети отсутствует при проверке конфигурации")?;
                     confirm_session(core, policy, if rollback { &previous } else { &s })
@@ -1093,12 +1093,16 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 // unrelated node tests fail with "service busy". WFP is unchanged.
                 Ok(json!({}))
             }
+            "recovery_status" => Ok(recovery.status()),
+            "recovery_refresh_result" => Ok(json!({"accepted":recovery.refresh_finished(
+                payload["ticket"].as_str().unwrap_or(""),payload["success"]==true,&core.client())})),
             "status" => {
                 let running = core.running();
                 Ok(json!({"running":running,"guard":*configured && running,
                     "adapter":guard.as_ref().map(|g|g.diagnostic()).unwrap_or_else(network_guard::tun_diagnostic),
                     "serviceProcessState":"Running","serviceChannelState":"Connected",
                     "sessionId":session_id.as_ref().map(ToString::to_string),"networkEpoch":*network_epoch,
+                    "recovery":recovery.status(),
                     "state":if *configured && running { "Connected" }
                         else if guard.is_some() { "ProtectedPause" } else { "Disconnected" }}))
             },

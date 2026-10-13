@@ -187,6 +187,7 @@ impl Core {
         ApiClient {
             secret: self.secret.clone(),
             controller_port: self.ports[1],
+            mixed_port: self.ports[0],
             broker: self.broker.clone(),
             logs: self.logs.clone(),
         }
@@ -659,6 +660,11 @@ impl Drop for Core {
 }
 
 fn controller_timeout(method: &str, path: &str, body: Option<&Value>) -> Duration {
+    if path.contains("/delay?") {
+        let timeout = path.split('?').nth(1).and_then(|q| url::form_urlencoded::parse(q.as_bytes())
+            .find(|(key,_)|key == "timeout").and_then(|(_,v)|v.parse::<u64>().ok())).unwrap_or(10000);
+        return Duration::from_millis(timeout.clamp(100,10000) + 500);
+    }
     Duration::from_secs(if method == "PATCH" && path == "/configs"
         && body.is_some_and(|value| value["tun"]["enable"] == false) {
         1
@@ -1189,6 +1195,7 @@ mod integration_tests {
 #[derive(Clone)]
 pub struct ApiClient {
     controller_port: u16,
+    mixed_port: u16,
     secret: String,
     broker: Option<std::sync::Arc<crate::broker::Broker>>,
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
@@ -1207,7 +1214,21 @@ impl ApiClient {
     }
     #[cfg(test)]
     pub(crate) fn loopback_fixture(port: u16) -> Self {
-        Self { controller_port:port, secret:String::new(), broker:None, logs:Default::default() }
+        Self { controller_port:port, mixed_port:port, secret:String::new(), broker:None, logs:Default::default() }
+    }
+    pub(crate) fn recovery_command(&self, op: &str, value: Value) -> Result<Value,String> {
+        self.broker.as_ref().ok_or("Нет службы восстановления")?.call(op,value)
+    }
+    /// Real HTTP traffic through the live mixed listener, distinct from node RTT.
+    pub(crate) fn tunnel_responds(&self, timeout: u64) -> bool {
+        self.tunnel_responds_at(crate::latency::DISPLAY_URL, timeout)
+            || self.tunnel_responds_at(crate::latency::SECONDARY_URL, timeout)
+    }
+    pub(crate) fn tunnel_responds_at(&self, endpoint: &str, timeout: u64) -> bool {
+        let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{}",self.mixed_port)) else { return false; };
+        let Ok(client) = reqwest::blocking::Client::builder().no_proxy().proxy(proxy)
+            .timeout(Duration::from_millis(timeout.clamp(1500,10000))).redirect(reqwest::redirect::Policy::none()).build() else { return false; };
+        client.get(endpoint).send().is_ok_and(|r|r.status().as_u16()==204)
     }
     pub(crate) fn event(&self, value: Value) {
         // Service-side events travel through the existing authenticated logs pipe.

@@ -2,7 +2,7 @@
 
 **[Официальная загрузка — GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest)**
 
-Для Windows 10/11 x64 скачайте из Assets полный EXE. Планируемый файл версии 2.5.1 — `Atlas-Setup-2.5.1.exe`; эта версия пока не опубликована. ZIP исходников не содержит готовый установщик.
+Для Windows 10/11 x64 скачайте из Assets полный EXE. Планируемый файл версии 3.0.1 — `Atlas-Setup-3.0.1.exe`; эта версия пока не опубликована. ZIP исходников не содержит готовый установщик.
 
 Один офлайн-пакет включает Atlas UI, Atlas.Service.exe (существующая служба AtlasNetworkService под SYSTEM), Mihomo, Xray с данными, CEF, AtlasMaintenance.exe и AtlasUpdater.exe, который также служит стабильным launcher. При установке отдельные зависимости из сети не скачиваются.
 

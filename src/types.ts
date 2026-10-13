@@ -62,6 +62,7 @@ export type Snapshot = {
   controlError?: string | null;
   startupStatus?: {desired: boolean; registered: boolean; disabledByWindows: boolean; effective: boolean; error?: string | null};
   desiredConnected?: boolean;
+  recovery?: {phase: string; operationId?: string; active?: {alive:boolean; delay:number | null; ageMs:number}} | null;
   refreshingSubscriptions?: string[];
   buildId?: string;
   revision?: number;

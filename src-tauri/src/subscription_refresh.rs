@@ -20,34 +20,6 @@ fn reason(startup: bool, updated: u64, last_attempt: Option<u64>, now: u64, fail
     if failed { return Some("recovery"); }
     (now.saturating_sub(updated)>=interval_seconds).then_some("periodic")
 }
-fn failed_nodes(lines: &[String], now: u64) -> HashSet<String> {
-    let mut failures = HashMap::new();
-    for line in lines {
-        let Some(raw) = line.strip_prefix("ATLAS_EVENT ") else { continue; };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else { continue; };
-        if now.saturating_sub(v["at"].as_u64().unwrap_or(0))>60 { continue; }
-        if v["kind"]=="active_node_sample" {
-            if let Some(name)=v["name"].as_str() { failures.insert(name.to_owned(), v["responded"]==false); }
-        }
-        if v["kind"]=="recovery_result" && v["evidence"]["candidate"].is_null() {
-            for result in v["evidence"]["results"].as_array().into_iter().flatten() {
-                if result["passed"]==false {
-                    if let Some(name)=result["name"].as_str() { failures.insert(name.to_owned(),true); }
-                }
-            }
-        }
-    }
-    failures.into_iter().filter_map(|(name,failed)|failed.then_some(name)).collect()
-}
-fn failed_active_path(failed: HashSet<String>, proxies: &serde_json::Value) -> HashSet<String> {
-    let mut current="ATLAS";
-    for _ in 0..8 {
-        let Some(proxy)=proxies["proxies"].get(current) else { return HashSet::new() };
-        if let Some(next)=proxy["now"].as_str() { current=next; }
-        else { return failed.into_iter().filter(|name|name==current).collect(); }
-    }
-    HashSet::new()
-}
 pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, done: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let initial: HashSet<_> = reads.get().map(|v|v.settings.subscriptions.iter().filter(|s|s.source==model::SubscriptionSource::Url).map(|s|s.id.clone()).collect()).unwrap_or_default();
@@ -55,8 +27,9 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
         let mut attempts = HashMap::new();
         let (tx,rx) = std::sync::mpsc::channel();
         let mut in_flight = HashSet::new();
-        let mut last_logs = 0;
-        let mut failed = HashSet::new();
+        let recovery_busy=Arc::new(AtomicBool::new(false));
+        let mut recovery_operation=None;
+        let mut notification_operation=None;
         while !stop.load(Ordering::SeqCst) {
             if crate::update_health::pending() {std::thread::sleep(Duration::from_millis(200));continue;}
             for id in rx.try_iter() { in_flight.remove(&id); outstanding.remove(&id); }
@@ -64,22 +37,34 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
             outstanding.retain(|id|snapshot.settings.subscriptions.iter().any(|s| &s.id==id));
             if outstanding.is_empty() { done.store(true,Ordering::SeqCst); }
             let now=model::now();
-            if now.saturating_sub(last_logs)>=10 {
-                failed = if matches!(snapshot.status.as_str(),"Connected"|"ProtectedPause") {
-                    // A recovered alternate path must not be replaced because
-                    // the abandoned node still has a failure in the log window.
-                    let failures=failed_nodes(&snapshot.client.logs().unwrap_or_default(),now);
-                    if failures.is_empty() { failures } else {
-                        failed_active_path(failures,&snapshot.client.api("GET","/proxies",None).unwrap_or_default())
+            let mut refreshing=false;
+            if matches!(snapshot.status.as_str(),"Connected"|"ProtectedPause") {
+                if let Ok(state)=snapshot.client.recovery_command("recovery_status",serde_json::Value::Null) {
+                    refreshing=state["phase"]=="REFRESHING_SUBSCRIPTIONS";
+                    let id=state["operationId"].as_str().map(str::to_owned);
+                    let ticket=state["refreshTicket"].as_str().map(str::to_owned);
+                    if state["phase"]=="REFRESHING_SUBSCRIPTIONS" && ticket.is_some() && ticket!=recovery_operation
+                        && in_flight.is_empty() && !recovery_busy.swap(true,Ordering::SeqCst) {
+                        recovery_operation=ticket.clone();
+                        let (shared,reads,stop,busy)=(shared.clone(),reads.clone(),stop.clone(),recovery_busy.clone());
+                        let job_id=ticket.unwrap();
+                        std::thread::spawn(move || {
+                            refresh_recovery(&shared,&reads,&stop,&job_id);
+                            busy.store(false,Ordering::SeqCst);
+                        });
                     }
-                } else { HashSet::new() };
-                last_logs=now;
+                    if state["failureExhausted"]==true && id.is_some() && notification_operation!=id {
+                        notification_operation=id;
+                        crate::recovery_notification::show(state["subscriptionsUpdated"]==true);
+                    }
+                }
             }
+            if refreshing || recovery_busy.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(200)); continue; }
             for sub in &snapshot.settings.subscriptions {
                 if in_flight.len()>=2 { break; }
                 if sub.source!=model::SubscriptionSource::Url {continue;}
-                let failed = sub.servers.iter().any(|n|n["name"].as_str().is_some_and(|n|failed.contains(n)))
-                    || (snapshot.status=="Error" && shared.try_lock().is_ok_and(|a|a.reconnect.load(Ordering::SeqCst)));
+                // Recovery downloads are owned by the explicit service incident.
+                let failed = false;
                 let Some(trigger)=reason(outstanding.contains(&sub.id),sub.updated_at,attempts.get(&sub.id).copied(),now,failed,sub.options.refresh_interval_seconds()) else { continue; };
                 let Some(lease)=Lease::take(&sub.id) else { continue; };
                 let id=sub.id.clone(); attempts.insert(id.clone(),now); in_flight.insert(id.clone());
@@ -121,23 +106,77 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                     let _=tx.send(id);
                 });
             }
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(500));
         }
         done.store(true,Ordering::SeqCst);
     });
 }
 
+fn refresh_recovery(shared: &Shared, reads: &ReadState, stop: &AtomicBool, operation: &str) {
+    let Ok(before)=reads.get() else { return; };
+    let connected=before.status=="Connected";
+    let mut next=before.settings.clone();
+    let sources:Vec<_>=before.settings.subscriptions.iter().filter(|sub|sub.source==model::SubscriptionSource::Url).collect();
+    let mut all_ok=!sources.is_empty();
+    let mut changed=false;
+    let deadline=std::time::Instant::now()+Duration::from_secs(120);
+    // Two downloads at a time, a bounded queue, and one atomic settings commit.
+    for pair in sources.chunks(2) {
+        if stop.load(Ordering::SeqCst) { return; }
+        if std::time::Instant::now()>=deadline {all_ok=false;break;}
+        let results=std::thread::scope(|scope| {
+            let jobs:Vec<_>=pair.iter().map(|sub|scope.spawn(move || {
+                let result=(|| {
+                    let _lease=Lease::take(&sub.id).ok_or("Подписка уже обновляется")?;
+                    let url=keyring::Entry::new("AtlasVPN",&sub.id).map_err(|_|"Хранилище Windows недоступно")?
+                        .get_password().map_err(|_|"Нет URL-подписки")?;
+                    subscriptions::download(&url,connected,&sub.options)
+                })();
+                (sub.id.clone(),result)
+            })).collect();
+            jobs.into_iter().filter_map(|job|job.join().ok()).collect::<Vec<_>>()
+        });
+        if results.len()!=pair.len() { all_ok=false; }
+        for (id,result) in results {
+            let sub=next.subscriptions.iter_mut().find(|s|s.id==id).unwrap();
+            match result {
+                Ok(downloaded) => {
+                    let nodes:Vec<_>=downloaded.nodes.into_iter().filter(|node|sub.source.accepts(node)).collect();
+                    if nodes.is_empty() {all_ok=false;sub.error=Some("Источник не содержит серверов выбранного типа".into());continue;}
+                    sub.servers=stable_names(&sub.servers,nodes,&id);
+                    sub.options=downloaded.options; sub.updated_at=model::now(); sub.error=None; changed=true;
+                }
+                Err(_) => { all_ok=false; sub.error=Some("Автоматическое обновление подписки не выполнено".into()); }
+            }
+        }
+    }
+    if stop.load(Ordering::SeqCst) { return; }
+    // Serialize with manual settings/subscription changes; never overwrite a new revision.
+    if let Ok(mut app)=shared.lock() {
+        if stop.load(Ordering::SeqCst) {return;}
+        let current=before.client.recovery_command("recovery_status",serde_json::Value::Null).unwrap_or_default();
+        if app.revision!=before.revision || current["refreshTicket"]!=operation || current["phase"]!="REFRESHING_SUBSCRIPTIONS" {
+            all_ok=false;
+        } else if changed {
+            model::repository::reconcile_references(&app.settings,&mut next);
+            if !["AUTO","FAILOVER"].contains(&next.selected.as_str()) && !next.servers().iter().any(|n|n["name"]==next.selected) {
+                next.selected="AUTO".into();
+            }
+            if app.core.validate(&next).and_then(|_|app.save(next)).is_err() { all_ok=false; }
+            app.snapshot();
+        }
+    } else { all_ok=false; }
+    let _=before.client.recovery_command("recovery_refresh_result",json!({"ticket":operation,"success":all_ok}));
+}
+
+/// Preserve selections and favourites when a provider reorders identical nodes.
+pub(crate) fn stable_names(old: &[serde_json::Value], nodes: Vec<serde_json::Value>, id: &str) -> Vec<serde_json::Value> {
+    subscriptions::reconcile_nodes(id,nodes,old)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn recovered_alternate_does_not_refresh_a_healthy_active_subscription() {
-        let failed=HashSet::from(["old".to_owned()]);
-        let healthy=json!({"proxies":{"ATLAS":{"now":"AUTO"},"AUTO":{"now":"replacement"},"replacement":{}}});
-        assert!(failed_active_path(failed.clone(),&healthy).is_empty());
-        let broken=json!({"proxies":{"ATLAS":{"now":"old"},"old":{}}});
-        assert!(failed_active_path(failed,&broken).contains("old"));
-    }
     #[test]
     fn independent_schedules_retry_without_reloading_healthy_subscriptions() {
         assert_eq!(reason(true,100,None,101,false,1800),Some("startup"));
@@ -154,11 +193,10 @@ mod tests {
         assert!(Lease::take("test-A").is_some()); drop(b);
     }
     #[test]
-    fn recovered_or_old_samples_do_not_trigger_downloads() {
-        let lines=vec![format!("ATLAS_EVENT {}",json!({"kind":"active_node_sample","at":100,"name":"A","responded":false})),
-            format!("ATLAS_EVENT {}",json!({"kind":"active_node_sample","at":110,"name":"A","responded":true}))];
-        assert!(failed_nodes(&lines,120).is_empty());
-        assert!(failed_nodes(&lines[..1],170).is_empty());
-        assert!(failed_nodes(&lines[..1],120).contains("A"));
+    fn provider_reordering_preserves_names_and_distinct_credentials() {
+        let old=vec![json!({"name":"favourite","server":"a","password":"one"}),json!({"name":"second","server":"a","password":"two"})];
+        let new=vec![json!({"name":"renamed","server":"a","password":"two"}),json!({"name":"renamed","server":"a","password":"one"})];
+        let nodes=stable_names(&old,new,"short");
+        assert_eq!(nodes[0]["name"],"second"); assert_eq!(nodes[1]["name"],"favourite");
     }
 }

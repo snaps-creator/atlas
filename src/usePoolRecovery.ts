@@ -53,7 +53,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
       if (!valid(revision)) return;
       const settings = latest.current!.settings;
       publish(observedHealth(allSubscriptions(settings).flatMap(sub => sub.servers.map(server => server.name)), proxies,
-        Math.max(30000, (settings.autoTestIntervalSeconds ?? 300) * 2000)));
+        30000));
     };
     const check = async (force = false) => {
       if (!alive || pending || (!force && Date.now() < nextCheck)) return;
@@ -67,8 +67,8 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
         if (!force) {
           const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");
           if (!valid(revision)) return;
-          publish(observedHealth(names, proxies, Math.max(30000, (initial.settings.autoTestIntervalSeconds ?? 300) * 2000)));
-          nextCheck = Date.now() + 30000;
+          publish(observedHealth(names, proxies, 30000));
+          nextCheck = Date.now() + 5000;
           return;
         }
         publish({ phase: "checking", text: "Проверяем серверы всех подписок…", checkedAt: Date.now() });
@@ -79,7 +79,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
         else publish(verdict);
         // Only an explicit diagnostic request scans the full pool. The service
         // owns periodic checks and selection while the UI remains passive.
-        nextCheck = Date.now() + 30000;
+        nextCheck = Date.now() + 5000;
       } catch (error) {
         if (valid(revision)) publish({ phase: "local_error", text: `Проверка или восстановление Atlas не завершены: ${String(error)}. Недоступность всех VPN-серверов не подтверждена.`, checkedAt: Date.now() });
         nextCheck = Date.now() + 5000;

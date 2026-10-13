@@ -14,6 +14,27 @@ fn legacy_rules_semantics_version() -> u8 { 1 }
 fn default_auto_search_ping_ms() -> u64 { 150 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default,rename_all="camelCase")]
+pub struct RecoveryPolicy {
+    pub retry_base_seconds: u64,
+    pub retry_max_seconds: u64,
+    pub refresh_interval_seconds: u64,
+    pub switch_cooldown_seconds: u64,
+}
+impl Default for RecoveryPolicy {
+    fn default() -> Self { Self {retry_base_seconds:10,retry_max_seconds:300,refresh_interval_seconds:300,switch_cooldown_seconds:30} }
+}
+impl RecoveryPolicy {
+    pub fn valid(&self) -> bool {
+        (1..=300).contains(&self.retry_base_seconds) && (self.retry_base_seconds..=3600).contains(&self.retry_max_seconds)
+            && (60..=86400).contains(&self.refresh_interval_seconds) && self.switch_cooldown_seconds<=300
+    }
+    pub fn retry_delay(&self, failures: u32) -> u64 {
+        self.retry_base_seconds.saturating_mul(1u64<<failures.saturating_sub(1).min(10)).min(self.retry_max_seconds)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Route {
     Proxy,
@@ -87,6 +108,8 @@ pub struct Settings {
     #[serde(default)]
     pub last_window_hidden: bool,
     #[serde(default)]
+    pub recovery_policy: RecoveryPolicy,
+    #[serde(default)]
     pub tun_stack: TunStack,
     #[serde(default)]
     pub routing_mode: RoutingMode,
@@ -115,6 +138,7 @@ impl Default for Settings {
             selected_node_id: "AUTO".into(),
             user_disconnected: false,
             last_window_hidden: false,
+            recovery_policy: RecoveryPolicy::default(),
             tun_stack: TunStack::Gvisor,
             routing_mode: RoutingMode::Rule,
             groups: vec![],

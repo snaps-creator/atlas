@@ -1,4 +1,22 @@
 import { expect, test, vi } from "vitest";
+import { freshLatency, latencyRank } from "./latency";
+
+test("устаревшее измерение и превышение порога не выглядят свежим успехом", () => {
+  const value: Latency = {status:"ok",delay:80,attempts:1,measuredAt:1000};
+  expect(freshLatency(value,150,2000)?.status).toBe("ok");
+  expect(freshLatency({...value,delay:200},150,2000)?.status).toBe("high_latency");
+  expect(freshLatency(value,150,32000)?.status).toBe("stale");
+  expect(latencyRank(value)).toBe(Infinity);
+  expect(latencyLabel({status:"timeout",delay:null,attempts:1})).toBe("Таймаут");
+  expect(latencyLabel({status:"queued",delay:null,attempts:0})).toBe("В очереди");
+});
+
+test("сбой хранит последнее успешное измерение и реальное время попытки", () => {
+  const names=new Set(["node"]), identities={node:"identity"};
+  const ok=applyLatencyProgress({}, {batchId:"b",probeId:"identity",name:"node",result:{status:"ok",delay:60,attempts:1,measuredAt:1000}},"b",identities,names);
+  const failure=applyLatencyProgress(ok,{batchId:"b",probeId:"identity",name:"node",result:{status:"timeout",delay:null,attempts:1,measuredAt:2000}},"b",identities,names);
+  expect(failure.node).toMatchObject({lastSuccessAt:1000,lastDelay:60,measuredAt:2000,status:"timeout"});
+});
 import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, boundedLatency, boundedBatch, historyLatency, latencyLabel, testPool, LatencyEpoch, type Latency } from "./latency";
 
 test("смена выбора сохраняет результаты; замена одной подписки не стирает остальные", () => {
@@ -65,11 +83,11 @@ test("ответ старой сессии и её очередь не затр�
 });
 
 test("ошибка контроллера не означает недоступность сервера", () => {
-  expect(latencyLabel()).toBe("—");
+  expect(latencyLabel()).toBe("Не проверен");
   expect(latencyLabel({ status: "error", delay: null, attempts: 0 })).toBe("Ошибка проверки");
   expect(
     latencyLabel({ status: "unreachable", delay: null, attempts: 4 }),
-  ).toBe("Таймаут");
+  ).toBe("Недоступен");
   expect(latencyLabel({ status: "ok", delay: 0, attempts: 1 })).toBe("0 мс");
 });
 

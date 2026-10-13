@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.0.1 (unpublished)
+
+- Monitor the active connection every second with bounded probes, fresh latency state and one recovery coordinator.
+- Verify replacements against the configured latency limit and live listener traffic; roll back failed switches before retrying.
+- Refresh URL subscriptions after exhausting candidates, preserve source-scoped node references, then rescan and notify Windows on failure.
+- Retain the 2.5.1 startup, transactional updater, node repository, HTTPS confirmation and auto-optimization preference.
+- Improve dark native select options and expose recovery/freshness state in the interface.
+- Record local checks, the scaled scheduler benchmark and remaining installed-network acceptance in [the recovery report](docs/RECOVERY-REFACTOR-2026-10.md).
+
 ## 2.5.1 (unpublished)
 
 - Combine URL subscriptions and manual VLESS sources in one repository, Add source dialog and server list; preserve source-scoped identity and selection across migration and refresh.

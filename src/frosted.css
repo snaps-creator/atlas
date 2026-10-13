@@ -48,6 +48,13 @@ button.primary,button.primary:hover { background:rgba(186,214,247,.14); border-c
 button.selected { color:var(--ink); background:var(--wash); border-color:var(--line); }
 button:focus-visible,a:focus-visible { outline:2px solid var(--link); outline-offset:3px; }
 input,select,textarea { background:var(--wash); color:var(--ink); border-color:var(--line); border-radius:6px; }
+/* Native popup surfaces need opaque theme colours in Chromium/CEF on Windows. */
+select option, select optgroup { background:var(--surface); color:var(--ink); }
+select option:checked { background:var(--surface); color:var(--ink); font-weight:600; }
+select:focus-visible { outline:2px solid var(--link); outline-offset:2px; }
+select:disabled, select option:disabled { color:var(--muted); }
+.version .sidebar-update { background:#f3cb56; color:#172235; }
+.version .sidebar-update:hover:not(:disabled) { background:#ffdd77; }
 input::placeholder,textarea::placeholder { color:var(--muted); }
 .connection-hero,.dashboard-panel,.settings-section,.list,.table-wrap,.rule-checks,.onboarding,.update-banner,.log-view,.empty { border:1px solid var(--line); border-radius:16px; background:rgba(186,214,247,.025); box-shadow:var(--glass); }
 .connection-hero { position:relative; overflow:hidden; padding:22px 26px 0; }

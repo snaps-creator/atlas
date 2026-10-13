@@ -19,26 +19,23 @@ events record an operation ID, lock wait and execution time without payloads.
 Regression checks hold a command lock while 32 snapshot readers complete, and
 exercise 20 simultaneous frontend reads followed by failure and a fresh retry.
 
-AUTO and FAILOVER monitor the actual selected node. A single asynchronous probe
-starts every 10 seconds when the previous probe has completed. Probes never
-overlap with themselves; controller errors are recorded separately from remote
-probe failures. The control URL is Cloudflare, without gstatic.
+AUTO and FAILOVER monitor the selected node once per second, with one pending
+probe at a time. With autoOptimize enabled, the first sample above
+autoSearchPingMs (default 150 ms) starts a bounded six-worker candidate search.
+Confirmed failure starts recovery regardless of autoOptimize. A candidate must meet that
+threshold. Only the service changes the selector; a fresh node check, real
+HTTP traffic through its live proxy listener and selector confirmation precede
+success. Manual selections invalidate automatic work. A failed switch restores
+the former selector without claiming that the former path is healthy.
 
-The persistent `autoSearchPingMs` setting defaults to 150 ms (range 1–5000).
-Three consecutive readings above this threshold enable a background search,
-with at most two candidate probes at once. A replacement must improve latency
-by both 30 ms and 20%, pass two observations, and respect a 60-second hold.
-A completed unsuccessful search waits 60 seconds before another pass. Healthy
-active nodes no longer trigger the old five-minute pool scan.
+An exhausted search requests one bounded subscription refresh and rescan.
+Failed incidents use exponential backoff, a refresh cooldown, and a single
+Windows notification. A new ticket identifies each permitted refresh within
+an incident. The recoveryPolicy defaults preserve old settings compatibility.
 
-On a failed active probe, recovery takes priority over optimization and
-quarantine diagnosis. Two workers search candidates ranked by core health
-history. The first confirmed response is submitted immediately; it does not
-wait for the other worker. The service alone commits the selector change.
-The previous node is quarantined for a later recheck. If replacements are
-exhausted, the original node is checked again so a recovered path is usable.
-Configuration generations reject stale results; cancellation stops old searches
-after their in-flight probe. Manual node selection does not enable auto-switching.
+See [the October audit, validation and limitations](RECOVERY-REFACTOR-2026-10.md)
+for the precise state machine, metrics, tests and the distinction between proxy
+listener verification and an end-to-end Windows TUN acceptance check.
 
 Policy-only settings updates change service scheduling without reloading the
 network configuration or recreating TUN. Cloudflare latency is not a throughput
