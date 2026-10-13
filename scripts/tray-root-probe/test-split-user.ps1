@@ -2,18 +2,21 @@ param([switch]$Worker,[string]$Repository,[string]$Executable,[string]$Report)
 $ErrorActionPreference='Stop'
 if ($Worker) {
     if([Environment]::UserName -notmatch '^AtlasProbe[0-9a-f]{8}$'){throw 'Worker requires the private disposable diagnostic identity'}
+    Start-Transcript -LiteralPath $Report -Force | Out-Null
+    try {
     $env:GITHUB_ACTIONS='true';$env:RUNNER_OS='Windows'
     # Start-Process -Credential inherits the caller's environment even when
     # LoadUserProfile loads the new identity's hive. Bind profile paths to the
     # actual token before Add-Type or Explorer creates any per-user files.
-    $env:USERPROFILE=[Environment]::GetFolderPath('UserProfile')
-    $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
-    $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    $profile=(Get-ItemProperty -LiteralPath ('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\'+$identity.User.Value)).ProfileImagePath
+    $env:USERPROFILE=[Environment]::ExpandEnvironmentVariables($profile)
+    $env:LOCALAPPDATA=Join-Path $env:USERPROFILE 'AppData/Local'
+    $env:APPDATA=Join-Path $env:USERPROFILE 'AppData/Roaming'
     $env:TEMP=Join-Path $env:LOCALAPPDATA 'Temp';$env:TMP=$env:TEMP
+    Write-Output ('Token profile='+$env:USERPROFILE+'; temp='+$env:TEMP)
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
     Set-Location -LiteralPath $Repository
-    Start-Transcript -LiteralPath $Report -Force | Out-Null
-    try {
         Add-Type -Path scripts/installed-shell.cs
         $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
         $admin=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -34,7 +37,7 @@ if ($Worker) {
         foreach($file in $reports){$proof=Get-Content -LiteralPath $file.FullName -Raw|ConvertFrom-Json;if($proof.notifyAdd -ne 1){throw 'Native registration still failed for normal user'}}
         $reports | ForEach-Object {Copy-Item -LiteralPath $_.FullName -Destination (Split-Path $Report -Parent)}
         Write-Output 'PASS: actual native icon registration with a normal medium shell and unchanged application token logic'
-    } finally {Stop-Transcript | Out-Null}
+    } catch {$_ | Out-String | Write-Output;throw} finally {Stop-Transcript | Out-Null}
     return
 }
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows'){throw 'Disposable GitHub Windows runner required'}

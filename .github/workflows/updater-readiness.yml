@@ -70,8 +70,5 @@ jobs:
         if: always()
         with:
           name: tray-root-probe-${{ matrix.runner }}
-          path: |
-            C:/Users/runneradmin/AppData/Local/AtlasTrayRootProbe-*/*.json
-            ${{ runner.temp }}/AtlasProbe*/*.log
-            ${{ runner.temp }}/AtlasProbe*/*.json
+          path: ${{ runner.temp }}/AtlasProbe*/**
           if-no-files-found: error
