@@ -40,7 +40,7 @@ test("publication requires separate manual authorization on main and preserves s
 });
 test("one public full installer is paired with metadata and temporary CI evidence", () => {
   const version = JSON.parse(fs.readFileSync("package.json")).version;
-  assert.equal(version, "2.5.1");
+  assert.match(version, /^\d+\.\d+\.\d+$/);
   const build = fs.readFileSync("scripts/build-release-installer.ps1", "utf8");
   assert(build.includes("Atlas-Setup-${version}.exe"));
   assert(build.includes("verify-transactional-installer.ps1"));

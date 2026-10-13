@@ -15,9 +15,20 @@ pub fn node_identity(node: &Value) -> String {
     if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");fields.remove("atlas");}
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
+pub(crate) fn probe_groups(settings: &Settings) -> std::collections::BTreeMap<String,Vec<String>> {
+    let mut keys=std::collections::HashMap::new();
+    let mut groups=std::collections::BTreeMap::<String,Vec<String>>::new();
+    for mut node in settings.servers() {
+        let Some(name)=node["name"].as_str().map(str::to_owned) else { continue; };
+        node.as_object_mut().unwrap().remove("name");
+        let primary=keys.entry(node_identity(&node)).or_insert_with(||name.clone());
+        groups.entry(primary.clone()).or_default().push(name);
+    }
+    groups
+}
 // Match Clash Verge's per-node measurement without saturating the controller.
 pub fn batch_stream(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
-    display_batch_stream(client, names, DISPLAY_URL, DISPLAY_TIMEOUT_MS, progress)
+    display_batch_stream(client, names, DISPLAY_URL, DISCOVERY_TIMEOUT_MS, progress)
 }
 
 /// Run a disposable, unprivileged Mihomo instance for URL tests while Atlas
@@ -79,8 +90,11 @@ fn display_batch_stream(client: ApiClient, names: &[String], endpoint: &str, tim
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
     let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
     let names = discovery_order(names, &proxies, endpoint);
-    Ok(discover_batch(&names, timeout, &|name, deadline|
-        display_probe(&client, name, endpoint, deadline), progress))
+    for name in &names { progress(name,&json!({"status":"queued","delay":null,"attempts":0})); }
+    Ok(discover_batch(&names, timeout, &|name, deadline| {
+        progress(name,&json!({"status":"testing","delay":null,"attempts":0}));
+        display_probe(&client, name, endpoint, deadline)
+    }, progress))
 }
 
 fn discovery_order(names: &[String], proxies: &Value, endpoint: &str) -> Vec<String> {
@@ -140,7 +154,9 @@ fn run_display_batch(names: &[String], probe: &(dyn Fn(&str) -> Value + Sync),
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(name) = names.get(i) else { break; };
-                    let value = probe(name);
+                    let mut value = probe(name);
+                    value["measuredAt"]=json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+                    value["measurement"]=json!("http_via_node_ms");
                     results.lock().unwrap().insert(name.clone(), value.clone());
                     // Publish this node before waiting for any other worker.
                     progress(name, &value);
@@ -182,9 +198,23 @@ pub fn expected_status(_endpoint: &str) -> u16 {
     204
 }
 pub(crate) fn verified_probe(client: &ApiClient, name: &str, endpoint: &str) -> Result<Value,String> {
-    let path = format!("/proxies/{}/delay?timeout={DISPLAY_TIMEOUT_MS}&expected={}&url={}",encode_name(name),expected_status(endpoint),encode_name(endpoint));
-    let result = client.api("GET",&path,None)?;
-    let proxies = client.api("GET","/proxies",None)?;
+    verified_probe_with(client, name, endpoint, DISPLAY_TIMEOUT_MS, None)
+}
+pub(crate) fn verified_probe_with(client: &ApiClient, name: &str, endpoint: &str, timeout: u64,
+    cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Value,String> {
+    let started=std::time::Instant::now(); let id=uuid::Uuid::new_v4().to_string();
+    client.event(json!({"at":crate::model::now(),"kind":"ProbeStarted","probeId":id,"name":name,"timeoutMs":timeout}));
+    let mut result=verified_probe_inner(client,name,endpoint,timeout,cancelled);
+    if let Ok(value)=&mut result { value["probeId"]=json!(id); }
+    client.event(json!({"at":crate::model::now(),"kind":if result.as_ref().err().is_some_and(|e|e=="Mihomo API: HTTP 504") {"ProbeTimeout"} else {"ProbeCompleted"},
+        "probeId":id,"name":name,"success":result.is_ok(),"elapsedMs":started.elapsed().as_millis(),"measurement":"http_via_node_ms"}));
+    result
+}
+fn verified_probe_inner(client: &ApiClient, name: &str, endpoint: &str, timeout: u64,
+    cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Value,String> {
+    let path = format!("/proxies/{}/delay?timeout={timeout}&expected={}&url={}",encode_name(name),expected_status(endpoint),encode_name(endpoint));
+    let result = client.api_cancellable("GET",&path,None,cancelled)?;
+    let proxies = client.api_cancellable("GET","/proxies",None,cancelled)?;
     // Mihomo returns a delay even when expected HTTP status did not match.
     // Its per-URL alive flag includes that status check; the delay alone does not.
     let health = &proxies["proxies"][name]["extra"][endpoint];
@@ -239,7 +269,7 @@ pub(crate) fn display_probe(client: &ApiClient, name: &str, endpoint: &str, time
 fn display_attempt(endpoint: &str, mut probe: impl FnMut(&str)->Result<u64,String>) -> TestResult {
     match probe(endpoint) {
         Ok(delay) => TestResult {status:"ok".into(),delay:Some(delay),attempts:1,error:None},
-        Err(error) => TestResult {status:if matches!(error.as_str(),"Mihomo API: HTTP 503"|"Mihomo API: HTTP 504") {"unreachable"} else {"error"}.into(),
+        Err(error) => TestResult {status:if error=="Mihomo API: HTTP 504" {"timeout"} else if error=="Mihomo API: HTTP 503" {"unreachable"} else {"error"}.into(),
             delay:None,attempts:1,error:Some(error)},
     }
 }
@@ -253,6 +283,39 @@ pub(crate) fn encode_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::Subscription;
+    #[test]
+    #[ignore = "Explicit scheduler load profile; simulated network waits, no user configuration"]
+    fn scheduler_load_profile() {
+        use std::sync::{Mutex,atomic::{AtomicUsize,Ordering}};
+        fn percentile(values: &mut [u128], p: usize) -> u128 {values.sort_unstable();values[((values.len()-1)*p).div_ceil(100)]}
+        for size in [10,50,100,500,1000] {
+            for (policy,timeout) in [("baseline_two_pass",10000),("bounded_first_pass",1500)] {
+                let mut totals=Vec::new();let mut firsts=Vec::new();let mut latencies=Vec::new();let mut peak=0;
+                for _ in 0..10 {
+                    let names:Vec<_>=(0..size).map(|i|i.to_string()).collect();
+                    let active=AtomicUsize::new(0);let maximum=AtomicUsize::new(0);
+                    let first=Mutex::new(None);let completions=Mutex::new(Vec::new());let start=std::time::Instant::now();
+                    let result=discover_batch(&names,timeout,&|name,deadline| {
+                        let n=name.parse::<usize>().unwrap();
+                        let count=active.fetch_add(1,Ordering::SeqCst)+1;maximum.fetch_max(count,Ordering::SeqCst);
+                        // Deliberately scaled scheduler workload: 20% failures.
+                        std::thread::sleep(std::time::Duration::from_millis(if n%5==0 {if deadline==1500 {3}else{20}} else {1}));
+                        active.fetch_sub(1,Ordering::SeqCst);
+                        TestResult{status:if n%5==0 {"unreachable"} else {"ok"}.into(),delay:if n%5==0 {None}else{Some(80)},attempts:1,error:None}
+                    },&|_,v| {
+                        let elapsed=start.elapsed().as_micros();completions.lock().unwrap().push(elapsed);
+                        if v["status"]=="ok" { first.lock().unwrap().get_or_insert(elapsed); }
+                    });
+                    assert_eq!(result.as_object().unwrap().len(),size);assert!(maximum.load(Ordering::SeqCst)<=DISPLAY_WORKERS);
+                    peak=peak.max(maximum.load(Ordering::SeqCst));totals.push(start.elapsed().as_micros());firsts.push(first.into_inner().unwrap().unwrap());latencies.extend(completions.into_inner().unwrap());
+                }
+                println!("LOAD {}",json!({"nodes":size,"policy":policy,"runs":10,"maxWorkers":peak,
+                    "firstP50Us":percentile(&mut firsts,50),"firstP95Us":percentile(&mut firsts,95),
+                    "fullP50Us":percentile(&mut totals,50),"fullP95Us":percentile(&mut totals,95),"fullP99Us":percentile(&mut totals,99),"fullMaxUs":totals.iter().max(),
+                    "completionP95Us":percentile(&mut latencies,95),"completionP99Us":percentile(&mut latencies,99)}));
+            }
+        }
+    }
     #[test]
     fn discovery_samples_subscription_tails_and_prioritizes_known_working_nodes() {
         let names: Vec<_> = (0..174).map(|i|format!("node-{i}")).collect();
@@ -383,7 +446,7 @@ mod tests {
     #[test]
     fn display_uses_one_cloudflare_request_and_keeps_local_errors_distinct() {
         let r=display_attempt(DISPLAY_URL, |_| Err("Mihomo API: HTTP 504".into()));
-        assert_eq!(r.status,"unreachable"); assert_eq!(r.attempts,1);
+        assert_eq!(r.status,"timeout"); assert_eq!(r.attempts,1);
         let r=display_attempt(DISPLAY_URL, |_| Err("Очередь проверок серверов заполнена".into()));
         assert_eq!(r.status,"error"); assert_eq!(r.attempts,1);
     }

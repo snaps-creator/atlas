@@ -11,6 +11,7 @@ pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
     if previous.auto_test_interval_seconds != next.auto_test_interval_seconds { return false; }
     if previous.auto_search_ping_ms != next.auto_search_ping_ms { return false; }
     if previous.auto_optimize != next.auto_optimize { return false; }
+    if previous.recovery_policy != next.recovery_policy { return false; }
     let mut comparison = next.clone();
     comparison.selected = previous.selected.clone();
     generate(&comparison, "comparison")
@@ -19,6 +20,7 @@ pub fn same_network_config(previous: &Settings, next: &Settings) -> bool {
         .is_some_and(|(a, b)| a == b)
 }
 pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
+    if !s.recovery_policy.valid() { return Err("Некорректная политика восстановления".into()); }
     if !(1..=5000).contains(&s.auto_search_ping_ms) {
         return Err("Порог поиска сервера должен быть от 1 до 5000 мс".into());
     }

@@ -33,6 +33,7 @@ mod xray_config;
 mod xray_runtime;
 mod subscription_options;
 mod subscription_refresh;
+mod recovery_notification;
 #[cfg(test)]
 mod site_checks;
 mod support_report;
@@ -70,6 +71,7 @@ struct App {
     error: Option<String>,
     control_error: Option<String>,
     startup_status: Value,
+    recovery: Value,
     logs: Vec<Value>,
     reconnect: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -115,6 +117,7 @@ impl App {
         value["controlError"] = json!(self.control_error);
         value["startupStatus"] = self.startup_status.clone();
         value["desiredConnected"] = json!(self.reconnect.load(std::sync::atomic::Ordering::SeqCst));
+        value["recovery"] = if running {self.recovery.clone()} else {Value::Null};
         value["refreshingSubscriptions"] = json!(subscription_refresh::active());
         value["revision"] = json!(self.revision);
         self.published.set(value.clone());
@@ -1052,14 +1055,22 @@ async fn request_inner(
             };
             let identities: std::collections::HashMap<_,_> = settings.servers().iter()
                 .filter_map(|node| node["name"].as_str().map(|name| (name.to_owned(), latency::node_identity(node)))).collect();
+            let groups=latency::probe_groups(&settings);
+            let names:Vec<_>=names.into_iter().filter(|name|groups.contains_key(name)).collect();
             let progress = |name: &str, result: &Value| {
-                let _ = app.emit("latency-result", json!({
-                    "batchId":batch_id,"revision":revision,"name":name,"probeId":identities.get(name),"result":result
-                }));
+                for alias in groups.get(name).into_iter().flatten() {
+                    let _ = app.emit("latency-result", json!({
+                        "batchId":batch_id,"revision":revision,"name":alias,"probeId":identities.get(alias),"result":result
+                    }));
+                }
             };
             let results = if let Some(client) = client { latency::batch_stream(client, &names, &progress)? }
                 else { latency::offline_batch_stream(settings, binary, directory, &names, &progress)? };
-            Ok(json!({"revision":revision,"identities":identities,"results":results}))
+            let expanded:serde_json::Map<_,_>=groups.iter().flat_map(|(name,aliases)| {
+                let result=&results[name];
+                aliases.iter().map(move |alias|(alias.clone(),result.clone()))
+            }).collect();
+            Ok(json!({"revision":revision,"identities":identities,"results":expanded}))
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "latency" {
@@ -1248,6 +1259,7 @@ pub fn run() {
                 error: None,
                 control_error: credential_error,
                 startup_status,
+                recovery: Value::Null,
                 logs: vec![],
                 reconnect: intent.clone(),
             }));
@@ -1486,10 +1498,11 @@ pub fn run() {
                     // result from an earlier revision cannot affect a new session.
                     let observed=handle.state::<published_state::ReadState>().get().ok()
                         .filter(|v|matches!(v.status.as_str(),"Connected"|"ProtectedPause"))
-                        .map(|v|(v.revision,v.client.session_running()));
+                        .map(|v|(v.revision,v.client.session_running(),v.client.recovery_command("recovery_status",Value::Null)));
                     let Ok(mut a) = shared.try_lock() else { continue; };
-                    let service_running=observed.and_then(|(revision,result)| {
+                    let service_running=observed.and_then(|(revision,result,recovery)| {
                         if revision != a.revision { return None; }
+                        a.recovery=recovery.unwrap_or(Value::Null);
                         match result {
                             Ok(running)=>{a.control_error=None;Some(running)},
                             Err(error)=>{

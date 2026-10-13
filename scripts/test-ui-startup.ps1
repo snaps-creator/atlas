@@ -32,8 +32,8 @@ try {
         $exited = $process.WaitForExit(25000)
     }
     if (-not $exited) {
-        Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe } |
-            Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json |
+        Get-Process -Name Atlas -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } |
+            Select-Object Id,ProcessName,Path | ConvertTo-Json |
             Set-Content (Join-Path $evidence 'processes.json')
         if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
         if (Test-Path -LiteralPath "$report.lifecycle.log") { Get-Content -LiteralPath "$report.lifecycle.log" }
@@ -63,12 +63,12 @@ try {
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
-        $remaining = @(Get-CimInstance Win32_Process -Filter "Name='Atlas.exe'" | Where-Object { $_.ExecutablePath -eq $exe })
+        $remaining = @(Get-Process -Name Atlas -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe })
         if ($remaining.Count -eq 0) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($remaining.Count -ne 0) {
-        $remaining | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine |
+        $remaining | Select-Object Id,ProcessName,Path |
             ConvertTo-Json | Set-Content (Join-Path $evidence 'processes.json')
         Write-Output "UI process evidence: $evidence"
         throw 'Isolated Atlas UI left helper processes behind'

@@ -49,7 +49,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, LatencyEpoch, type Latency } from "./latency";
+import { recordLatency, latencyRank, retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, LatencyEpoch, type Latency } from "./latency";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
@@ -336,6 +336,7 @@ function App() {
   const subscriptions = allSubscriptions(s);
   const servers = subscriptions.flatMap((v) => v.servers);
   const connected = data?.running ?? false;
+  const recovering = connected && data?.recovery?.phase !== undefined && data.recovery.phase !== "CONNECTED_HEALTHY";
   const connecting = data?.status === "Connecting";
   const initializing = data?.status === "Initializing";
   const protectedPause = data?.status === "ProtectedPause";
@@ -428,7 +429,7 @@ function App() {
     let active = true;
     let unlisten: UnlistenFn | undefined;
     setLatencies(previous => ({...previous, ...Object.fromEntries(names.map(name =>
-      [name, {status:"testing" as const, delay:null, attempts:0}]))}));
+      [name, recordLatency(previous[name],{status:"queued" as const, delay:null, attempts:0})]))}));
     try {
       // Subscribe before invoking so even the first fast result is delivered.
       unlisten = await listen<LatencyProgress>("latency-result", ({payload}) => {
@@ -442,8 +443,8 @@ function App() {
         15000 + Math.ceil(names.length / 6) * 15000);
       setLatencies(previous => ({...previous, ...Object.fromEntries(names.filter(name =>
         response.identities[name] !== undefined && response.identities[name] === identitiesRef.current[name]).map(name =>
-        [name, {...(response.results[name] ?? {status:"error",delay:null,attempts:0,
-          error:"Ядро не вернуло результат для этого узла"}), measuredAt:Date.now()}]))}));
+        [name, recordLatency(previous[name],response.results[name] ?? {status:"error",delay:null,attempts:0,
+          error:"Ядро не вернуло результат для этого узла"})]))}));
     } catch (error) {
       setLatencies(previous => failPendingLatencies(previous,
         names.filter(name => identities[name] === identitiesRef.current[name]), error));
@@ -455,15 +456,15 @@ function App() {
     if (!token) return;
     setLatencies((l) => ({
       ...l,
-      [name]: { status: "testing", delay: null, attempts: 0 },
+      [name]: recordLatency(l[name],{ status: "testing", delay: null, attempts: 0 }),
     }));
     try {
       const r = await boundedLatency(request<Latency>("latency", { name }));
-      if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({ ...l, [name]: {...r,measuredAt:Date.now()} }));
+      if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({ ...l, [name]: recordLatency(l[name],r) }));
     } catch (e) {
       if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({
         ...l,
-        [name]: { status: "error", delay: null, attempts: 0, error: String(e) },
+        [name]: recordLatency(l[name],{ status: "error", delay: null, attempts: 0, error: String(e) }),
       }));
     } finally {
       latencyEpoch.current.finish(name, token);
@@ -569,7 +570,7 @@ function App() {
           </span>
           <span className="top-status">
             <i className={connected ? "dot online" : "dot"} />
-            {connected ? "Подключено" : "Не подключено"}
+            {recovering ? "Путь VPN не подтверждён" : connected ? "Подключено" : "Не подключено"}
           </span>
         </header>
         <main>
@@ -702,7 +703,7 @@ function App() {
                       <span className="badge">
                         <i className={connected ? "dot online" : "dot"} />
                         {initializing ? "ПОДГОТОВКА…" : connecting ? "ПОДКЛЮЧЕНИЕ…" : data.status === "Stopping" ? "ОТКЛЮЧЕНИЕ…" : connected
-                          ? "ТУННЕЛЬ ЗАПУЩЕН"
+                          ? (recovering ? "ПРОВЕРКА И ВОССТАНОВЛЕНИЕ" : "ТУННЕЛЬ ЗАПУЩЕН")
                           : protectedPause
                             ? "ЗАЩИЩЁННАЯ ПАУЗА"
                           : data.status === "Error"
@@ -740,7 +741,7 @@ function App() {
                         )}
                       </button>
                       <div>
-                        <h2>{initializing ? "Подготовка сети…" : connecting ? "Подключение…" : data.status === "WaitingForNetwork" ? "Ожидание сети…" : data.status === "Stopping" ? "Отключение…" : connected ? "Туннель запущен" : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
+                        <h2>{initializing ? "Подготовка сети…" : connecting ? "Подключение…" : data.status === "WaitingForNetwork" ? "Ожидание сети…" : data.status === "Stopping" ? "Отключение…" : connected ? (recovering ? "Путь VPN проверяется" : "Туннель запущен") : protectedPause ? "Защищённая пауза" : "Отключено"}</h2>
                         <p>
                           {connected
                             ? protection.detail
@@ -923,8 +924,7 @@ function App() {
                         )
                         .sort((a, b) =>
                           sortLatency
-                            ? (latencies[a.name]?.delay ?? Infinity) -
-                              (latencies[b.name]?.delay ?? Infinity)
+                            ? latencyRank(latencies[a.name]) - latencyRank(latencies[b.name])
                             : 0,
                         )
                         .map((n) => (
@@ -932,7 +932,7 @@ function App() {
                             key={n.nodeId ?? n.name} server={n}
                             selected={isServerSelected(s, n) || (connected && activeServer === n.name)}
                             favorite={isFavorite(s?.favorites ?? [], n)}
-                            latency={latencies[n.name]} disabled={busy}
+                            latency={latencies[n.name]} threshold={s?.autoSearchPingMs} disabled={busy}
                             testing={latencies[n.name]?.status === "testing"}
                             onSelect={() => s && run(() => act("select", serverSelectionPayload(n)))}
                             onTest={() => run(() => test(n.name))}

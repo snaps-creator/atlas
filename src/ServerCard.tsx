@@ -1,14 +1,16 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { Globe2, Star } from "lucide-react";
 import type { Server } from "./types";
-import { latencyLabel, type Latency } from "./latency";
+import { freshLatency, latencyLabel, type Latency } from "./latency";
 import "./servers.css";
 
-export function ServerCard({ server, selected, favorite, latency, disabled, testing, onSelect, onFavorite, onTest }: {
+export function ServerCard({ server, selected, favorite, latency, threshold, disabled, testing, onSelect, onFavorite, onTest }: {
   server: Server; selected: boolean; favorite: boolean; latency?: Latency;
+  threshold?: number;
   disabled: boolean; testing: boolean; onSelect: () => void; onFavorite: () => void; onTest: () => void;
 }) {
   const label = serverDisplayName(server.name);
+  latency = freshLatency(latency, threshold);
   const delay = latency?.status === "ok" ? latency.delay : null;
   const tone = latency?.status === "unreachable" ? "timeout" : delay == null ? "unknown" : delay < 250 ? "fast" : delay < 400 ? "medium" : "slow";
   return <article className={`server-card ${selected ? "is-selected" : ""}`}>
