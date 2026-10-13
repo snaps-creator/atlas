@@ -1,0 +1,110 @@
+name: Verify connected upgrade
+on:
+  pull_request: null
+  workflow_call:
+    inputs:
+      include_unpublished_243:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      include_unpublished_243:
+        description: Also test the unpublished 2.4.3 baseline
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  release-readiness:
+    uses: ./.github/workflows/updater-readiness.yml
+  build-installer:
+    needs: release-readiness
+    uses: ./.github/workflows/pr-installer.yml
+    secrets: inherit
+  connected-upgrade:
+    if: ${{ !cancelled() && needs.build-installer.result == 'success' && (needs.baseline-243.result == 'success' || needs.baseline-243.result == 'skipped') }}
+    needs:
+      - build-installer
+      - baseline-243
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline: ${{ fromJSON(inputs.include_unpublished_243 && '["legacy","2.4.2","2.4.3"]' || '["legacy","2.4.2"]') }}
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: Atlas-Windows-x64-${{ github.run_id }}
+          path: candidate-installer
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        if: matrix.baseline == '2.4.3'
+        with:
+          name: baseline-243-${{ github.run_id }}
+          path: baseline-installer
+      - name: Verify upgrade using the signed installer with matching build inputs
+        shell: pwsh
+        run: |
+          $candidates = @(Get-ChildItem candidate-installer -Filter 'Atlas-Setup-*.exe' -File)
+          if ($candidates.Count -ne 1) { throw 'Expected exactly one freshly built installer' }
+          node scripts/verify-installer.cjs $candidates[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate signature verification failed' }
+          $legacy = '${{ matrix.baseline }}' -eq 'legacy'
+          $baseline = if ('${{ matrix.baseline }}' -eq '2.4.3') { (Resolve-Path 'baseline-installer/Atlas_2.4.3_x64-setup.exe').Path } else { '' }
+          $env:ATLAS_BUILD_ID = "${{ github.event.pull_request.head.sha || github.sha }}"
+          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$candidates[0].FullName;LegacyBaseline=$legacy;PreviousInstaller=$baseline}
+          ./scripts/publish-verified-update.ps1 -Installer $candidates[0].FullName -VerifyOnly
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: connected-upgrade-evidence-${{ matrix.baseline }}
+          path: |
+            ${{ runner.temp }}/atlas-installed-desktop-*/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.err
+            ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.error.txt
+            ${{ runner.temp }}/atlas-ui-acceptance-*/**
+          retention-days: 7
+  baseline-243:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    if: inputs.include_unpublished_243 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      ATLAS_BUILD_ID: 49dfcde7666a58847c48c65a8a29570174316710
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 49dfcde7666a58847c48c65a8a29570174316710
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.3
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: npm install --global npm@11.16.0
+      - run: npm ci
+      - name: Build the actual unpublished 2.4.3 baseline
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/build-release-installer.ps1 -Clean -Signed -TargetDirectory t/baseline-clean -OutputDirectory artifacts/baseline
+      - uses: actions/upload-artifact@v7
+        with:
+          name: baseline-243-${{ github.run_id }}
+          path: artifacts/baseline/Atlas_2.4.3_x64-setup.exe*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

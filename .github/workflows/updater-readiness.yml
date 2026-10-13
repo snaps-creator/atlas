@@ -44,7 +44,14 @@ jobs:
       - run: npm install --global npm@11.16.0
       - run: npm ci
       - run: npm test
-      - run: node --test scripts/*.check.cjs
+      - name: Verify all contracts against the prepared PR workflows
+        shell: pwsh
+        run: |
+          # This branch's dispatch workflow deliberately cannot publish. Test
+          # the unchanged contracts against the exact prepared PR files instead.
+          Copy-Item scripts/prepared-pr-workflows/*.yml .github/workflows -Force
+          node --test scripts/*.check.cjs
+          if($LASTEXITCODE -ne 0){throw 'Prepared PR contracts failed'}
       - name: Build and verify one complete signed candidate
         shell: pwsh
         env:
