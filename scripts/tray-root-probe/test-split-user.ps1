@@ -55,6 +55,7 @@ New-Item -ItemType Directory -Path $root | Out-Null
 $report=Join-Path $root 'split-user.log'
 Add-Type -Path (Join-Path $repo 'scripts/installed-shell.cs')
 Add-Type -Path (Join-Path $PSScriptRoot 'desktop-lease.cs')
+Add-Type -Path (Join-Path $PSScriptRoot 'credential-process.cs')
 $desktopLease=[AtlasDiagnosticDesktopLease]::new($account.SID.Value)
 . (Join-Path $repo 'scripts/shell-restart-policy.ps1')
 $policy=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',$true)
@@ -65,12 +66,14 @@ try {
         $shell=[AtlasInstalledShell]::ShellPid()
         if($shell){[AtlasInstalledShell]::StopVerifiedShell($shell)}
         $command='-NoProfile -ExecutionPolicy Bypass -File "'+$PSCommandPath+'" -Worker -Repository "'+$repo+'" -Executable "'+$exe+'" -Report "'+$report+'"'
-        $worker=Start-Process -FilePath "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -Credential $credential -LoadUserProfile -ArgumentList $command -PassThru -WindowStyle Hidden
+        $plain=[Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($credential.Password)
+        try {$worker=[AtlasDiagnosticCredentialProcess]::new($name,$account.SID.Value,[Runtime.InteropServices.Marshal]::PtrToStringUni($plain),$command,$repo)}
+        finally {[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($plain)}
         try {
             if(-not $worker.WaitForExit(60000)){throw 'Normal user experiment timed out'}
             if(Test-Path -LiteralPath $report){Get-Content -LiteralPath $report | Write-Output}
             if($worker.ExitCode -ne 0){throw "Normal user experiment exit=$($worker.ExitCode)"}
-        } finally {if(-not $worker.HasExited){$worker.Kill();$worker.WaitForExit()};$worker.Dispose()}
+        } finally {$worker.Dispose()}
     }
 } finally {
     $policy.Dispose()
