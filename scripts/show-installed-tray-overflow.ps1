@@ -3,6 +3,7 @@ if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows'){throw 'Dispo
 Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
 $shell=[AtlasInstalledShell]::ShellPid();[AtlasInstalledShell]::VerifyShell($shell)
 if([AtlasInstalledShell]::Integrity($shell) -ne 8192){throw 'Notification overflow requires the ordinary fixture shell'}
+if([AtlasInstalledShell]::Integrity([uint32]$PID) -ne 8192){throw 'Notification overflow input requires an ordinary medium user'}
 Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
 $condition=[Windows.Automation.AndCondition]::new(
     [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$shell),
@@ -34,8 +35,6 @@ public static class AtlasClassicOverflow {
     [DllImport("user32.dll")] static extern uint SendInput(uint count,Input[] input,int size);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     public static void Click(uint shell) {
-        if(AtlasInstalledShell.Integrity((uint)System.Diagnostics.Process.GetCurrentProcess().Id)!=8192)throw new Exception("Chevron input must originate at medium integrity");
-        AtlasInstalledShell.VerifyShell(shell);
         var previous=SetThreadDpiAwarenessContext(new IntPtr(-4));if(previous==IntPtr.Zero)throw new Exception("Chevron physical coordinates unavailable");
         Point cursor;bool saved=GetCursorPos(out cursor);
         try {
