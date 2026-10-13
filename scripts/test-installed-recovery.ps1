@@ -49,6 +49,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot quiesce recovery fixture' }
 # pretend to kill the kernel, reboot Windows or reproduce physical power loss.
 Write-InterruptedRecoveryFixture -Root $root -Journal $journal
 foreach ($attempt in 1..2) {
+    Write-Output "STATE BEFORE RECOVERY $attempt"
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
     if ($attempt -eq 2) {
         # Reproduce an idle service/closed desktop deterministically before retry.
         Wait-RecoveryStartup
@@ -63,6 +65,9 @@ foreach ($attempt in 1..2) {
         Get-Content -LiteralPath (Join-Path $root "recovery-$attempt.err")
         throw "Installed recovery failed: $($process.ExitCode)"
     }
+    Start-Sleep -Seconds 5
+    Write-Output "STATE AFTER RECOVERY $attempt"
+    & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
     $restored = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
     if ($restored.stage -ne 'RolledBack' -or $restored.active.id -ne $previous -or $restored.network_state -ne 'restored' -or $restored.migration_state -ne 'restored') { throw 'Recovery did not durably restore the previous version and state' }
     $service = Get-CimInstance Win32_Service -Filter "Name='AtlasNetworkService'"

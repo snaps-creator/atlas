@@ -120,6 +120,7 @@ function Recovery-Root {
     return $installRoot
 }
 function Install-Checked([string]$path) {
+    if (Test-Path (Join-Path $env:LOCALAPPDATA 'net.atlasvpn.desktop/atlas.db')) { Write-Output "STATE BEFORE INSTALL $path"; & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose }
     $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
     if ($process.ExitCode -ne 0) {
@@ -359,6 +360,8 @@ rules:
         $reinstalled = Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
         if ($reinstalled.stage -ne 'Committed' -or $reinstalled.active.id -ne $journal.candidate.id) { throw 'Reinstall after recovery did not commit the candidate' }
         Write-Output 'PASS: candidate reinstalls successfully after installed rollback and repeated recovery.'
+        Write-Output 'STATE AFTER RECOVERY REINSTALL'
+        & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
         foreach ($cycle in @('upgrade uninstall','clean install uninstall')) {
             $runKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
             $approvedKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
@@ -369,6 +372,8 @@ rules:
             }
             $offlineHive=Join-Path $fixture ('offline-startup-'+[guid]::NewGuid().ToString('N'))
             & (Join-Path $PSScriptRoot 'test-offline-startup-hive.ps1') -Mode Setup -Fixture $offlineHive -InstallRoot $installRoot
+            Write-Output 'STATE BEFORE UNINSTALL'
+            & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
             $uninstaller = Join-Path $installRoot 'uninstall.exe'
             $remove = Start-Process -FilePath $uninstaller -ArgumentList @('/S',"_?=$installRoot") -WindowStyle Hidden -PassThru
             $null = $remove.Handle
@@ -401,6 +406,7 @@ rules:
             & curl.exe --fail --silent --max-time 20 https://example.com/ --output NUL
             if ($LASTEXITCODE -ne 0) { throw 'Direct network control failed after uninstall' }
             if (-not $LegacyBaseline) {
+                & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') diagnose
                 & python (Join-Path $PSScriptRoot 'installed-settings-fixture.py') verify
                 if ($LASTEXITCODE -ne 0) { throw 'Uninstall changed preserved sources, settings, references or credentials' }
             }

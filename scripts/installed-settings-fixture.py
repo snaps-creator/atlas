@@ -111,7 +111,12 @@ with sqlite3.connect(database, timeout=10) as db:
         print("Synthetic encrypted URL + VLESS state and two user credentials seeded")
     else:
         state = json.loads(dpapi(db.execute("SELECT payload FROM state WHERE id=1").fetchone()[0], False))
-        if action == "prepare-upgrade":
+        if action == "diagnose":
+            nodes = [n for s in state["subscriptions"] for n in s["servers"]]
+            print(json.dumps(dict(schema=db.execute("PRAGMA user_version").fetchone()[0],
+                favorites=state["favorites"], selected=state["selected"], selectedNodeId=state.get("selectedNodeId"),
+                nodes=[dict(name=n["name"], nodeId=n.get("atlas", {}).get("nodeId")) for n in nodes])))
+        elif action == "prepare-upgrade":
             # Establish references after the baseline has loaded the fixture.
             # Published 2.4.2 uses names/schema 2; candidate 2.4.3 already uses
             # source-scoped identities/schema 3 and has a migration backup.
