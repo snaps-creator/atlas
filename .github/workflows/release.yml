@@ -12,3 +12,4 @@ jobs:
   desktop-proof:
     if: github.ref == 'refs/heads/audit/tray-root-cause' && inputs.confirmation == 'Diagnostic only - do not publish'
     uses: ./.github/workflows/updater-readiness.yml
+    secrets: inherit

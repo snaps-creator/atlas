@@ -1,0 +1,9 @@
+[package]
+name = "atlas-offline-hive-probe"
+version = "0.0.0"
+edition = "2021"
+[dependencies]
+winreg = "=0.55.0"
+uuid = {version="=1.26.1",features=["v4"]}
+regex = "=1.13.1"
+windows-sys = {version="=0.59.0",features=["Win32_Foundation","Win32_Security","Win32_Security_Authorization","Win32_System_Threading"]}

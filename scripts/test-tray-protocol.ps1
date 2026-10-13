@@ -36,18 +36,22 @@ try {
     $native=[regex]::Match($source,"@'\r?\n([\s\S]*?)\r?\n'@").Groups[1].Value
     if (-not $native) {throw 'Native tray implementation missing'}
     Add-Type -TypeDefinition $native
+    [AtlasTrayAcceptance]::ActivateFixtureWindow([uint32]$process.Id)
+    $foregroundDeadline=[DateTime]::UtcNow.AddSeconds(2)
+    while(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id) -and [DateTime]::UtcNow -lt $foregroundDeadline){Start-Sleep -Milliseconds 25}
+    if(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id)){throw 'Real fixture input did not grant foreground to its owner'}
     $registration=[AtlasTrayAcceptance]::QueryRegisteredIcon([uint32]$process.Id)
     $actualOwner=$registration.ProcessId
     $registration.ProcessId=[uint32]$PID
-    try { [AtlasTrayAcceptance]::Open([uint32]$process.Id,$registration); throw 'Wrong registration owner accepted' }
+    try { [AtlasTrayAcceptance]::OpenProtocolFixture([uint32]$process.Id,$registration); throw 'Wrong registration owner accepted' }
     catch { if($_.Exception.ToString() -notmatch 'Registered tray proof does not match'){throw} }
     $registration.ProcessId=$actualOwner
     $actualRight=$registration.Right;$registration.Right=$registration.Left
-    try { [AtlasTrayAcceptance]::Open([uint32]$process.Id,$registration); throw 'Invalid registration rectangle accepted' }
+    try { [AtlasTrayAcceptance]::OpenProtocolFixture([uint32]$process.Id,$registration); throw 'Invalid registration rectangle accepted' }
     catch { if($_.Exception.ToString() -notmatch 'Registered tray proof does not match'){throw} }
     $registration.Right=$actualRight
     $actualWindow=$registration.Window;$registration.Window=0
-    try { [AtlasTrayAcceptance]::Open([uint32]$process.Id,$registration); throw 'Stale registration window accepted' }
+    try { [AtlasTrayAcceptance]::OpenProtocolFixture([uint32]$process.Id,$registration); throw 'Stale registration window accepted' }
     catch { if($_.Exception.ToString() -notmatch 'Registered tray proof no longer identifies'){throw} }
     $registration.Window=$actualWindow
     # Exercise the same JSON transport used between the read-only parent and
@@ -55,7 +59,7 @@ try {
     $proof=$registration | ConvertTo-Json -Compress | ConvertFrom-Json
     $registration=[AtlasTrayAcceptance+Registration]::new()
     foreach ($field in 'ProcessId','Id','Window','Left','Top','Right','Bottom') {$registration.$field=$proof.$field}
-    [AtlasTrayAcceptance]::Open([uint32]$process.Id,$registration)
+    [AtlasTrayAcceptance]::OpenProtocolFixture([uint32]$process.Id,$registration)
     $deadline=[DateTime]::UtcNow.AddSeconds(5)
     do {
         $found=[AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'Перезагрузить')
@@ -63,7 +67,6 @@ try {
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $found) {throw ('Fixture native popup unavailable: '+[AtlasTrayAcceptance]::Diagnostic)}
-    if(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id)){throw 'Actual notification-area input did not grant foreground to its native menu owner'}
     # Negative checks run only after the actual popup has been found.
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$PID,'Перезагрузить')) {throw 'Wrong popup owner accepted'}
     if ([AtlasTrayAcceptance]::HasMenuItem([uint32]$process.Id,'not-a-fixture-action')) {throw 'Wrong popup action accepted'}
@@ -77,7 +80,7 @@ try {
     $process.WaitForExit()
     if ($process.ExitCode -ne 0 -or (Get-Content (Join-Path $root 'menu.txt') -Raw).Trim() -ne 'restart') {throw 'Fixture did not acknowledge exactly the native restart action'}
     if (-not (Test-Path -LiteralPath (Join-Path $root 'tray-click.txt'))) {throw 'Missing actual tray callback evidence'}
-    Write-Output "PASS: native popup owner/label/enabled state/hit-test, wrong-owner/wrong-label/disabled rejection, actual input and callback acknowledgement; evidence=$root"
+    Write-Output "PASS: standalone callback protocol, native popup owner/label/enabled state/hit-test, negative guards and real menu input/handler acknowledgement; evidence=$root"
 } catch {
     $_ | Out-String | Set-Content -LiteralPath (Join-Path $root 'failure.log')
     throw

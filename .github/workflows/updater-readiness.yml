@@ -5,7 +5,71 @@ permissions:
   contents: read
   actions: read
 jobs:
-  readiness:
+  registry-proof:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Reproduce mixed-ACL user hive failure and verify production cleanup
+        shell: pwsh
+        run: |
+          . ./scripts/initialize-msvc.ps1
+          cargo test --locked --manifest-path scripts/offline-hive-probe/Cargo.toml -- --test-threads=1
+          if($LASTEXITCODE -ne 0){throw 'Startup ownership tests failed'}
+          cargo test --locked --manifest-path scripts/offline-hive-probe/Cargo.toml -- --ignored --nocapture --test-threads=1
+          if($LASTEXITCODE -ne 0){throw 'Real offline registry regression failed'}
+  candidate:
+    needs: registry-proof
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      ATLAS_BUILD_ID: ${{ github.sha }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/t/isolated-clean
+      CARGO_INCREMENTAL: '0'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.3
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: npm install --global npm@11.16.0
+      - run: npm ci
+      - name: Build and verify one complete signed candidate
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/build-release-installer.ps1 -Clean -Signed -TargetDirectory t/isolated-clean -OutputDirectory artifacts/isolated
+      - name: Backend and native callback regression suite
+        shell: pwsh
+        run: |
+          . ./scripts/initialize-msvc.ps1
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
+          if($LASTEXITCODE -ne 0){throw 'Backend tests failed'}
+          ./scripts/test-tray-protocol.ps1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: isolated-fixed-candidate-${{ github.sha }}
+          path: artifacts/isolated/Atlas-Setup-*.exe*
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: isolated-build-failure
+          path: temp/tray-protocol-*/**
+  installed:
+    needs: candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline: ['2.4.2', legacy]
     runs-on: windows-2022
     timeout-minutes: 40
     steps:
@@ -21,23 +85,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.1
       - uses: actions/download-artifact@v4
         with:
-          name: remediation-candidate-b766b255376a64a440a6e83f59d152944cba7d9e
+          name: isolated-fixed-candidate-${{ github.sha }}
           path: candidate
-          run-id: 38268646107
-          github-token: ${{ github.token }}
-      - name: Verify previously built signed runtime and run complete installed acceptance in a normal desktop
+      - name: Verify full signed update in an ordinary interactive desktop
         shell: pwsh
         env:
-          ATLAS_BUILD_ID: b766b255376a64a440a6e83f59d152944cba7d9e
+          ATLAS_BUILD_ID: ${{ github.sha }}
         run: |
           $installer=(Resolve-Path 'candidate/Atlas-Setup-2.5.1.exe').Path
           node scripts/verify-installer.cjs $installer
-          if($LASTEXITCODE -ne 0){throw 'Existing signed runtime did not verify'}
-          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$installer}
+          if($LASTEXITCODE -ne 0){throw 'Signed runtime did not verify'}
+          $legacy='${{ matrix.baseline }}' -eq 'legacy'
+          ./scripts/with-installed-desktop.ps1 -Script scripts/test-connected-upgrade.ps1 -Parameters @{Installer=$installer;LegacyBaseline=$legacy}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: installed-desktop-proof
+          name: isolated-proof-${{ matrix.baseline }}
           path: |
             ${{ runner.temp }}/atlas-installed-desktop-*/*.log
             ${{ runner.temp }}/atlas-connected-upgrade-*/**/*.log

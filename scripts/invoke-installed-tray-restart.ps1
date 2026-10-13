@@ -38,6 +38,7 @@ public static class AtlasTrayAcceptance {
     static string trayDiagnostic="",menuDiagnostic="";
     public static string Diagnostic { get {return trayDiagnostic+"; "+menuDiagnostic;} }
     [DllImport("user32.dll",SetLastError=true)] static extern uint SendInput(uint count,Input[] inputs,int size);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool PostMessage(IntPtr window,uint message,UIntPtr w,IntPtr l);
     [DllImport("user32.dll",SetLastError=true)] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     sealed class PhysicalCoordinates : IDisposable {
         readonly IntPtr previous;
@@ -152,6 +153,24 @@ public static class AtlasTrayAcceptance {
     }
     public static void Open(uint pid,Registration registration) {
         using(var coordinates=new PhysicalCoordinates()){OpenPhysical(pid,registration);}
+    }
+    // Unit coverage of the library's callback protocol, including injected
+    // geometry failures. Installed acceptance always uses real shell input.
+    public static void OpenProtocolFixture(uint pid,Registration registration) {
+        using(var coordinates=new PhysicalCoordinates()) {
+            if(registration==null || registration.ProcessId!=pid || registration.Id<1 || registration.Id>16 || registration.Right<=registration.Left || registration.Bottom<=registration.Top)
+                throw new Exception("Registered tray proof does not match the requested owner or valid rectangle");
+            if(InputIntegrity(pid)!=InputIntegrity((uint)Process.GetCurrentProcess().Id))throw new Exception("Protocol fixture input integrity mismatch");
+            var process=OpenProcess(0x1000,false,pid);if(process==IntPtr.Zero)throw new Exception("Protocol fixture owner unavailable");
+            try {
+                var image=new StringBuilder(32768);uint length=32768;
+                if(!QueryFullProcessImageName(process,0,image,ref length) || System.IO.Path.GetFileName(image.ToString())!="atlas-tray-protocol-fixture.exe")throw new Exception("Callback protocol injection is restricted to the standalone fixture");
+            }finally{CloseHandle(process);}
+            var window=new IntPtr(registration.Window);uint owner;GetWindowThreadProcessId(window,out owner);
+            var name=new StringBuilder(256);GetClassName(window,name,name.Capacity);
+            if(owner!=pid || name.ToString()!="tray_icon_app")throw new Exception("Registered tray proof no longer identifies the live owner window");
+            if(!PostMessage(window,6002,UIntPtr.Zero,new IntPtr(0x205)))throw new Exception("Standalone callback protocol delivery failed");
+        }
     }
     static void OpenPhysical(uint pid,Registration registration) {
         if(registration==null || registration.ProcessId!=pid || registration.Id<1 || registration.Id>16 || registration.Right<=registration.Left || registration.Bottom<=registration.Top)
