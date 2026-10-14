@@ -1,6 +1,17 @@
 import { expect, test, vi } from "vitest";
 import { freshLatency, latencyRank } from "./latency";
 
+test("измеренный пинг отображается числом без пояснений, независимо от возраста и порога", () => {
+  const measured: Latency = {status:"ok",delay:210,attempts:1,measuredAt:1000};
+  expect(latencyLabel(measured)).toBe("210 мс");
+  expect(latencyLabel(freshLatency(measured,150,2000))).toBe("210 мс");
+  expect(latencyLabel(freshLatency(measured,150,32000))).toBe("210 мс");
+  for (const status of ["ok", "high_latency", "stale"] as const) {
+    expect(latencyLabel({status,delay:null,attempts:0})).toBe("Не проверен");
+  }
+  expect(latencyLabel({status:"timeout",delay:null,lastDelay:210,attempts:1})).toBe("Таймаут");
+});
+
 test("устаревшее измерение и превышение порога не выглядят свежим успехом", () => {
   const value: Latency = {status:"ok",delay:80,attempts:1,measuredAt:1000};
   expect(freshLatency(value,150,2000)?.status).toBe("ok");

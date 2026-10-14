@@ -56,7 +56,8 @@ impl QueryJobs {
         } else {
             let distinct: HashSet<_> = self.jobs.values().filter(|job| job.delay == delay)
                 .map(|job| Arc::as_ptr(&job.work)).collect();
-            if distinct.len() >= PER_CLASS {
+            let limit = if delay { crate::latency::DISPLAY_WORKERS + PER_CLASS } else { PER_CLASS };
+            if distinct.len() >= limit {
                 return Err(if delay { "Очередь проверок серверов заполнена" } else { "Очередь чтения состояния заполнена" }.into());
             }
             let work = Arc::new(Work { cancelled: Arc::new(AtomicBool::new(false)),
@@ -129,7 +130,7 @@ mod tests {
     fn stalled_latency_jobs_cannot_consume_operational_capacity() {
         let mut jobs = QueryJobs::default();
         let mut release: Vec<mpsc::Sender<()>> = Vec::new();
-        for _ in 0..PER_CLASS {
+        for _ in 0..crate::latency::DISPLAY_WORKERS + PER_CLASS {
             let (tx, rx) = mpsc::channel();
             release.push(tx);
             jobs.start(true, move |_| { let _ = rx.recv(); Ok(Value::Null) }).unwrap();

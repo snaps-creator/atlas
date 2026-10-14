@@ -407,7 +407,7 @@ function App() {
           for (const node of servers) {
             const value = historyLatency(result.proxies[node.name]?.extra?.["http://cp.cloudflare.com/generate_204"]);
             const old = previous[node.name];
-            if (value && old?.status !== "testing" && (!old ||
+            if (value && old?.status !== "testing" && old?.status !== "queued" && (!old ||
                 (old.measuredAt !== undefined && value.measuredAt! > old.measuredAt))) next[node.name] = value;
           }
           return next;
@@ -932,7 +932,7 @@ function App() {
                             key={n.nodeId ?? n.name} server={n}
                             selected={isServerSelected(s, n) || (connected && activeServer === n.name)}
                             favorite={isFavorite(s?.favorites ?? [], n)}
-                            latency={latencies[n.name]} threshold={s?.autoSearchPingMs} disabled={busy}
+                            latency={latencies[n.name]} disabled={busy}
                             testing={latencies[n.name]?.status === "testing"}
                             onSelect={() => s && run(() => act("select", serverSelectionPayload(n)))}
                             onTest={() => run(() => test(n.name))}

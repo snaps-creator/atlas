@@ -898,6 +898,33 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 let id = queries.start(false, |_| crate::support_report::privileged_snapshot().map(|text| json!({"text":text})))?;
                 Ok(json!({"id":id}))
             }
+            "delay_many" => {
+                let paths: Vec<String> = serde_json::from_value(payload["paths"].clone())
+                    .map_err(|_| "Нет путей проверок")?;
+                if paths.len() > crate::latency::DISPLAY_WORKERS || paths.iter().any(|path|
+                    !path.starts_with("/proxies/") || !path.contains("/delay?") || !allowed_api("GET", path)) {
+                    return Err("Проверки серверов не разрешены".into());
+                }
+                let jobs: Vec<_> = paths.into_iter().map(|path| {
+                    let client = core.client();
+                    match queries.start_keyed(true, Some(path.clone()), move |cancelled|
+                        client.api_cancellable("GET", &path, None, Some(&cancelled))) {
+                        Ok(id) => json!({"id":id}),
+                        Err(error) => json!({"error":error}),
+                    }
+                }).collect();
+                Ok(json!(jobs))
+            }
+            "delay_results" => {
+                let ids: Vec<String> = serde_json::from_value(payload["ids"].clone())
+                    .map_err(|_| "Нет проверок")?;
+                if ids.len() > crate::latency::DISPLAY_WORKERS { return Err("Слишком много проверок".into()); }
+                Ok(json!(ids.into_iter().map(|id| match queries.poll(&id) {
+                    Ok(Some(value)) => json!({"id":id,"done":true,"value":value}),
+                    Ok(None) => json!({"id":id,"done":false}),
+                    Err(error) => json!({"id":id,"done":true,"error":error}),
+                }).collect::<Vec<_>>()))
+            }
             "delay" | "query" => {
                 let path = payload["path"].as_str().ok_or("Нет пути")?;
                 if (op == "delay" && !path.contains("/delay?")) || !allowed_api("GET", path) {
@@ -1395,6 +1422,78 @@ mod tests {
         assert_eq!(existing_session_action(true, true, true, false), ExistingSessionAction::Reconcile);
         assert_eq!(existing_session_action(true, false, true, false), ExistingSessionAction::WaitForRecovery);
         assert_eq!(existing_session_action(true, false, false, false), ExistingSessionAction::Inconsistent);
+    }
+
+    #[test]
+    fn batch_transport_refills_before_slow_reply_and_preserves_every_result() {
+        let (mut server, client) = pipe_pair();
+        let broker = Broker { pipe: Mutex::new(Some(client)) };
+        let count = crate::latency::DISPLAY_WORKERS + 3;
+        let names: Vec<_> = (0..count).map(|i|format!("node-{i}")).collect();
+        let (consumed, acknowledged) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut jobs = std::collections::BTreeMap::<String,String>::new();
+            let mut started = std::collections::HashSet::new();
+            let mut completed = 0;
+            let mut polls = 0;
+            while completed < count {
+                let request = receive(&mut server, Duration::from_secs(5)).unwrap();
+                let payload = &request["payload"];
+                let reply = match request["op"].as_str().unwrap() {
+                    "delay_many" => {
+                        let paths = payload["paths"].as_array().unwrap();
+                        assert!(paths.len() <= crate::latency::DISPLAY_WORKERS);
+                        json!(paths.iter().map(|path| {
+                            let path = path.as_str().unwrap();
+                            assert!(allowed_api("GET", path));
+                            assert!(path.contains("timeout=10000"));
+                            assert!(started.insert(path.to_owned()), "node was submitted twice");
+                            let id = uuid::Uuid::new_v4().to_string();
+                            jobs.insert(id.clone(), path.to_owned());
+                            json!({"id":id})
+                        }).collect::<Vec<_>>())
+                    }
+                    "delay_results" => {
+                        polls += 1;
+                        let ids = payload["ids"].as_array().unwrap();
+                        assert!(ids.len() <= crate::latency::DISPLAY_WORKERS);
+                        json!(ids.iter().map(|id| {
+                            let id = id.as_str().unwrap();
+                            let path = &jobs[id];
+                            // The slow first node must not hold the next wave.
+                            if path.contains("/node-0/") && started.len() < count {
+                                return json!({"id":id,"done":false});
+                            }
+                            let reply = if path.contains("/node-1/") {
+                                json!({"id":id,"done":true,"error":"Mihomo API: HTTP 504"})
+                            } else if path.contains("/node-2/") {
+                                json!({"id":id,"done":true,"error":"Mihomo API: HTTP 401"})
+                            } else { json!({"id":id,"done":true,"value":{"delay":210}}) };
+                            jobs.remove(id);
+                            completed += 1;
+                            reply
+                        }).collect::<Vec<_>>())
+                    }
+                    op => panic!("unexpected operation: {op}"),
+                };
+                send(&mut server, &json!({"result":reply})).unwrap();
+            }
+            assert_eq!(started.len(), count);
+            assert_eq!(polls, 2, "polls must be batched, not one IPC per node");
+            acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let published = Mutex::new(Vec::new());
+        let results = crate::latency::service_batch_stream(&broker, &names, crate::latency::DISPLAY_URL,
+            crate::latency::DISPLAY_TIMEOUT_MS, &|name,value| {
+                if value["status"] != "testing" { published.lock().unwrap().push(name.to_owned()); }
+            }).unwrap();
+        consumed.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(results.as_object().unwrap().len(), count);
+        assert_eq!(published.into_inner().unwrap().len(), count);
+        assert_eq!(results["node-0"]["delay"], 210);
+        assert_eq!(results["node-1"]["status"], "timeout");
+        assert_eq!(results["node-2"]["status"], "error");
     }
 
     #[test]

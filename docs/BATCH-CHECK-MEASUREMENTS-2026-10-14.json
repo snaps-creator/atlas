@@ -1,0 +1,60 @@
+{
+  "scope": "Isolated core, active installed VPN unchanged; excludes live service and UI. Most nodes timed out; not proof of speed on the working Clash pool.",
+  "date": "2026-10-14",
+  "dataset": "4d7ca459eaf39a0b152e091709d7994f55f01f3302da0c18b62a8078ffc70ad0",
+  "runs": [
+    {
+      "policy": "before",
+      "nodes": 250,
+      "tested": 250,
+      "fullMs": 64944,
+      "firstMs": 3143,
+      "counts": {
+        "ok": 1,
+        "timeout": 248,
+        "unreachable": 1
+      }
+    },
+    {
+      "policy": "after",
+      "nodes": 250,
+      "tested": 250,
+      "fullMs": 41883,
+      "firstMs": 11743,
+      "counts": {
+        "ok": 2,
+        "timeout": 247,
+        "unreachable": 1
+      }
+    },
+    {
+      "policy": "before",
+      "nodes": 250,
+      "tested": 250,
+      "fullMs": 64971,
+      "firstMs": 3186,
+      "counts": {
+        "ok": 1,
+        "timeout": 248,
+        "unreachable": 1
+      }
+    },
+    {
+      "policy": "after",
+      "nodes": 250,
+      "tested": 250,
+      "fullMs": 41819,
+      "firstMs": 11662,
+      "counts": {
+        "ok": 1,
+        "timeout": 248,
+        "unreachable": 1
+      }
+    }
+  ],
+  "lostPreviouslySuccessfulNodes": [
+    0,
+    0
+  ],
+  "coreSha256": "23285b575b41ea21085c71c3c722940ab6669c2340374c49eddb05bb51d508c1"
+}
