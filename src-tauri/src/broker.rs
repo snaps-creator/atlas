@@ -1128,7 +1128,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 Ok(json!({"running":running,"guard":*configured && running,
                     "adapter":guard.as_ref().map(|g|g.diagnostic()).unwrap_or_else(network_guard::tun_diagnostic),
                     "serviceProcessState":"Running","serviceChannelState":"Connected",
-                    "sessionId":session_id.as_ref().map(ToString::to_string),"networkEpoch":*network_epoch,
+                    "sessionId":session_id.as_ref().map(ToString::to_string),"networkEpoch":*network_epoch,"corePid":core.child.as_ref().map(|child|child.id()),
                     "recovery":recovery.status(),
                     "state":if *configured && running { "Connected" }
                         else if guard.is_some() { "ProtectedPause" } else { "Disconnected" }}))

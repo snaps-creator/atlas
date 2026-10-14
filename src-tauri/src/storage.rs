@@ -338,6 +338,13 @@ impl Store {
         }
         self.write_operational(&persisted)
     }
+    pub fn save_subscription_check(&mut self, settings: &Settings, id: &str) -> Result<(),String> {
+        let mut persisted=self.load()?;
+        let current=settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка удалена")?;
+        let source=persisted.subscriptions.iter_mut().find(|s|s.id==id).ok_or("Подписка удалена")?;
+        source.updated_at=current.updated_at;source.error=current.error.clone();source.options=current.options.clone();
+        self.write_operational(&persisted)
+    }
     fn write_operational(&mut self, settings: &Settings) -> Result<(), String> {
         let data = crypt(&serde_json::to_vec(settings).map_err(|e| e.to_string())?, true)?;
         self.db.execute("INSERT INTO state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![data]).map_err(|e| e.to_string())?;
@@ -358,6 +365,21 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conditional_check_preserves_profiles_preferences_and_checkpoints() {
+        let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let settings=decode_settings(&serde_json::to_vec(&legacy_fixture()).unwrap()).unwrap();
+        store.save(&settings).unwrap();
+        let mut edited=settings.clone();edited.theme="dark".into();store.save(&edited).unwrap();
+        let mut checked=edited.clone();
+        checked.subscriptions[0].updated_at=123456;
+        checked.subscriptions[0].options.etag=Some("fixture-etag".into());
+        let id=checked.subscriptions[0].id.clone();
+        store.save_subscription_check(&checked,&id).unwrap();
+        assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(),serde_json::to_value(checked).unwrap());
+        assert_eq!(store.previous().unwrap().theme,settings.theme);
+        assert_eq!(store.db.query_row("SELECT COUNT(*) FROM backups",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
     #[test]
     fn visibility_crash_window_preserves_restore_and_explicit_disconnect() {
         let mut store=Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();

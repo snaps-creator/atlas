@@ -76,7 +76,7 @@ finally { ConvertTo-Json -InputObject $global:atlasTestApiCalls -Depth 5 | Set-C
 `);
   for (const fail of ['0','1']) {
     const published=spawnSync('pwsh',['-NoProfile','-File','run.ps1'],{cwd:root,encoding:'utf8',env:{...process.env,
-      GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_EVENT_NAME:'workflow_dispatch',ATLAS_RELEASE_AUTHORIZATION:'Publish Atlas 2.5.1',GITHUB_STEP_SUMMARY:'',ATLAS_TEST_FAIL_UPLOAD:fail}});
+      GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_EVENT_NAME:'workflow_dispatch',ATLAS_RELEASE_AUTHORIZATION:'Publish Atlas 3.0.3',GITHUB_STEP_SUMMARY:'',ATLAS_TEST_FAIL_UPLOAD:fail}});
     assert.ifError(published.error);
     assert(fs.existsSync(path.join(root,'calls.json')),published.stdout+'\n'+published.stderr);
     const calls=JSON.parse(fs.readFileSync(path.join(root,'calls.json')));

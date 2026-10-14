@@ -7,11 +7,18 @@ export type Latency = {
   lastSuccessAt?: number;
   lastDelay?: number;
   measurement?: "http_via_node_ms";
+  lastAttemptAt?: number;
+  attemptId?: number;
+  networkGeneration?: number;
+  probeId?: string;
 };
 
 export type LatencyProgress = { batchId: string; probeId: string; name: string; result: Latency };
 
 export function recordLatency(old: Latency | undefined, result: Latency): Latency {
+  if (result.status === "testing" || result.status === "queued") {
+    return old ? {...old,lastAttemptAt:result.lastAttemptAt ?? Date.now()} : {...result,lastAttemptAt:Date.now()};
+  }
   const now=result.measuredAt ?? Date.now();
   return {...result,measuredAt:now,measurement:"http_via_node_ms",
     lastSuccessAt:result.status === "ok" ? now : old?.lastSuccessAt ?? (old?.status === "ok" ? old.measuredAt : undefined),
@@ -83,21 +90,17 @@ export class LatencyEpoch {
 }
 
 export function latencyLabel(value?: Latency): string {
-  if (value && ["ok", "high_latency", "stale"].includes(value.status) && value.delay !== null)
+  if (value && ["ok", "high_latency"].includes(value.status) && value.delay !== null && Number.isFinite(value.delay) && value.delay >= 0)
     return `${value.delay} мс`;
-  if (value?.status === "timeout") return "Таймаут";
-  if (value?.status === "unreachable") return "Недоступен";
-  if (value?.status === "queued") return "В очереди";
-  if (value?.status === "testing") return "Проверка…";
-  if (value?.status === "error") return "Ошибка проверки";
-  if (value?.status === "not_connected") return "Нет подключения";
-  return "Не проверен";
+  return "";
 }
 
 export function freshLatency(value?: Latency, threshold = Infinity, now = Date.now()): Latency | undefined {
   if (!value) return;
+  if (["ok","high_latency"].includes(value.status) && (value.measuredAt === undefined || !Number.isFinite(value.measuredAt) ||
+      value.delay === null || !Number.isFinite(value.delay) || value.delay < 0)) return {...value,status:"stale",delay:null};
   if (value.status !== "testing" && value.status !== "queued" && value.measuredAt !== undefined &&
-      (now - value.measuredAt > 30_000 || value.measuredAt > now + 5000)) return {...value,status:"stale"};
+      (now - value.measuredAt >= 30_000 || value.measuredAt > now + 5000)) return {...value,status:"stale",delay:null};
   if (value.status === "ok" && value.delay !== null && value.delay > threshold) return {...value,status:"high_latency"};
   return value;
 }

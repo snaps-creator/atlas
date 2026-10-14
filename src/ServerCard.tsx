@@ -1,7 +1,7 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { Globe2, Star } from "lucide-react";
 import type { Server } from "./types";
-import { latencyLabel, type Latency } from "./latency";
+import { freshLatency, latencyLabel, type Latency } from "./latency";
 import "./servers.css";
 
 export function ServerCard({ server, selected, favorite, latency, disabled, testing, onSelect, onFavorite, onTest }: {
@@ -9,7 +9,8 @@ export function ServerCard({ server, selected, favorite, latency, disabled, test
   disabled: boolean; testing: boolean; onSelect: () => void; onFavorite: () => void; onTest: () => void;
 }) {
   const label = serverDisplayName(server.name);
-  const delay = latency && ["ok", "high_latency", "stale"].includes(latency.status) ? latency.delay : null;
+  latency = freshLatency(latency?.probeId !== undefined && latency.probeId !== server.probeId ? undefined : latency);
+  const delay = latency && ["ok", "high_latency"].includes(latency.status) ? latency.delay : null;
   const tone = latency?.status === "unreachable" ? "timeout" : delay == null ? "unknown" : delay < 250 ? "fast" : delay < 400 ? "medium" : "slow";
   return <article className={`server-card ${selected ? "is-selected" : ""}`}>
     <button className="server-card-select" onClick={onSelect} disabled={disabled} aria-pressed={selected} title={label}>

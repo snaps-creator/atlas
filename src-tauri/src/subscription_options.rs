@@ -8,6 +8,10 @@ pub const DEFAULT_USER_AGENT: &str = "Happ/4.3.0";
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all="camelCase")]
 pub struct Options {
+    // Validators belong to the exact URL and user-agent representation.
+    pub cache_key: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
     pub user_agent: Option<String>,
     pub user_agent_override: Option<String>,
     pub fallback_url: Option<String>,

@@ -40,6 +40,11 @@ $inspection = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
 if ($null -eq $inspection.verifiedWintunDriver) { throw 'Native helper did not return driver verification evidence' }
 Write-Output 'PASS: embedded native maintenance starts independently of CEF; read-only adapter inspection completed.'
 & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $payload 'Atlas.exe')
+$previousLatencySmoke=$env:ATLAS_LATENCY_UI_SMOKE
+try {
+    $env:ATLAS_LATENCY_UI_SMOKE='1'
+    & (Join-Path $PSScriptRoot 'test-ui-startup.ps1') -Executable (Join-Path $payload 'Atlas.exe')
+} finally { $env:ATLAS_LATENCY_UI_SMOKE=$previousLatencySmoke }
 & (Join-Path $PSScriptRoot 'test-service-identity.ps1') -Executable (Join-Path $payload 'Atlas.exe') -RequirePackagedService:$transactional
 # Remove only this uniquely created test directory, never an installation.
 $resolved = [IO.Path]::GetFullPath($extract)
