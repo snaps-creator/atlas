@@ -513,7 +513,7 @@ function App() {
           {nav.map(([p, Icon]) => (
             <button
               key={p}
-              className={`${page === p ? "active" : ""}${p === "Updates" ? " update-attention" : ""}`}
+              className={page === p ? "active" : ""}
               onClick={() => setPage(p)}
             >
               <Icon size={18} strokeWidth={1.7} />
