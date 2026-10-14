@@ -1201,6 +1201,9 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    pub(crate) fn broker_client(&self) -> Option<std::sync::Arc<crate::broker::Broker>> {
+        self.broker.clone()
+    }
     pub(crate) fn session_running(&self) -> Result<bool,String> {
         if let Some(broker)=&self.broker {
             if !broker.alive() {
@@ -1300,7 +1303,7 @@ impl ApiClient {
             return broker.call("api", json!({"method":method,"path":path}));
         }
         // Service-owned scheduled probes and desktop-submitted probes share
-        // one eight-slot admission gate before the network timeout starts.
+        // one bounded admission gate before the network timeout starts.
         let _permit = if path.contains("/delay?") {
             Some(crate::query_admission::acquire_cancellable(true, cancelled)?)
         } else { None };

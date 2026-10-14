@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 pub const DISPLAY_URL: &str = "http://cp.cloudflare.com/generate_204";
 pub const DISPLAY_TIMEOUT_MS: u64 = 10000;
-const DISCOVERY_TIMEOUT_MS: u64 = 1500;
-const DISPLAY_WORKERS: usize = 6;
+pub(crate) const DISPLAY_WORKERS: usize = 64;
 /// Opaque identity of actual node parameters, independent of UI preferences,
 /// selected route and subscription refresh timestamps. Never expose credentials.
 pub fn node_identity(node: &Value) -> String {
@@ -15,20 +14,9 @@ pub fn node_identity(node: &Value) -> String {
     if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");fields.remove("atlas");}
     format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
 }
-pub(crate) fn probe_groups(settings: &Settings) -> std::collections::BTreeMap<String,Vec<String>> {
-    let mut keys=std::collections::HashMap::new();
-    let mut groups=std::collections::BTreeMap::<String,Vec<String>>::new();
-    for mut node in settings.servers() {
-        let Some(name)=node["name"].as_str().map(str::to_owned) else { continue; };
-        node.as_object_mut().unwrap().remove("name");
-        let primary=keys.entry(node_identity(&node)).or_insert_with(||name.clone());
-        groups.entry(primary.clone()).or_default().push(name);
-    }
-    groups
-}
-// Match Clash Verge's per-node measurement without saturating the controller.
+// Use the same per-node URL measurement as Clash Verge, with bounded concurrency.
 pub fn batch_stream(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
-    display_batch_stream(client, names, DISPLAY_URL, DISCOVERY_TIMEOUT_MS, progress)
+    display_batch_stream(client, names, DISPLAY_URL, DISPLAY_TIMEOUT_MS, progress)
 }
 
 /// Run a disposable, unprivileged Mihomo instance for URL tests while Atlas
@@ -90,20 +78,88 @@ fn display_batch_stream(client: ApiClient, names: &[String], endpoint: &str, tim
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
     let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
     let names = discovery_order(names, &proxies, endpoint);
-    for name in &names { progress(name,&json!({"status":"queued","delay":null,"attempts":0})); }
+    if let Some(broker) = client.broker_client() {
+        return service_batch_stream(&broker, &names, endpoint, timeout, progress);
+    }
+    // The caller already queues the full list. Publish only starts and results.
     Ok(discover_batch(&names, timeout, &|name, deadline| {
         progress(name,&json!({"status":"testing","delay":null,"attempts":0}));
         display_probe(&client, name, endpoint, deadline)
     }, progress))
 }
 
+// One IPC request submits a set of independent tests; one poll collects their
+// completed replies. Do not serialize a round trip for every in-flight node.
+pub(crate) fn service_batch_stream(broker: &crate::broker::Broker, names: &[String], endpoint: &str, timeout: u64,
+    progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value,String> {
+    use std::time::{Duration, Instant};
+    let mut next = 0;
+    let mut pending = std::collections::BTreeMap::<String,(String,Instant)>::new();
+    let mut results = serde_json::Map::new();
+    let mut publish = |name: &str, reply: Result<Value,String>| {
+        let result = display_attempt(endpoint, |_| reply.clone().and_then(|value|
+            value["delay"].as_u64().ok_or("Ядро не вернуло задержку".into())));
+        let mut value = serde_json::to_value(result).unwrap();
+        stamp_result(&mut value);
+        progress(name, &value);
+        results.insert(name.to_owned(), value);
+    };
+    while next < names.len() || !pending.is_empty() {
+        let end = (next + DISPLAY_WORKERS - pending.len()).min(names.len());
+        if end > next {
+            let paths: Vec<_> = names[next..end].iter().map(|name|display_path(name, endpoint, timeout)).collect();
+            let jobs = crate::query_admission::retry_busy(Instant::now()+Duration::from_secs(5), ||
+                broker.call("delay_many", json!({"paths":paths})))?;
+            let jobs = jobs.as_array().filter(|jobs|jobs.len()==end-next).ok_or("Некорректный ответ очереди проверок")?;
+            for (name, job) in names[next..end].iter().zip(jobs) {
+                if let Some(id) = job["id"].as_str() {
+                    progress(name, &json!({"status":"testing","delay":null,"attempts":0}));
+                    pending.insert(id.to_owned(), (name.clone(), Instant::now()));
+                } else { publish(name, Err(job["error"].as_str().unwrap_or("Проверка не запущена").to_owned())); }
+            }
+            next = end;
+        }
+        if pending.is_empty() { continue; }
+        let ids: Vec<_> = pending.keys().cloned().collect();
+        let replies = crate::query_admission::retry_busy(Instant::now()+Duration::from_secs(5), ||
+            broker.call("delay_results", json!({"ids":ids})))?;
+        let replies = replies.as_array().ok_or("Некорректный ответ проверок")?;
+        for reply in replies {
+            if reply["done"] != true { continue; }
+            let Some((name, _)) = reply["id"].as_str().and_then(|id|pending.remove(id)) else { continue; };
+            publish(&name, match reply["error"].as_str() {
+                Some(error) => Err(error.to_owned()), None => Ok(reply["value"].clone()),
+            });
+        }
+        let expired: Vec<_> = pending.iter().filter(|(_,(_,at))|at.elapsed()>=Duration::from_secs(40))
+            .map(|(id,_)|id.clone()).collect();
+        for id in expired {
+            let (name,_) = pending.remove(&id).unwrap();
+            publish(&name, Err("Проверка сервера превысила время ожидания".into()));
+        }
+        if !pending.is_empty() && (next == names.len() || pending.len() == DISPLAY_WORKERS) {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+    Ok(Value::Object(results))
+}
+
+fn stamp_result(value: &mut Value) {
+    value["measuredAt"]=json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+    value["measurement"]=json!("http_via_node_ms");
+}
+
 fn discovery_order(names: &[String], proxies: &Value, endpoint: &str) -> Vec<String> {
+    discovery_order_with_workers(names, proxies, endpoint, DISPLAY_WORKERS)
+}
+
+fn discovery_order_with_workers(names: &[String], proxies: &Value, endpoint: &str, workers: usize) -> Vec<String> {
     // Sample across the whole list: subscription tails must not sit behind
     // dozens of silently dropped connections, even on the first-ever check.
-    let width = names.len().div_ceil(DISPLAY_WORKERS).max(1);
+    let width = names.len().div_ceil(workers).max(1);
     let mut ordered = Vec::with_capacity(names.len());
     for offset in 0..width {
-        for lane in 0..DISPLAY_WORKERS {
+        for lane in 0..workers {
             if let Some(name) = names.get(lane * width + offset) { ordered.push(name.clone()); }
         }
     }
@@ -121,42 +177,31 @@ fn discovery_order(names: &[String], proxies: &Value, endpoint: &str) -> Vec<Str
 fn discover_batch(names: &[String], timeout: u64,
     probe: &(dyn Fn(&str, u64) -> TestResult + Sync),
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Value {
-    let quick = timeout.min(DISCOVERY_TIMEOUT_MS);
-    let mut results = run_display_batch(names, &|name|
-        serde_json::to_value(probe(name, quick)).unwrap(), &|name, value| {
-        // An early timeout is only a scheduling hint, never a final verdict.
-        if value["status"] != "unreachable" || quick == timeout { progress(name, value); }
-    });
-    if quick < timeout {
-        let retry: Vec<_> = names.iter().filter(|name|
-            results[*name]["status"] == "unreachable").cloned().collect();
-        let completed = run_display_batch(&retry, &|name| {
-            let mut result = probe(name, timeout);
-            result.attempts = 2;
-            serde_json::to_value(result).unwrap()
-        }, progress);
-        results.as_object_mut().unwrap().extend(completed.as_object().unwrap().clone());
-    }
-    results
+    // One real request per node, with the full network deadline. A short pass
+    // followed by full retries repeats connection setup and delays completion.
+    run_display_batch(names, &|name|
+        serde_json::to_value(probe(name, timeout)).unwrap(), progress)
 }
 
 fn run_display_batch(names: &[String], probe: &(dyn Fn(&str) -> Value + Sync),
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Value {
+    run_display_batch_with_workers(names, DISPLAY_WORKERS, probe, progress)
+}
+
+fn run_display_batch_with_workers(names: &[String], workers: usize, probe: &(dyn Fn(&str) -> Value + Sync),
+    progress: &(dyn Fn(&str, &Value) + Sync)) -> Value {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(serde_json::Map::new());
     std::thread::scope(|scope| {
-        // Keep spare controller capacity for active-node health and failover.
-        // Short discovery runs first; full retries retain the same safe limit.
-        for worker in 0..names.len().min(DISPLAY_WORKERS) {
+        // The shared admission gate reserves additional capacity for recovery.
+        for _ in 0..names.len().min(workers) {
             let (next, results) = (&next, &results);
             scope.spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(worker as u64 * 20));
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(name) = names.get(i) else { break; };
                     let mut value = probe(name);
-                    value["measuredAt"]=json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-                    value["measurement"]=json!("http_via_node_ms");
+                    stamp_result(&mut value);
                     results.lock().unwrap().insert(name.clone(), value.clone());
                     // Publish this node before waiting for any other worker.
                     progress(name, &value);
@@ -262,9 +307,12 @@ pub fn test(client: ApiClient, name: &str) -> TestResult {
 }
 pub(crate) fn display_probe(client: &ApiClient, name: &str, endpoint: &str, timeout: u64) -> TestResult {
     display_attempt(endpoint, |url| {
-        let path = format!("/proxies/{}/delay?timeout={timeout}&url={}", encode_name(name), encode_name(url));
+        let path = display_path(name, url, timeout);
         client.api("GET", &path, None).and_then(|v|v["delay"].as_u64().ok_or("Ядро не вернуло задержку".into()))
     })
+}
+fn display_path(name: &str, endpoint: &str, timeout: u64) -> String {
+    format!("/proxies/{}/delay?timeout={timeout}&url={}", encode_name(name), encode_name(endpoint))
 }
 fn display_attempt(endpoint: &str, mut probe: impl FnMut(&str)->Result<u64,String>) -> TestResult {
     match probe(endpoint) {
@@ -283,30 +331,97 @@ pub(crate) fn encode_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::Subscription;
+
+    // Frozen scheduling policy from the working tree before this fix. Used only
+    // by the opt-in network comparison, never by application code.
+    fn before_batch(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value,String> {
+        let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
+        let names = discovery_order_with_workers(names, &proxies, DISPLAY_URL, 6);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results = std::sync::Mutex::new(serde_json::Map::new());
+        for name in &names { progress(name, &json!({"status":"queued","delay":null,"attempts":0})); }
+        std::thread::scope(|scope| {
+            for worker in 0..names.len().min(6) {
+                let (next, results, names, client) = (&next, &results, &names, &client);
+                scope.spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(worker as u64 * 20));
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(name) = names.get(i) else { break; };
+                        progress(name, &json!({"status":"testing","delay":null,"attempts":0}));
+                        let value = serde_json::to_value(display_probe(client, name, DISPLAY_URL, 1500)).unwrap();
+                        results.lock().unwrap().insert(name.clone(), value.clone());
+                        progress(name, &value);
+                    }
+                });
+            }
+        });
+        Ok(Value::Object(results.into_inner().unwrap()))
+    }
+    #[test]
+    #[ignore = "Opt-in real network benchmark; ATLAS_BATCH_DATABASE is opened read-only"]
+    fn real_batch_profile() {
+        let database = std::env::var("ATLAS_BATCH_DATABASE").expect("Set ATLAS_BATCH_DATABASE");
+        let db = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let encrypted: Vec<u8> = db.query_row("SELECT payload FROM state WHERE id=1", [], |r|r.get(0)).unwrap();
+        let settings: Settings = serde_json::from_slice(&crate::storage::crypt(&encrypted, false).unwrap()).unwrap();
+        let nodes = settings.servers();
+        let names: Vec<_> = nodes.iter().filter_map(|n|n["name"].as_str())
+            .map(str::to_owned).collect();
+        assert!(!names.is_empty());
+        let start = std::time::Instant::now();
+        let first = std::sync::Mutex::new(None);
+        let progress = std::sync::Mutex::new(std::collections::HashSet::new());
+        let binary = std::env::var_os("ATLAS_BATCH_CORE").map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe"));
+        let policy = std::env::var("ATLAS_BATCH_POLICY").unwrap_or_else(|_|"after".into());
+        assert!(matches!(policy.as_str(), "before" | "after"));
+        let progress_callback = |name: &str, value: &Value| {
+            if value["status"] != "queued" && value["status"] != "testing" {
+                first.lock().unwrap().get_or_insert(start.elapsed().as_millis());
+                progress.lock().unwrap().insert(name.to_owned());
+            }
+        };
+        let results = with_offline_core(settings, binary, std::env::temp_dir(), |client| {
+            if policy == "before" { before_batch(client, &names, &progress_callback) }
+            else { batch_stream(client, &names, &progress_callback) }
+        }).unwrap();
+        let elapsed = start.elapsed().as_millis();
+        assert_eq!(results.as_object().unwrap().len(), names.len());
+        assert_eq!(progress.into_inner().unwrap().len(), names.len());
+        let mut counts = std::collections::BTreeMap::<String,usize>::new();
+        let mut outcomes = serde_json::Map::new();
+        for (name, result) in results.as_object().unwrap() {
+            *counts.entry(result["status"].as_str().unwrap().to_owned()).or_default() += 1;
+            outcomes.insert(node_identity(&json!(name)), json!({"status":result["status"],"delay":result["delay"],"attempts":result["attempts"]}));
+        }
+        println!("REAL_BATCH {}", json!({"policy":policy,"nodes":nodes.len(),"tested":names.len(),"dataset":node_identity(&json!(nodes)),
+            "fullMs":elapsed,"firstMs":first.into_inner().unwrap(),"counts":counts,"outcomes":outcomes}));
+    }
     #[test]
     #[ignore = "Explicit scheduler load profile; simulated network waits, no user configuration"]
     fn scheduler_load_profile() {
         use std::sync::{Mutex,atomic::{AtomicUsize,Ordering}};
         fn percentile(values: &mut [u128], p: usize) -> u128 {values.sort_unstable();values[((values.len()-1)*p).div_ceil(100)]}
         for size in [10,50,100,500,1000] {
-            for (policy,timeout) in [("baseline_two_pass",10000),("bounded_first_pass",1500)] {
+            for (policy,workers) in [("baseline_six_workers",6),("full_deadline_parallel",DISPLAY_WORKERS)] {
                 let mut totals=Vec::new();let mut firsts=Vec::new();let mut latencies=Vec::new();let mut peak=0;
                 for _ in 0..10 {
                     let names:Vec<_>=(0..size).map(|i|i.to_string()).collect();
                     let active=AtomicUsize::new(0);let maximum=AtomicUsize::new(0);
                     let first=Mutex::new(None);let completions=Mutex::new(Vec::new());let start=std::time::Instant::now();
-                    let result=discover_batch(&names,timeout,&|name,deadline| {
+                    let result=run_display_batch_with_workers(&names,workers,&|name| {
                         let n=name.parse::<usize>().unwrap();
                         let count=active.fetch_add(1,Ordering::SeqCst)+1;maximum.fetch_max(count,Ordering::SeqCst);
                         // Deliberately scaled scheduler workload: 20% failures.
-                        std::thread::sleep(std::time::Duration::from_millis(if n%5==0 {if deadline==1500 {3}else{20}} else {1}));
+                        std::thread::sleep(std::time::Duration::from_millis(if n%5==0 {20} else {1}));
                         active.fetch_sub(1,Ordering::SeqCst);
-                        TestResult{status:if n%5==0 {"unreachable"} else {"ok"}.into(),delay:if n%5==0 {None}else{Some(80)},attempts:1,error:None}
+                        json!({"status":if n%5==0 {"timeout"} else {"ok"},"delay":if n%5==0 {None}else{Some(80)},"attempts":1})
                     },&|_,v| {
                         let elapsed=start.elapsed().as_micros();completions.lock().unwrap().push(elapsed);
                         if v["status"]=="ok" { first.lock().unwrap().get_or_insert(elapsed); }
                     });
-                    assert_eq!(result.as_object().unwrap().len(),size);assert!(maximum.load(Ordering::SeqCst)<=DISPLAY_WORKERS);
+                    assert_eq!(result.as_object().unwrap().len(),size);assert!(maximum.load(Ordering::SeqCst)<=workers);
                     peak=peak.max(maximum.load(Ordering::SeqCst));totals.push(start.elapsed().as_micros());firsts.push(first.into_inner().unwrap().unwrap());latencies.extend(completions.into_inner().unwrap());
                 }
                 println!("LOAD {}",json!({"nodes":size,"policy":policy,"runs":10,"maxWorkers":peak,
@@ -320,7 +435,7 @@ mod tests {
     fn discovery_samples_subscription_tails_and_prioritizes_known_working_nodes() {
         let names: Vec<_> = (0..174).map(|i|format!("node-{i}")).collect();
         let cold = discovery_order(&names, &Value::Null, DISPLAY_URL);
-        assert_eq!(&cold[..6], &["node-0", "node-29", "node-58", "node-87", "node-116", "node-145"]);
+        assert_eq!(&cold[..6], &["node-0", "node-3", "node-6", "node-9", "node-12", "node-15"]);
         let mut sorted = cold.clone(); sorted.sort();
         let mut expected = names.clone(); expected.sort(); assert_eq!(sorted, expected);
         let proxies = json!({"proxies":{
@@ -332,36 +447,77 @@ mod tests {
         assert!(discovery_order(&[], &Value::Null, DISPLAY_URL).is_empty());
     }
     #[test]
-    fn full_timeouts_cannot_hold_up_discovery_and_slow_nodes_get_a_full_retry() {
+    fn every_node_gets_one_full_deadline_and_one_final_result() {
         use std::sync::{Mutex,atomic::{AtomicUsize,Ordering}};
         let names: Vec<_> = (0..18).map(|i|i.to_string()).collect();
-        let discovered = AtomicUsize::new(0);
+        let checked = AtomicUsize::new(0);
         let published = Mutex::new(Vec::new());
         let result = discover_batch(&names, DISPLAY_TIMEOUT_MS, &|name, timeout| {
-            if timeout == DISCOVERY_TIMEOUT_MS { discovered.fetch_add(1,Ordering::SeqCst); }
-            else {
-                assert_eq!(discovered.load(Ordering::SeqCst), names.len());
-                assert!(published.lock().unwrap().iter().any(|(n,_)|n=="17"));
-                assert_eq!(timeout, DISPLAY_TIMEOUT_MS);
-            }
+            checked.fetch_add(1,Ordering::SeqCst);
+            assert_eq!(timeout, DISPLAY_TIMEOUT_MS);
             if name == "17" || (name == "16" && timeout == DISPLAY_TIMEOUT_MS) {
                 TestResult { status:"ok".into(),delay:Some(80),attempts:1,error:None }
             } else if name == "15" {
                 TestResult { status:"error".into(),delay:None,attempts:1,error:Some("local IPC".into()) }
             } else {
-                TestResult { status:"unreachable".into(),delay:None,attempts:1,error:Some("Mihomo API: HTTP 504".into()) }
+                TestResult { status:"timeout".into(),delay:None,attempts:1,error:Some("Mihomo API: HTTP 504".into()) }
             }
         }, &|name,value|published.lock().unwrap().push((name.to_owned(),value.clone())));
         let published = published.into_inner().unwrap();
+        assert_eq!(checked.load(Ordering::SeqCst), names.len());
         assert_eq!(published.len(), names.len());
         assert_eq!(result["17"]["attempts"],1);
         assert_eq!(result["16"]["status"],"ok");
-        assert_eq!(result["16"]["attempts"],2);
-        assert_eq!(result["0"]["status"],"unreachable");
-        assert_eq!(result["0"]["attempts"],2);
+        assert_eq!(result["16"]["attempts"],1);
+        assert_eq!(result["0"]["status"],"timeout");
+        assert_eq!(result["0"]["attempts"],1);
         assert_eq!(result["15"]["status"],"error");
         assert_eq!(result["15"]["attempts"],1);
-        assert!(published.iter().all(|(_,v)|v["status"]!="unreachable" || v["attempts"]==2));
+        assert!(published.iter().all(|(_,v)|v["attempts"]==1));
+    }
+    #[test]
+    fn batch_keeps_a_real_controller_reply_that_takes_longer_than_short_discovery() {
+        use std::{io::{Read,Write}, net::TcpListener, time::{Duration,Instant}};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = ApiClient::loopback_fixture(listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                for _ in 0..3 {
+                    let deadline = Instant::now()+Duration::from_secs(5);
+                    let (mut stream,_) = loop {
+                        match listener.accept() {
+                            Ok(connection) => break connection,
+                            Err(e) if e.kind()==std::io::ErrorKind::WouldBlock && Instant::now()<deadline =>
+                                std::thread::sleep(Duration::from_millis(5)),
+                            Err(e) => panic!("controller fixture: {e}"),
+                        }
+                    };
+                    scope.spawn(move || {
+                        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        let mut bytes = [0;4096];
+                        let len = stream.read(&mut bytes).unwrap();
+                        let request = String::from_utf8_lossy(&bytes[..len]);
+                        let body = if request.starts_with("GET /proxies HTTP/") { "{\"proxies\":{}}" }
+                        else {
+                            assert!(request.contains("timeout=10000"));
+                            if request.contains("/slow/") { std::thread::sleep(Duration::from_millis(1700)); }
+                            "{\"delay\":210}"
+                        };
+                        write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    });
+                }
+            });
+        });
+        let completed = std::sync::Mutex::new(Vec::new());
+        let results = batch_stream(client, &["slow".into(),"fast".into()], &|name,value| {
+            if value["status"] == "ok" { completed.lock().unwrap().push(name.to_owned()); }
+        }).unwrap();
+        server.join().unwrap();
+        assert_eq!(completed.into_inner().unwrap(), ["fast", "slow"]);
+        assert_eq!(results["slow"]["delay"], 210);
+        assert_eq!(results["slow"]["attempts"], 1);
+        assert_eq!(results["fast"]["delay"], 210);
     }
     #[test]
     fn reachable_subscription_tail_is_published_before_blocked_prefix_finishes() {
@@ -373,7 +529,7 @@ mod tests {
             let names:Vec<_>=(0..174).map(|i|i.to_string()).collect();
             let names=discovery_order(&names,&Value::Null,DISPLAY_URL);
             discover_batch(&names,DISPLAY_TIMEOUT_MS,&|name,_| {
-                if name!="58" {
+                if name!="60" {
                     let deadline=std::time::Instant::now()+Duration::from_secs(5);
                     while !worker_release.load(Ordering::SeqCst) && std::time::Instant::now()<deadline {
                         std::thread::sleep(Duration::from_millis(5));
@@ -386,7 +542,7 @@ mod tests {
         let still_waiting=!worker.is_finished();
         released.store(true,Ordering::SeqCst);
         let results=worker.join().unwrap();
-        assert_eq!(first.unwrap(),"58");
+        assert_eq!(first.unwrap(),"60");
         assert!(still_waiting);
         assert_eq!(results.as_object().unwrap().len(),174);
     }

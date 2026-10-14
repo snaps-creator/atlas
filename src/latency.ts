@@ -83,12 +83,10 @@ export class LatencyEpoch {
 }
 
 export function latencyLabel(value?: Latency): string {
-  if (value?.status === "ok" && value.delay !== null)
+  if (value && ["ok", "high_latency", "stale"].includes(value.status) && value.delay !== null)
     return `${value.delay} мс`;
-  if (value?.status === "high_latency") return `${value.delay} мс · выше порога`;
   if (value?.status === "timeout") return "Таймаут";
   if (value?.status === "unreachable") return "Недоступен";
-  if (value?.status === "stale") return "Устарело";
   if (value?.status === "queued") return "В очереди";
   if (value?.status === "testing") return "Проверка…";
   if (value?.status === "error") return "Ошибка проверки";

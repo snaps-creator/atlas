@@ -1,7 +1,7 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { useEffect, useState } from "react";
 import { request } from "./api";
-import { freshLatency, latencyLabel, historyLatency, type Latency, type ProxyHealth } from "./latency";
+import { latencyLabel, historyLatency, type Latency, type ProxyHealth } from "./latency";
 import type { PoolHealth } from "./usePoolRecovery";
 
 type Proxies = Record<string, ProxyHealth & { now?: string; testUrl?:string }>;
@@ -53,7 +53,7 @@ export function ActiveServer({
         const name = resolveServer(response.proxies);
         if (!name) { setValue(null); onChange?.(null); return; }
         onChange?.(name);
-        const result = freshLatency(selectedLatency(response.proxies));
+        const result = selectedLatency(response.proxies);
         setValue({name,delay:result?.status === "ok" ? result.delay : null,status:result?.status});
       } catch (error) { if (alive) setControlError(String(error)); }
       finally { pending = false; }

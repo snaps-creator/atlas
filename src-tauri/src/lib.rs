@@ -1055,22 +1055,14 @@ async fn request_inner(
             };
             let identities: std::collections::HashMap<_,_> = settings.servers().iter()
                 .filter_map(|node| node["name"].as_str().map(|name| (name.to_owned(), latency::node_identity(node)))).collect();
-            let groups=latency::probe_groups(&settings);
-            let names:Vec<_>=names.into_iter().filter(|name|groups.contains_key(name)).collect();
             let progress = |name: &str, result: &Value| {
-                for alias in groups.get(name).into_iter().flatten() {
-                    let _ = app.emit("latency-result", json!({
-                        "batchId":batch_id,"revision":revision,"name":alias,"probeId":identities.get(alias),"result":result
-                    }));
-                }
+                let _ = app.emit("latency-result", json!({
+                    "batchId":batch_id,"revision":revision,"name":name,"probeId":identities.get(name),"result":result
+                }));
             };
             let results = if let Some(client) = client { latency::batch_stream(client, &names, &progress)? }
                 else { latency::offline_batch_stream(settings, binary, directory, &names, &progress)? };
-            let expanded:serde_json::Map<_,_>=groups.iter().flat_map(|(name,aliases)| {
-                let result=&results[name];
-                aliases.iter().map(move |alias|(alias.clone(),result.clone()))
-            }).collect();
-            Ok(json!({"revision":revision,"identities":identities,"results":expanded}))
+            Ok(json!({"revision":revision,"identities":identities,"results":results}))
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "latency" {

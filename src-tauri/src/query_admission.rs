@@ -8,7 +8,7 @@ pub fn acquire(delay:bool)->Result<Permit,String> {
     acquire_cancellable(delay, None)
 }
 pub fn acquire_cancellable(delay:bool,cancelled:Option<&AtomicBool>)->Result<Permit,String> {
-    let (count,limit)=if delay {(&DELAYS,8)} else {(&READS,4)};
+    let (count,limit)=if delay {(&DELAYS,crate::latency::DISPLAY_WORKERS + 8)} else {(&READS,4)};
     let deadline=Instant::now()+Duration::from_secs(20);
     loop {
         if cancelled.is_some_and(|flag|flag.load(Ordering::SeqCst)) {
