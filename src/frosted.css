@@ -136,4 +136,3 @@ nav button.active svg { color:#a88cff; }
 .subscription-entry:last-child { border-bottom: 0; }
 .subscription-type-badge { display: inline-block; margin-left: 25px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 11px; }
 .subscription-entry > .subscription { padding-top: 12px; }
-
