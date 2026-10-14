@@ -300,6 +300,10 @@ mod tests {
         let server=std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 if let Ok((mut stream,_))=listener.accept() {
+                    // Windows inherits the listener's nonblocking mode. A
+                    // partial request must wait for its remaining headers;
+                    // otherwise the fixture closes a healthy connection.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                     let mut bytes=Vec::new();let mut chunk=[0;1024];
                     while !bytes.windows(4).any(|w|w==b"\r\n\r\n") && bytes.len()<8192 {
