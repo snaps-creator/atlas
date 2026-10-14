@@ -5,11 +5,11 @@ test("измеренный пинг отображается числом без
   const measured: Latency = {status:"ok",delay:210,attempts:1,measuredAt:1000};
   expect(latencyLabel(measured)).toBe("210 мс");
   expect(latencyLabel(freshLatency(measured,150,2000))).toBe("210 мс");
-  expect(latencyLabel(freshLatency(measured,150,32000))).toBe("210 мс");
+  expect(latencyLabel(freshLatency(measured,150,32000))).toBe("");
   for (const status of ["ok", "high_latency", "stale"] as const) {
-    expect(latencyLabel({status,delay:null,attempts:0})).toBe("Не проверен");
+    expect(latencyLabel({status,delay:null,attempts:0})).toBe("");
   }
-  expect(latencyLabel({status:"timeout",delay:null,lastDelay:210,attempts:1})).toBe("Таймаут");
+  expect(latencyLabel({status:"timeout",delay:null,lastDelay:210,attempts:1})).toBe("");
 });
 
 test("устаревшее измерение и превышение порога не выглядят свежим успехом", () => {
@@ -18,8 +18,8 @@ test("устаревшее измерение и превышение порог
   expect(freshLatency({...value,delay:200},150,2000)?.status).toBe("high_latency");
   expect(freshLatency(value,150,32000)?.status).toBe("stale");
   expect(latencyRank(value)).toBe(Infinity);
-  expect(latencyLabel({status:"timeout",delay:null,attempts:1})).toBe("Таймаут");
-  expect(latencyLabel({status:"queued",delay:null,attempts:0})).toBe("В очереди");
+  expect(latencyLabel({status:"timeout",delay:null,attempts:1})).toBe("");
+  expect(latencyLabel({status:"queued",delay:null,attempts:0})).toBe("");
 });
 
 test("сбой хранит последнее успешное измерение и реальное время попытки", () => {
@@ -94,11 +94,11 @@ test("ответ старой сессии и её очередь не затр�
 });
 
 test("ошибка контроллера не означает недоступность сервера", () => {
-  expect(latencyLabel()).toBe("Не проверен");
-  expect(latencyLabel({ status: "error", delay: null, attempts: 0 })).toBe("Ошибка проверки");
+  expect(latencyLabel()).toBe("");
+  expect(latencyLabel({ status: "error", delay: null, attempts: 0 })).toBe("");
   expect(
     latencyLabel({ status: "unreachable", delay: null, attempts: 4 }),
-  ).toBe("Недоступен");
+  ).toBe("");
   expect(latencyLabel({ status: "ok", delay: 0, attempts: 1 })).toBe("0 мс");
 });
 

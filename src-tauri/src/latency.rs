@@ -9,14 +9,19 @@ pub(crate) const DISPLAY_WORKERS: usize = 64;
 /// Opaque identity of actual node parameters, independent of UI preferences,
 /// selected route and subscription refresh timestamps. Never expose credentials.
 pub fn node_identity(node: &Value) -> String {
-    use sha2::{Digest, Sha256};
-    let mut node=node.clone();
-    if let Some(fields)=node.as_object_mut() {fields.remove("extraParams");fields.remove("atlas");}
-    format!("{:x}", Sha256::digest(node.to_string().as_bytes()))
+    format!("{}:{}",node["atlas"]["sourceId"].as_str().unwrap_or(""),crate::model::repository::identity(node))
 }
 // Use the same per-node URL measurement as Clash Verge, with bounded concurrency.
+#[cfg(test)]
 pub fn batch_stream(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
     display_batch_stream(client, names, DISPLAY_URL, DISPLAY_TIMEOUT_MS, progress)
+}
+pub(crate) fn batch_stream_cancel(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str) -> bool + Sync)) -> Result<Value,String> {
+    display_batch_stream_cancel(client,names,DISPLAY_URL,DISPLAY_TIMEOUT_MS,progress,current)
+}
+pub(crate) fn offline_batch_stream_cancel(settings: Settings, binary: PathBuf, parent: PathBuf, names: &[String],
+    progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str) -> bool + Sync)) -> Result<Value,String> {
+    with_offline_core(settings,binary,parent,|client|batch_stream_cancel(client,names,progress,current))
 }
 
 /// Run a disposable, unprivileged Mihomo instance for URL tests while Atlas
@@ -57,32 +62,26 @@ fn with_offline_core<T>(settings: Settings, binary: PathBuf, parent: PathBuf,
     }
 }
 
-pub fn offline_batch_stream(settings: Settings, binary: PathBuf, parent: PathBuf,
-    names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
-    with_offline_core(settings, binary, parent, |client| batch_stream(client, names, progress))
-}
-
-pub fn offline_test(settings: Settings, binary: PathBuf, parent: PathBuf,
-    name: &str) -> TestResult {
-    with_offline_core(settings, binary, parent, |client| Ok(test(client, name)))
-        .unwrap_or_else(|error| TestResult {
-            status: "error".into(), delay: None, attempts: 0, error: Some(error),
-        })
-}
 #[cfg(test)]
 pub(crate) fn display_batch_at(client: ApiClient, names: &[String], endpoint: &str, timeout: u64) -> Result<Value, String> {
     display_batch_stream(client, names, endpoint, timeout, &|_, _| {})
 }
 
+#[cfg(test)]
 fn display_batch_stream(client: ApiClient, names: &[String], endpoint: &str, timeout: u64,
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value, String> {
+    display_batch_stream_cancel(client,names,endpoint,timeout,progress,&|_|true)
+}
+fn display_batch_stream_cancel(client: ApiClient, names: &[String], endpoint: &str, timeout: u64,
+    progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str)->bool + Sync)) -> Result<Value,String> {
     let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
     let names = discovery_order(names, &proxies, endpoint);
     if let Some(broker) = client.broker_client() {
-        return service_batch_stream(&broker, &names, endpoint, timeout, progress);
+        return service_batch_stream_cancel(&broker, &names, endpoint, timeout, progress,current);
     }
     // The caller already queues the full list. Publish only starts and results.
     Ok(discover_batch(&names, timeout, &|name, deadline| {
+        if !current(name) {return TestResult {status:"cancelled".into(),delay:None,attempts:0,error:None};}
         progress(name,&json!({"status":"testing","delay":null,"attempts":0}));
         display_probe(&client, name, endpoint, deadline)
     }, progress))
@@ -90,8 +89,13 @@ fn display_batch_stream(client: ApiClient, names: &[String], endpoint: &str, tim
 
 // One IPC request submits a set of independent tests; one poll collects their
 // completed replies. Do not serialize a round trip for every in-flight node.
+#[cfg(test)]
 pub(crate) fn service_batch_stream(broker: &crate::broker::Broker, names: &[String], endpoint: &str, timeout: u64,
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value,String> {
+    service_batch_stream_cancel(broker,names,endpoint,timeout,progress,&|_|true)
+}
+fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String], endpoint: &str, timeout: u64,
+    progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str)->bool + Sync)) -> Result<Value,String> {
     use std::time::{Duration, Instant};
     let mut next = 0;
     let mut pending = std::collections::BTreeMap::<String,(String,Instant)>::new();
@@ -107,11 +111,13 @@ pub(crate) fn service_batch_stream(broker: &crate::broker::Broker, names: &[Stri
     while next < names.len() || !pending.is_empty() {
         let end = (next + DISPLAY_WORKERS - pending.len()).min(names.len());
         if end > next {
-            let paths: Vec<_> = names[next..end].iter().map(|name|display_path(name, endpoint, timeout)).collect();
+            let admitted:Vec<_> = names[next..end].iter().filter(|name|current(name)).collect();
+            if admitted.is_empty() {next=end;continue;}
+            let paths: Vec<_> = admitted.iter().map(|name|display_path(name, endpoint, timeout)).collect();
             let jobs = crate::query_admission::retry_busy(Instant::now()+Duration::from_secs(5), ||
                 broker.call("delay_many", json!({"paths":paths})))?;
-            let jobs = jobs.as_array().filter(|jobs|jobs.len()==end-next).ok_or("Некорректный ответ очереди проверок")?;
-            for (name, job) in names[next..end].iter().zip(jobs) {
+            let jobs = jobs.as_array().filter(|jobs|jobs.len()==admitted.len()).ok_or("Некорректный ответ очереди проверок")?;
+            for (name, job) in admitted.into_iter().zip(jobs) {
                 if let Some(id) = job["id"].as_str() {
                     progress(name, &json!({"status":"testing","delay":null,"attempts":0}));
                     pending.insert(id.to_owned(), (name.clone(), Instant::now()));
@@ -331,32 +337,42 @@ pub(crate) fn encode_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::Subscription;
+    #[test]
+    fn display_identity_is_source_scoped_and_ignores_presentation() {
+        let node=json!({"name":"one","server":"same.example","password":"one","atlas":{"sourceId":"s1"}});
+        let mut renamed=node.clone();renamed["name"]=json!("other label");assert_eq!(node_identity(&node),node_identity(&renamed));
+        renamed["atlas"]["sourceId"]=json!("s2");assert_ne!(node_identity(&node),node_identity(&renamed));
+        renamed=node.clone();renamed["password"]=json!("two");assert_ne!(node_identity(&node),node_identity(&renamed));
+    }
 
-    // Frozen scheduling policy from the working tree before this fix. Used only
-    // by the opt-in network comparison, never by application code.
+    // Frozen 51c1e16 (installed 3.0.2) scheduling, including the original
+    // status-specific full retry. Never use this policy in application code.
     fn before_batch(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value,String> {
-        let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
-        let names = discovery_order_with_workers(names, &proxies, DISPLAY_URL, 6);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let results = std::sync::Mutex::new(serde_json::Map::new());
-        for name in &names { progress(name, &json!({"status":"queued","delay":null,"attempts":0})); }
-        std::thread::scope(|scope| {
-            for worker in 0..names.len().min(6) {
-                let (next, results, names, client) = (&next, &results, &names, &client);
-                scope.spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(worker as u64 * 20));
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(name) = names.get(i) else { break; };
-                        progress(name, &json!({"status":"testing","delay":null,"attempts":0}));
-                        let value = serde_json::to_value(display_probe(client, name, DISPLAY_URL, 1500)).unwrap();
-                        results.lock().unwrap().insert(name.clone(), value.clone());
-                        progress(name, &value);
-                    }
-                });
-            }
-        });
-        Ok(Value::Object(results.into_inner().unwrap()))
+        let proxies=client.api("GET","/proxies",None).unwrap_or(Value::Null);
+        let names=discovery_order_with_workers(names,&proxies,DISPLAY_URL,6);
+        let run=|names:&[String],timeout:u64,emit:&(dyn Fn(&str,&Value)+Sync)| {
+            let next=std::sync::atomic::AtomicUsize::new(0);
+            let results=std::sync::Mutex::new(serde_json::Map::new());
+            std::thread::scope(|scope| {
+                for worker in 0..names.len().min(6) {
+                    let (next,results,client)=(&next,&results,&client);
+                    scope.spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(worker as u64*20));
+                        loop {
+                            let i=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                            let Some(name)=names.get(i) else {break;};
+                            progress(name,&json!({"status":"testing","delay":null,"attempts":0}));
+                            let value=serde_json::to_value(display_probe(client,name,DISPLAY_URL,timeout)).unwrap();
+                            results.lock().unwrap().insert(name.clone(),value.clone());emit(name,&value);
+                        }
+                    });
+                }
+            });
+            results.into_inner().unwrap()
+        };
+        let mut results=run(&names,1500,&|name,value|{if value["status"]!="unreachable" {progress(name,value);}});
+        let retry=names.iter().filter(|name|results[*name]["status"]=="unreachable").cloned().collect::<Vec<_>>();
+        results.extend(run(&retry,DISPLAY_TIMEOUT_MS,progress));Ok(Value::Object(results))
     }
     #[test]
     #[ignore = "Opt-in real network benchmark; ATLAS_BATCH_DATABASE is opened read-only"]
@@ -371,20 +387,23 @@ mod tests {
         assert!(!names.is_empty());
         let start = std::time::Instant::now();
         let first = std::sync::Mutex::new(None);
+        let last_success=std::sync::Mutex::new(None);
         let progress = std::sync::Mutex::new(std::collections::HashSet::new());
         let binary = std::env::var_os("ATLAS_BATCH_CORE").map(PathBuf::from)
             .unwrap_or_else(||PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe"));
         let policy = std::env::var("ATLAS_BATCH_POLICY").unwrap_or_else(|_|"after".into());
-        assert!(matches!(policy.as_str(), "before" | "after"));
+        assert!(matches!(policy.as_str(), "before" | "after" | "workers32" | "workers16"));
         let progress_callback = |name: &str, value: &Value| {
             if value["status"] != "queued" && value["status"] != "testing" {
                 first.lock().unwrap().get_or_insert(start.elapsed().as_millis());
+                if value["status"]=="ok" {*last_success.lock().unwrap()=Some(start.elapsed().as_millis());}
                 progress.lock().unwrap().insert(name.to_owned());
             }
         };
         let results = with_offline_core(settings, binary, std::env::temp_dir(), |client| {
             if policy == "before" { before_batch(client, &names, &progress_callback) }
-            else { batch_stream(client, &names, &progress_callback) }
+            else if policy=="after" { batch_stream(client, &names, &progress_callback) }
+            else {Ok(run_display_batch_with_workers(&names,if policy=="workers32" {32} else {16},&|name|serde_json::to_value(display_probe(&client,name,DISPLAY_URL,DISPLAY_TIMEOUT_MS)).unwrap(),&progress_callback))}
         }).unwrap();
         let elapsed = start.elapsed().as_millis();
         assert_eq!(results.as_object().unwrap().len(), names.len());
@@ -396,7 +415,7 @@ mod tests {
             outcomes.insert(node_identity(&json!(name)), json!({"status":result["status"],"delay":result["delay"],"attempts":result["attempts"]}));
         }
         println!("REAL_BATCH {}", json!({"policy":policy,"nodes":nodes.len(),"tested":names.len(),"dataset":node_identity(&json!(nodes)),
-            "fullMs":elapsed,"firstMs":first.into_inner().unwrap(),"counts":counts,"outcomes":outcomes}));
+            "fullMs":elapsed,"firstMs":first.into_inner().unwrap(),"lastSuccessMs":last_success.into_inner().unwrap(),"counts":counts,"outcomes":outcomes}));
     }
     #[test]
     #[ignore = "Explicit scheduler load profile; simulated network waits, no user configuration"]

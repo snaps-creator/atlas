@@ -212,6 +212,20 @@ pub struct Downloaded {
     pub nodes: Vec<Value>,
     pub options: crate::subscription_options::Options,
     pub diagnostics: Vec<String>,
+    pub not_modified: bool,
+    pub explicit_empty: bool,
+}
+fn cache_key(raw: &str, options: &crate::subscription_options::Options) -> String {
+    use sha2::{Digest,Sha256};
+    format!("{:x}",Sha256::digest(format!("{}\n{}",raw,options.effective_user_agent()).as_bytes()))
+}
+static RETRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String,std::time::Instant>>> = std::sync::OnceLock::new();
+fn retry_delays() -> &'static std::sync::Mutex<std::collections::HashMap<String,std::time::Instant>> {RETRY.get_or_init(Default::default)}
+fn retry_after(value: &str, now: std::time::SystemTime) -> Option<std::time::Duration> {
+    if let Ok(seconds)=value.trim().parse::<u64>() {return Some(std::time::Duration::from_secs(seconds));}
+    let date=chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let epoch=date.timestamp().max(0) as u64;
+    Some((std::time::UNIX_EPOCH+std::time::Duration::from_secs(epoch)).duration_since(now).unwrap_or_default())
 }
 /// Keep existing names (including legacy positional names) when a provider reorders
 /// nodes. Presentation names and provider metadata do not change runtime identity.
@@ -234,7 +248,7 @@ pub fn download(raw: &str, connected: bool, options: &crate::subscription_option
     if raw.trim().starts_with("vless://") {
         if raw.trim().lines().count()!=1 { return Err("Вставьте один VLESS-ключ".into()); }
         let mut diagnostics=Vec::new();
-        return Ok(Downloaded {nodes:parse_report(raw.trim(),options,&mut diagnostics)?,options:options.clone(),diagnostics});
+        return Ok(Downloaded {nodes:parse_report(raw.trim(),options,&mut diagnostics)?,options:options.clone(),diagnostics,not_modified:false,explicit_empty:false});
     }
     download_with(raw, options, |url| download_one(url, connected, options))
 }
@@ -262,6 +276,12 @@ pub(crate) fn download_test_https(raw: &str, certificate: &[u8]) -> Result<Downl
 fn download_one_with_client(raw: &str, connected: bool, options: &crate::subscription_options::Options, builder: reqwest::blocking::ClientBuilder) -> Result<Downloaded, String> {
     crate::subscription_options::validate_agent(options.effective_user_agent())?;
     let u = crate::subscription_options::https_url(raw)?;
+    let key=cache_key(raw,options);
+    {
+        let mut retries=retry_delays().lock().unwrap_or_else(|e|e.into_inner());
+        retries.retain(|_,until|*until>std::time::Instant::now());
+        if retries.contains_key(&key) {return Err("Источник подписки запросил задержку повтора; предыдущая версия сохранена".into());}
+    }
     let mut builder = builder.no_proxy();
     if connected {
         builder = builder.proxy(
@@ -284,8 +304,13 @@ fn download_one_with_client(raw: &str, connected: bool, options: &crate::subscri
         }))
         .build()
         .map_err(|_| "Ошибка HTTPS клиента")?;
-    let mut response = client
-        .get(u)
+    let mut request = client.get(u);
+    let conditional=options.cache_key.as_deref()==Some(key.as_str());
+    if conditional {
+        if let Some(etag)=&options.etag {request=request.header("If-None-Match",etag);}
+        if let Some(modified)=&options.last_modified {request=request.header("If-Modified-Since",modified);}
+    }
+    let mut response = request
         .header("Accept-Encoding", "gzip")
         .header("User-Agent", options.effective_user_agent())
         .send()
@@ -296,7 +321,16 @@ fn download_one_with_client(raw: &str, connected: bool, options: &crate::subscri
             format!("Загрузка подписки: timeout={}, connect={}, {}; предыдущая версия сохранена",
                 e.is_timeout(),e.is_connect(),crate::support_report::redact(&chain,&[raw.to_owned()]))
         })?;
+    if response.status()==reqwest::StatusCode::NOT_MODIFIED {
+        if !conditional || (options.etag.is_none() && options.last_modified.is_none()) {return Err("Неожиданный HTTP 304 без сохранённой версии подписки".into());}
+        return Ok(Downloaded {nodes:vec![],options:options.clone(),diagnostics:vec![],not_modified:true,explicit_empty:false});
+    }
     if !response.status().is_success() {
+        if let Some(delay)=response.headers().get("retry-after").and_then(|v|v.to_str().ok()).and_then(|v|retry_after(v,std::time::SystemTime::now())) {
+            let now=std::time::Instant::now();
+            let until=now.checked_add(delay).unwrap_or(now+std::time::Duration::from_secs(100*365*86400));
+            retry_delays().lock().unwrap_or_else(|e|e.into_inner()).insert(key,until);
+        }
         return Err(format!(
             "Сервер подписки вернул HTTP {}. Предыдущая версия сохранена.",
             response.status().as_u16()
@@ -313,7 +347,11 @@ fn download_one_with_client(raw: &str, connected: bool, options: &crate::subscri
     if body.len()>8*1024*1024 { return Err("Подписка превышает 8 МБ".into()); }
     let body=decode_http_body(body,&encoding)?;
     let body = String::from_utf8(body).map_err(|_| "Ответ подписки не является UTF-8")?;
-    parse_response(&body, &headers, options, raw)
+    let mut downloaded=parse_response(&body, &headers, options, raw)?;
+    downloaded.options.cache_key=Some(key);
+    downloaded.options.etag=headers.get("etag").cloned();
+    downloaded.options.last_modified=headers.get("last-modified").cloned();
+    Ok(downloaded)
 }
 fn decode_http_body(body: Vec<u8>, encoding: &str) -> Result<Vec<u8>,String> {
     use std::io::Read;
@@ -338,11 +376,57 @@ pub(crate) fn parse_response(body: &str, headers: &std::collections::BTreeMap<St
     let decoded=subscription_body(&body)?;
     let (body,options)=crate::subscription_options::extract(&decoded,headers,&options,source)?;
     let mut diagnostics=Vec::new();
-    Ok(Downloaded {nodes:parse_report(&body,&options,&mut diagnostics)?,options,diagnostics})
+    // Only an explicit, well-formed Clash empty list denotes deletion. Empty
+    // bytes, unrecognised URI lines and invalid Xray documents remain errors.
+    let explicit_empty=serde_yaml::from_str::<Value>(&body).ok().is_some_and(|v|
+        v.get("proxies").and_then(Value::as_array).is_some_and(Vec::is_empty));
+    Ok(Downloaded {nodes:if explicit_empty {vec![]} else {parse_report(&body,&options,&mut diagnostics)?},options,diagnostics,not_modified:false,explicit_empty})
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_after_seconds_and_http_dates_are_bounded() {
+        let now=std::time::UNIX_EPOCH+std::time::Duration::from_secs(1445412480);
+        assert_eq!(retry_after("120",now).unwrap().as_secs(),120);
+        assert_eq!(retry_after("Wed, 21 Oct 2015 07:30:00 GMT",now).unwrap().as_secs(),120);
+        assert!(retry_after("invalid",now).is_none());
+    }
+    #[test]
+    fn explicit_empty_is_distinct_from_damage_and_validators_are_representation_scoped() {
+        let options=crate::subscription_options::Options::default();
+        assert!(parse_response("proxies: []",&Default::default(),&options,"https://a.example").unwrap().explicit_empty);
+        for body in [""," ","<html>error</html>","vless://bad", "proxies: nonsense"] {
+            assert!(parse_response(body,&Default::default(),&options,"https://a.example").is_err());
+        }
+        let mut changed=options.clone();changed.user_agent_override=Some("fixture-agent".into());
+        assert_ne!(cache_key("https://a.example",&options),cache_key("https://b.example",&options));
+        assert_ne!(cache_key("https://a.example",&options),cache_key("https://a.example",&changed));
+    }
+    #[test]
+    fn actual_https_conditional_errors_and_empty_responses() {
+        use std::{io::BufRead,process::{Command,Stdio},os::windows::process::CommandExt};
+        let fixture=std::env::temp_dir().join(format!("atlas-conditional-{}.txt",uuid::Uuid::new_v4()));
+        std::fs::write(&fixture,"proxies:\n  - {name: fixture, type: socks5, server: 127.0.0.1, port: 1080}").unwrap();
+        let mut publisher=Command::new("pwsh").creation_flags(0x08000000).args(["-NoProfile","-File"])
+            .arg(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/test-subscription-https-server.ps1"))
+            .arg("-SourceFile").arg(&fixture).arg("-Conditional").stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+        let job=crate::job::Job::attach(&publisher).unwrap();
+        let mut line=String::new();std::io::BufReader::new(publisher.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let ready:Value=serde_json::from_str(&line).unwrap();
+        let certificate=STANDARD.decode(ready["certificate"].as_str().unwrap()).unwrap();
+        let root=reqwest::Certificate::from_der(&certificate).unwrap();
+        let fetch=|path:&str,options:&crate::subscription_options::Options|download_one_with_client(
+            &format!("https://127.0.0.1:{}/{path}",ready["port"].as_u64().unwrap()),false,options,
+            reqwest::blocking::Client::builder().add_root_certificate(root.clone()));
+        let first=fetch("conditional",&Default::default()).unwrap();assert_eq!(first.nodes.len(),1);
+        let next=fetch("conditional",&first.options).unwrap();assert!(next.not_modified);
+        for path in ["401","403","429","503","invalid","empty"] {assert!(fetch(path,&first.options).is_err(),"{path}");}
+        assert!(fetch("429",&first.options).err().unwrap().contains("задержку"));
+        assert!(fetch("empty-list",&first.options).unwrap().explicit_empty);
+        assert!(!fetch("other-source",&first.options).unwrap().not_modified);
+        let _=publisher.kill();let _=publisher.wait();drop(job);std::fs::remove_file(fixture).unwrap();
+    }
     #[test]
     fn provider_rotation_preserves_source_scoped_selection_and_favorite() {
         use crate::model::{Settings,Subscription,SubscriptionSource};
@@ -479,14 +563,14 @@ mod tests {
         let result = download_with("https://old.example/key", &options, |url| {
             requested.push(url.to_owned());
             if requested.len() == 1 { return Err("HTTP 503".into()); }
-            Ok(Downloaded { nodes: vec![json!({"name":"backup"})], options: options.clone(), diagnostics:vec![] })
+            Ok(Downloaded { nodes: vec![json!({"name":"backup"})], options: options.clone(), diagnostics:vec![],not_modified:false,explicit_empty:false })
         }).unwrap();
         assert_eq!(requested, ["https://new.example/key", "https://backup.example/key"]);
         assert_eq!(result.nodes[0]["name"], "backup");
         requested.clear();
         download_with("https://old.example/key", &options, |url| {
             requested.push(url.to_owned());
-            Ok(Downloaded { nodes: vec![], options: options.clone(), diagnostics:vec![] })
+            Ok(Downloaded { nodes: vec![], options: options.clone(), diagnostics:vec![],not_modified:false,explicit_empty:false })
         }).unwrap();
         assert_eq!(requested, ["https://new.example/key"]);
     }

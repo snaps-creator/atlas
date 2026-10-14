@@ -49,7 +49,8 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { recordLatency, latencyRank, retainNodeLatencies, applyLatencyProgress, failPendingLatencies, type LatencyProgress, boundedBatch, boundedLatency, historyLatency, LatencyEpoch, type Latency } from "./latency";
+import { latencyRank, type Latency } from "./latency";
+import { matchingLatencies, startLatencyPolling, type LatencySnapshot } from "./latencyPolling";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
@@ -110,7 +111,7 @@ function App() {
   const [name, setName] = useState("");
   const [latencies, setLatencies] = useState<Record<string, Latency>>({});
   const [testingAll, setTestingAll] = useState(false);
-  const latencyEpoch = useRef(new LatencyEpoch());
+  const latencyWake = useRef<() => void>(()=>{});
   const [connections, setConnections] = useState<Connection[]>([]);
   const [traffic, setTraffic] = useState({ up: 0, down: 0 });
   const [samples, setSamples] = useState<TrafficSample[]>([]);
@@ -381,94 +382,33 @@ function App() {
   const identities = Object.fromEntries(servers.map(node => [node.name, node.probeId]));
   const identitiesRef = useRef(identities);
   identitiesRef.current = identities;
-  const previousIdentities = useRef(identities);
   const latencyContext = JSON.stringify(identities);
   useEffect(() => {
-    latencyEpoch.current.update("nodes");
-    return () => { latencyEpoch.current.update("unmounted"); };
+    if (!native) return;
+    const polling = startLatencyPolling(()=>request<LatencySnapshot>("latency_state"), snapshot=>{
+      setLatencies(matchingLatencies(snapshot,identitiesRef.current));
+      setTestingAll(snapshot.pending.length > 0);
+    });
+    latencyWake.current=()=>void polling.wake();
+    let disposed=false, unlisten:UnlistenFn|undefined;
+    void listen("latency-updated",()=>void polling.wake()).then(stop=>{if(disposed)stop();else unlisten=stop;}).catch(()=>{});
+    const wake=()=>void polling.wake();
+    window.addEventListener("focus",wake);
+    document.addEventListener("visibilitychange",wake);
+    return ()=>{disposed=true;polling.stop();unlisten?.();window.removeEventListener("focus",wake);document.removeEventListener("visibilitychange",wake);};
   }, []);
   useEffect(() => {
-    const before = previousIdentities.current;
-    const after = identitiesRef.current;
-    setLatencies(values => retainNodeLatencies(values, before, after));
-    previousIdentities.current = after;
-  }, [latencyContext]);
-  useEffect(() => {
-    if (!data?.running || page !== "Servers") return;
-    let alive = true, pending = false;
-    const read = async () => {
-      if (pending) return;
-      pending = true;
-      try {
-        const result = await request<{proxies:Record<string, Parameters<typeof historyLatency>[0]>}>("proxies");
-        if (!alive) return;
-        setLatencies(previous => {
-          const next = {...previous};
-          for (const node of servers) {
-            const value = historyLatency(result.proxies[node.name]?.extra?.["http://cp.cloudflare.com/generate_204"]);
-            const old = previous[node.name];
-            if (value && old?.status !== "testing" && old?.status !== "queued" && (!old ||
-                (old.measuredAt !== undefined && value.measuredAt! > old.measuredAt))) next[node.name] = value;
-          }
-          return next;
-        });
-      } catch { /* Keep existing measurements; a controller error is not a server timeout. */ }
-      finally { pending = false; }
-    };
-    void read();
-    const timer = setInterval(() => { void read(); }, 5000);
-    return () => { alive = false; clearInterval(timer); };
-  }, [latencyContext, page, data?.running]);
+    latencyWake.current();
+    if (native && page === "Servers") void request("refresh_due").catch(()=>{});
+  }, [page,latencyContext,data?.running]);
   async function testAll() {
-    if (testingAll) return;
-    setTestingAll(true);
     setSortLatency(true);
-    const names = [...new Set(servers.map(node => node.name))];
-    const batchId = crypto.randomUUID();
-    const nameSet = new Set(names);
-    let active = true;
-    let unlisten: UnlistenFn | undefined;
-    setLatencies(previous => ({...previous, ...Object.fromEntries(names.map(name =>
-      [name, recordLatency(previous[name],{status:"queued" as const, delay:null, attempts:0})]))}));
-    try {
-      // Subscribe before invoking so even the first fast result is delivered.
-      unlisten = await listen<LatencyProgress>("latency-result", ({payload}) => {
-        if (!active) return;
-        setLatencies(previous => active
-          ? applyLatencyProgress(previous, payload, batchId, identitiesRef.current, nameSet) : previous);
-      });
-      // One native batch reads app state once. Per-card invocations used to
-      // race the app mutex and falsely label the entire pool as failed.
-      const response = await boundedBatch(request<{identities:Record<string,string>;results:Record<string,Latency>}>("latency_batch", {batchId}),
-        15000 + Math.ceil(names.length / 6) * 15000);
-      setLatencies(previous => ({...previous, ...Object.fromEntries(names.filter(name =>
-        response.identities[name] !== undefined && response.identities[name] === identitiesRef.current[name]).map(name =>
-        [name, recordLatency(previous[name],response.results[name] ?? {status:"error",delay:null,attempts:0,
-          error:"Ядро не вернуло результат для этого узла"})]))}));
-    } catch (error) {
-      setLatencies(previous => failPendingLatencies(previous,
-        names.filter(name => identities[name] === identitiesRef.current[name]), error));
-    } finally { active = false; unlisten?.(); setTestingAll(false); }
+    try {await request("latency_batch");latencyWake.current();}
+    catch(error) {setError(String(error));}
   }
-  async function test(name: string) {
-    if (testingAll) return;
-    const token = latencyEpoch.current.begin("nodes", name);
-    if (!token) return;
-    setLatencies((l) => ({
-      ...l,
-      [name]: recordLatency(l[name],{ status: "testing", delay: null, attempts: 0 }),
-    }));
-    try {
-      const r = await boundedLatency(request<Latency>("latency", { name }));
-      if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({ ...l, [name]: recordLatency(l[name],r) }));
-    } catch (e) {
-      if (latencyEpoch.current.current(name, token) && identities[name] === identitiesRef.current[name]) setLatencies((l) => ({
-        ...l,
-        [name]: recordLatency(l[name],{ status: "error", delay: null, attempts: 0, error: String(e) }),
-      }));
-    } finally {
-      latencyEpoch.current.finish(name, token);
-    }
+  async function test(name:string) {
+    try {await request("latency",{name});latencyWake.current();}
+    catch(error) {setError(String(error));}
   }
   return (
     <div className="app">

@@ -47,6 +47,9 @@ try {
     if (-not (Test-Path -LiteralPath $report)) { Write-SmokeFailureEvidence; throw 'Atlas created a process but failed to render its interface and acknowledge IPC' }
     $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
     if (-not $result.rendered -or $result.buttons -lt 5) { throw 'Atlas UI acceptance report is incomplete' }
+    if ($env:ATLAS_LATENCY_UI_SMOKE -eq '1' -and ($result.latency.phases.Count -ne 4 -or $result.latency.navigations -ne 3 -or $result.latency.forbiddenLabels -ne $false)) {
+        throw 'Packaged latency cards did not complete the IPC/render/navigation regression'
+    }
     # Historical binaries have no trace. Current candidates must prove one exit
     # flow and normal CEF return, not merely exit(0) from a duplicate IPC call.
     $currentVersion = (Get-Content (Join-Path $PSScriptRoot '../package.json') -Raw | ConvertFrom-Json).version
@@ -73,7 +76,7 @@ try {
         Write-Output "UI process evidence: $evidence"
         throw 'Isolated Atlas UI left helper processes behind'
     }
-    $result | ConvertTo-Json -Compress
+    $result | ConvertTo-Json -Depth 8 -Compress
     Write-Output 'PASS: packaged React interface rendered, IPC responded, all isolated UI processes exited; no VPN/service setup executed.'
 } finally {
     $env:ATLAS_UI_PROCESS_SMOKE = $previousMode

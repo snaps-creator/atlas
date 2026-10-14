@@ -40,6 +40,10 @@ jobs:
         run: node --test scripts/release-distribution.check.cjs
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
+      - name: Verify background ping across real expiry
+        # The background timer must cross the previous 30-second expiry in real
+        # time too; ordinary scheduler tests use controlled monotonic time.
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact latency_refresh::tests::real_timer_cycles_without_a_page --ignored
       - name: Verify actual restricted desktop process
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
       - name: Verify offline user hive cleanup and release after failure

@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod latency_ui_smoke;
 fn main() {
     // The stock CEF entry macro dispatches helpers before the application body.
     // Subscribe to desktop lifetime FIRST so renderer/GPU/utility processes cannot
@@ -39,14 +40,15 @@ fn run_application() {
             std::env::temp_dir().join(format!("atlas-cef-smoke-{}", uuid::Uuid::new_v4()));
         let result = tauri::Builder::default()
             .runtime(tauri_runtime_cef::Cef::default().root_cache_path(smoke_cache))
-            .invoke_handler(tauri::generate_handler![ui_smoke_ready])
+            .invoke_handler(tauri::generate_handler![ui_smoke_ready, request])
             .on_page_load(|webview, payload| {
                 ui_smoke_stage(match payload.event() {
                     tauri::webview::PageLoadEvent::Started => "PageLoadStarted",
                     tauri::webview::PageLoadEvent::Finished => "PageLoadFinished",
                 });
                 if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) { return; }
-                if let Err(error) = webview.eval(r#"(() => { const timer = setInterval(() => { if (document.querySelector('main') && document.querySelectorAll('button').length >= 5) { clearInterval(timer); window.__TAURI_INTERNALS__.invoke('ui_smoke_ready', { title: document.title, buttons: document.querySelectorAll('button').length }); } }, 100); })()"#) {
+                let script=if latency_ui_smoke::enabled() {include_str!("../../scripts/latency-ui-smoke.js")} else {r#"(() => { const timer = setInterval(() => { if (document.querySelector('main') && document.querySelectorAll('button').length >= 5) { clearInterval(timer); window.__TAURI_INTERNALS__.invoke('ui_smoke_ready', { title: document.title, buttons: document.querySelectorAll('button').length }); } }, 100); })()"#};
+                if let Err(error) = webview.eval(script) {
                     eprintln!("UI smoke readiness injection failed: {error}");
                     ui_smoke_stage("ReadinessInjectionFailed");
                 }
@@ -55,7 +57,7 @@ fn run_application() {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(12));
+                    std::thread::sleep(std::time::Duration::from_secs(if latency_ui_smoke::enabled() {40} else {12}));
                     if claim_ui_smoke_completion(2) {
                         eprintln!("UI smoke did not acknowledge rendering/IPC within 12 seconds");
                         ui_smoke_stage("StartupTimedOut");
@@ -183,14 +185,14 @@ fn claim_ui_smoke_completion(outcome: u8) -> bool {
         .is_ok()
 }
 #[tauri::command]
-fn ui_smoke_ready(app: tauri::AppHandle, title: String, buttons: usize) {
+fn ui_smoke_ready(app: tauri::AppHandle, title: String, buttons: usize, latency: Option<serde_json::Value>) {
     if buttons < 5 || !claim_ui_smoke_completion(1) {
         return;
     }
     ui_smoke_stage("RenderAcknowledged");
     let report = std::env::var_os("ATLAS_UI_SMOKE_REPORT")
         .ok_or_else(|| "UI smoke report path missing".to_owned())
-        .and_then(|path| std::fs::write(path, serde_json::json!({"rendered":true,"title":title,"buttons":buttons,"version":env!("CARGO_PKG_VERSION")}).to_string()).map_err(|error| error.to_string()));
+        .and_then(|path| std::fs::write(path, serde_json::json!({"rendered":true,"title":title,"buttons":buttons,"version":env!("CARGO_PKG_VERSION"),"latency":latency}).to_string()).map_err(|error| error.to_string()));
     if let Err(error) = report {
         UI_SMOKE_COMPLETION.store(3, std::sync::atomic::Ordering::SeqCst);
         eprintln!("UI smoke report write failed: {error}");
@@ -203,6 +205,8 @@ fn ui_smoke_ready(app: tauri::AppHandle, title: String, buttons: usize) {
         app.exit(0);
     });
 }
+#[tauri::command]
+fn request(action:String) -> Result<serde_json::Value,String> {latency_ui_smoke::reply(&action)}
 
 // Diagnostics belong only to the isolated smoke mode; no application settings,
 // URLs, credentials or network state are included.

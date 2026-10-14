@@ -5,6 +5,17 @@ use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock, atomic::
 
 static BUSY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 fn busy() -> &'static Mutex<HashSet<String>> { BUSY.get_or_init(Default::default) }
+static WAKE: OnceLock<(Mutex<bool>,std::sync::Condvar)> = OnceLock::new();
+pub(crate) fn wake() {
+    let (flag,signal)=WAKE.get_or_init(Default::default);
+    *flag.lock().unwrap_or_else(|e|e.into_inner())=true;signal.notify_one();
+}
+fn wait() {
+    let (flag,signal)=WAKE.get_or_init(Default::default);
+    let guard=flag.lock().unwrap_or_else(|e|e.into_inner());
+    let (mut guard,_)=signal.wait_timeout_while(guard,Duration::from_millis(500),|wake| !*wake).unwrap_or_else(|e|e.into_inner());
+    *guard=false;
+}
 pub(crate) fn active() -> Vec<String> { busy().lock().unwrap_or_else(|e|e.into_inner()).iter().cloned().collect() }
 pub(crate) struct Lease(String);
 impl Lease {
@@ -15,10 +26,9 @@ impl Lease {
 impl Drop for Lease { fn drop(&mut self) { busy().lock().unwrap_or_else(|e|e.into_inner()).remove(&self.0); } }
 
 fn reason(startup: bool, updated: u64, last_attempt: Option<u64>, now: u64, failed: bool, interval_seconds: u64) -> Option<&'static str> {
-    if startup && last_attempt.is_none() { return Some("startup"); }
-    if last_attempt.is_some_and(|at|now.saturating_sub(at)<120) { return None; }
+    if last_attempt.is_some_and(|at|at<=now && now-at<120) { return None; }
     if failed { return Some("recovery"); }
-    (now.saturating_sub(updated)>=interval_seconds).then_some("periodic")
+    (updated==0 || updated>now || now.saturating_sub(updated)>=interval_seconds).then_some(if startup {"startup"} else {"periodic"})
 }
 pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, done: Arc<AtomicBool>) {
     std::thread::spawn(move || {
@@ -64,7 +74,7 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                 if in_flight.len()>=2 { break; }
                 if sub.source!=model::SubscriptionSource::Url {continue;}
                 // Recovery downloads are owned by the explicit service incident.
-                let failed = false;
+                let failed = sub.error.is_some();
                 let Some(trigger)=reason(outstanding.contains(&sub.id),sub.updated_at,attempts.get(&sub.id).copied(),now,failed,sub.options.refresh_interval_seconds()) else { continue; };
                 let Some(lease)=Lease::take(&sub.id) else { continue; };
                 let id=sub.id.clone(); attempts.insert(id.clone(),now); in_flight.insert(id.clone());
@@ -72,8 +82,9 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                 std::thread::spawn(move || {
                     let started=std::time::Instant::now();
                     incident_history::record("subscription_refresh_started",json!({"subscription":id,"trigger":trigger}),&[]);
-                    let result=(|| -> Result<(),String> {
-                        let before=reads.get()?;
+                    let captured=reads.get();
+                    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(),String> {
+                        let before=captured.as_ref().map_err(Clone::clone)?;
                         let url=keyring::Entry::new("AtlasVPN",&id).map_err(|_|"Хранилище Windows недоступно")?
                             .get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")?;
                         let options=before.settings.subscriptions.iter().find(|s|s.id==id)
@@ -87,13 +98,15 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                         let source=before.settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка удалена")?.source;
                         a.install_subscription(id.clone(),url,nodes,None,None,source)?;
                         a.snapshot(); Ok(())
-                    })();
+                    })).unwrap_or_else(|_|Err("Обновление подписки прервано; будет повторено".into()));
                     incident_history::record("subscription_refresh_completed",json!({"subscription":id,"trigger":trigger,
                         "elapsedMs":started.elapsed().as_millis(),"success":result.is_ok(),"error":result.as_ref().err()}),&[]);
                     if !stop.load(Ordering::SeqCst) {
                         if let Ok(mut a)=shared.lock() {
                             if let Err(error)=result {
-                                if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id) {
+                                let current=captured.as_ref().is_ok_and(|before|subscriptions::refresh_is_current(
+                                    before.settings.subscriptions.iter().find(|s|s.id==id),a.settings.subscriptions.iter().find(|s|s.id==id)));
+                                if let Some(sub)=a.settings.subscriptions.iter_mut().find(|s|s.id==id).filter(|_|current) {
                                     sub.error=Some(error);
                                     let settings=a.settings.clone();
                                     if a.store.save_source_status(&settings).is_err() {a.log("WARN","Не удалось сохранить состояние обновления подписки");}
@@ -106,7 +119,7 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                     let _=tx.send(id);
                 });
             }
-            std::thread::sleep(Duration::from_millis(500));
+            wait();
         }
         done.store(true,Ordering::SeqCst);
     });
@@ -141,8 +154,12 @@ fn refresh_recovery(shared: &Shared, reads: &ReadState, stop: &AtomicBool, opera
             let sub=next.subscriptions.iter_mut().find(|s|s.id==id).unwrap();
             match result {
                 Ok(downloaded) => {
+                    if !downloaded.diagnostics.is_empty() {all_ok=false;sub.error=Some("Неполный ответ подписки; предыдущая версия сохранена".into());continue;}
+                    if downloaded.not_modified {
+                        sub.options=downloaded.options;sub.updated_at=model::now();sub.error=None;changed=true;continue;
+                    }
                     let nodes:Vec<_>=downloaded.nodes.into_iter().filter(|node|sub.source.accepts(node)).collect();
-                    if nodes.is_empty() {all_ok=false;sub.error=Some("Источник не содержит серверов выбранного типа".into());continue;}
+                    if nodes.is_empty() && !downloaded.explicit_empty {all_ok=false;sub.error=Some("Источник не содержит серверов выбранного типа".into());continue;}
                     sub.servers=stable_names(&sub.servers,nodes,&id);
                     sub.options=downloaded.options; sub.updated_at=model::now(); sub.error=None; changed=true;
                 }
@@ -179,7 +196,9 @@ mod tests {
     use super::*;
     #[test]
     fn independent_schedules_retry_without_reloading_healthy_subscriptions() {
-        assert_eq!(reason(true,100,None,101,false,1800),Some("startup"));
+        assert_eq!(reason(true,100,None,101,false,1800),None);
+        assert_eq!(reason(true,0,None,101,false,1800),Some("startup"));
+        assert_eq!(reason(false,200,Some(200),100,false,1800),Some("periodic"));
         assert_eq!(reason(false,100,Some(100),180,true,1800),None);
         assert_eq!(reason(false,100,Some(100),220,true,1800),Some("recovery"));
         assert_eq!(reason(false,100,Some(100),220,false,1800),None);

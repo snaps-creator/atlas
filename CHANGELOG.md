@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.3 (unpublished)
+
+- App-owned, bounded ping refresh continues across navigation and tray use; manual checks share the same queue. Old configuration/network replies cannot replace current measurements.
+- Server cards show only fresh numeric HTTP delay, including values above the AUTO threshold; missing/failed/expired measurements leave the numeric area empty.
+- Subscription due checks run at startup, on server-page entry and in the existing background worker. Conditional HTTPS requests, Retry-After, atomic refresh rejection and explicit empty Clash lists preserve valid data.
+- Added scheduler, HTTPS, identity, rendered-card and packaged CEF acceptance coverage. See `docs/ATLAS-3.0.3-VALIDATION.md` for measured results and remaining limits.
+
 ## 3.0.1 (unpublished)
 
 - Monitor the active connection every second with bounded probes, fresh latency state and one recovery coordinator.

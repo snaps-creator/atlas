@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$SourceFile, [switch]$Redirect, [switch]$Gzip)
+param([Parameter(Mandatory)][string]$SourceFile, [switch]$Redirect, [switch]$Gzip, [switch]$Conditional)
 $ErrorActionPreference = 'Stop'
 # Real loopback HTTPS publisher for acceptance tests. Certificate trust is scoped
 # to the Rust test client; nothing is installed in the Windows certificate store.
@@ -34,7 +34,18 @@ try {
             $tls.AuthenticateAsServer($certificate, $false, [System.Security.Authentication.SslProtocols]::Tls12, $false)
             $reader=[System.IO.StreamReader]::new($tls, [System.Text.Encoding]::ASCII, $false, 1024, $true)
             $requestLine=$reader.ReadLine()
-            while ($reader.ReadLine()) {}
+            $requestHeaders=@{}
+            while ($line=$reader.ReadLine()) {if ($line -match '^([^:]+):\s*(.*)$') {$requestHeaders[$Matches[1]]=$Matches[2]}}
+            if ($Conditional) {
+                $status=200; $reply=$encoded; $extra="ETag: `"fixture-v1`"`r`n"
+                if ($requestLine -match '^GET /conditional ' -and $requestHeaders['If-None-Match'] -eq '"fixture-v1"') {$status=304;$reply=[byte[]]@()}
+                if ($requestLine -match '^GET /(401|403|429|503) ') {$status=[int]$Matches[1];$reply=[byte[]]@();$extra="Retry-After: 120`r`n"}
+                if ($requestLine -match '^GET /invalid ') {$reply=[Text.Encoding]::UTF8.GetBytes('<html>error</html>')}
+                if ($requestLine -match '^GET /empty ') {$reply=[byte[]]@()}
+                if ($requestLine -match '^GET /empty-list ') {$reply=[Text.Encoding]::UTF8.GetBytes('proxies: []')}
+                $header=[Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $status Test`r`n${extra}Content-Length: $($reply.Length)`r`nConnection: close`r`n`r`n")
+                $tls.Write($header);$tls.Write($reply);$tls.Flush();continue
+            }
             $redirectLocation = switch -Regex ($requestLine) {
                 '^GET /subscription ' { if ($Redirect) {'/body'} }
                 '^GET /unsafe ' {'http://127.0.0.1/body'}

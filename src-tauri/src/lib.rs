@@ -13,6 +13,7 @@ mod job;
 pub use job::DesktopJob;
 mod lan_policy;
 mod latency;
+mod latency_refresh;
 mod resilient_selection;
 mod model;
 mod network_guard;
@@ -107,6 +108,7 @@ impl App {
             // Provider directives can contain private URLs. The UI only edits
             // the explicit User-Agent override through its dedicated command.
             sub.options.parameters.clear();
+            sub.options.cache_key=None;sub.options.etag=None;sub.options.last_modified=None;
             sub.options.provider_id = None;
             for p in &mut sub.servers {
                 *p = json!({"name":p["name"],"type":p["type"],"protocol":p["xray"]["outbounds"][0]["protocol"].as_str().or_else(||p["type"].as_str()),"nodeId":p["atlas"]["nodeId"],"sourceId":sub.id,"sourceName":sub.name,"sourceType":sub.source,"stableIdentity":p["atlas"]["stableIdentity"],"transport":p["atlas"]["transport"],"country":country::detect(p),"probeId":latency::node_identity(p)});
@@ -124,11 +126,21 @@ impl App {
         value
     }
     fn install_subscription(&mut self, id: String, url: String, mut downloaded: subscriptions::Downloaded, label: Option<String>, entry: Option<keyring::Entry>, source: SubscriptionSource) -> Result<(),String> {
+                let replacing=self.settings.subscriptions.iter().any(|s|s.id==id);
+                if replacing && !downloaded.diagnostics.is_empty() {return Err("Неполный ответ подписки; предыдущая версия сохранена".into());}
+                if downloaded.not_modified {
+                    let mut next=self.settings.clone();
+                    let sub=next.subscriptions.iter_mut().find(|s|s.id==id).ok_or("HTTP 304 без сохранённой подписки")?;
+                    sub.options=downloaded.options;sub.updated_at=now();sub.error=None;
+                    self.store.save_subscription_check(&next,&id)?;
+                    self.settings=next;
+                    return Ok(());
+                }
                 let before=downloaded.nodes.len();
                 let mut skipped=downloaded.diagnostics.len();
                 downloaded.nodes.retain(|node|source.accepts(node));
                 skipped+=before-downloaded.nodes.len();
-                if downloaded.nodes.is_empty() {return Err("Источник не содержит серверов выбранного типа подписок".into());}
+                if downloaded.nodes.is_empty() && !downloaded.explicit_empty {return Err("Источник не содержит серверов выбранного типа подписок".into());}
                 if downloaded.nodes.len()!=before {downloaded.diagnostics.push(format!("Пропущено {} узлов другого типа",before-downloaded.nodes.len()));}
                 let previous=self.settings.subscriptions.iter().find(|s|s.id==id).map(|s|s.servers.as_slice()).unwrap_or(&[]);
                 let nodes=subscriptions::reconcile_nodes(&id,downloaded.nodes,previous);
@@ -158,7 +170,8 @@ impl App {
                     next.selected = "AUTO".into()
                 };
                 let mut validation=next.clone();
-                if let Err(batch_error)=self.core.validate(&validation) {
+                if let Err(batch_error)=if validation.servers().is_empty() || config::same_network_config(&self.settings,&validation) {Ok(())} else {self.core.validate(&validation).map(|_|())} {
+                    if replacing {return Err(batch_error);}
                     let index=next.subscriptions.iter().position(|s|s.id==id).ok_or("Подписка отсутствует")?;
                     let candidates=next.subscriptions[index].servers.clone();
                     let mut accepted=Vec::new();
@@ -1034,60 +1047,17 @@ async fn request_inner(
         .await
         .map_err(|e| e.to_string())?;
     }
-    if action == "latency_batch" {
-        let batch_id = payload.as_ref().and_then(|p| p["batchId"].as_str())
-            .filter(|id| !id.is_empty() && id.len() <= 128)
-            .ok_or("Не указан идентификатор проверки")?.to_owned();
-        let reads = app.state::<published_state::ReadState>().inner().clone();
-        return tauri::async_runtime::spawn_blocking(move || {
-            let (settings, client, binary, directory, names, revision) = {
-                // A snapshot or save may briefly own the app mutex. Queue the
-                // read instead of falsely marking every node as a probe error.
-                let a = reads.get()?;
-                let connected = a.status == "Connected";
-                // A recovery marker does not prohibit isolated URL probes.
-                // The probe uses the same WFP-allowed Core/Xray executables,
-                // random loopback ports, and never changes the TUN or guard.
-                (a.settings.clone(), connected.then(|| a.client.clone()),
-                    a.binary.clone(), a.directory.clone(),
-                    a.settings.servers().iter().filter_map(|node| node["name"].as_str().map(str::to_owned)).collect::<Vec<_>>(),
-                    a.revision)
-            };
-            let identities: std::collections::HashMap<_,_> = settings.servers().iter()
-                .filter_map(|node| node["name"].as_str().map(|name| (name.to_owned(), latency::node_identity(node)))).collect();
-            let progress = |name: &str, result: &Value| {
-                let _ = app.emit("latency-result", json!({
-                    "batchId":batch_id,"revision":revision,"name":name,"probeId":identities.get(name),"result":result
-                }));
-            };
-            let results = if let Some(client) = client { latency::batch_stream(client, &names, &progress)? }
-                else { latency::offline_batch_stream(settings, binary, directory, &names, &progress)? };
-            Ok(json!({"revision":revision,"identities":identities,"results":results}))
-        }).await.map_err(|e| e.to_string())?;
+    if matches!(action.as_str(), "latency_state" | "latency_batch" | "latency") {
+        let snapshot = app.state::<published_state::ReadState>().get()?;
+        let name = payload.as_ref().and_then(|p|p["name"].as_str());
+        if action == "latency" && !name.is_some_and(|name|snapshot.settings.servers().iter().any(|n|n["name"]==name)) {
+            return Err("Сервер отсутствует в подписках".into());
+        }
+        return Ok(app.state::<latency_refresh::Refresh>().view(&snapshot,name,action != "latency_state"));
     }
-    if action == "latency" {
-        let name = payload
-            .as_ref()
-            .and_then(|p| p["name"].as_str())
-            .ok_or("Не выбран сервер")?
-            .to_owned();
-        let reads = app.state::<published_state::ReadState>().inner().clone();
-        return tauri::async_runtime::spawn_blocking(move || {
-            let (settings, client, binary, directory) = {
-                let a = reads.get()?;
-                if !a.settings.servers().iter().any(|p| p["name"] == name) {
-                    return Err("Сервер отсутствует в подписках".into());
-                }
-                let connected = a.status == "Connected";
-                (a.settings.clone(), connected.then(|| a.client.clone()),
-                    a.binary.clone(), a.directory.clone())
-            };
-            let result = if let Some(client) = client { latency::test(client, &name) }
-                else { latency::offline_test(settings, binary, directory, &name) };
-            serde_json::to_value(result).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+    if action == "refresh_due" {
+        subscription_refresh::wake();
+        return Ok(Value::Null);
     }
     if matches!(action.as_str(), "subscription_add" | "subscription_refresh") {
         let captured = app.state::<published_state::ReadState>().get()?;
@@ -1473,6 +1443,9 @@ pub fn run() {
                     }
                 });
             }
+            let probes = latency_refresh::Refresh::default();
+            app.manage(probes.clone());
+            probes.start(app.state::<published_state::ReadState>().inner().clone(), shutdown.clone(), app.handle().clone());
             let refresh_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
             subscription_refresh::start(shared.clone(), app.state::<published_state::ReadState>().inner().clone(), shutdown.clone(), refresh_done.clone());
             let handle = app.handle().clone();
@@ -1480,23 +1453,28 @@ pub fn run() {
                 let mut reconnect_retry = connection_retry::ConnectionRetry::default();
                 let mut cleanup_retry = connection_retry::ConnectionRetry::default();
                 let mut uplink = network_change::Monitor::default();
+                let mut probe_session = None;
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if shutdown.load(std::sync::atomic::Ordering::SeqCst)
                         || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
                     if update_health::pending() {continue;}
                     let network_changed = uplink.tick();
+                    if network_changed {handle.state::<latency_refresh::Refresh>().invalidate();}
                     // Query the service without holding the mutation lock. A
                     // result from an earlier revision cannot affect a new session.
                     let observed=handle.state::<published_state::ReadState>().get().ok()
                         .filter(|v|matches!(v.status.as_str(),"Connected"|"ProtectedPause"))
-                        .map(|v|(v.revision,v.client.session_running(),v.client.recovery_command("recovery_status",Value::Null)));
+                        .map(|v|(v.revision,v.client.session_observation(),v.client.recovery_command("recovery_status",Value::Null)));
                     let Ok(mut a) = shared.try_lock() else { continue; };
                     let service_running=observed.and_then(|(revision,result,recovery)| {
                         if revision != a.revision { return None; }
                         a.recovery=recovery.unwrap_or(Value::Null);
                         match result {
-                            Ok(running)=>{a.control_error=None;Some(running)},
+                            Ok((running,session))=>{
+                                if probe_session.as_ref().is_some_and(|previous|previous!=&session) {handle.state::<latency_refresh::Refresh>().invalidate();}
+                                probe_session=Some(session);a.control_error=None;Some(running)
+                            },
                             Err(error)=>{
                                 if a.control_error.as_ref()!=Some(&error) {
                                     a.log("WARN",&format!("Проверка состояния службы: {error}"));

@@ -1201,19 +1201,25 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    pub(crate) fn context_id(&self) -> String {
+        use sha2::{Digest,Sha256};
+        format!("{}:{:x}:{:p}",self.controller_port,Sha256::digest(self.secret.as_bytes()),
+            self.broker.as_ref().map_or(std::ptr::null(),std::sync::Arc::as_ptr))
+    }
     pub(crate) fn broker_client(&self) -> Option<std::sync::Arc<crate::broker::Broker>> {
         self.broker.clone()
     }
-    pub(crate) fn session_running(&self) -> Result<bool,String> {
+    pub(crate) fn session_observation(&self) -> Result<(bool,String),String> {
         if let Some(broker)=&self.broker {
             if !broker.alive() {
                 let process = crate::service::process_snapshot()?;
-                if matches!(process.state, "Stopped" | "Missing") { return Ok(false); }
+                if matches!(process.state, "Stopped" | "Missing") { return Ok((false,String::new())); }
                 broker.reconnect()?;
             }
-            return broker.call("status",Value::Null).map(|s|s["running"]==true && s["guard"]==true);
+            return broker.call("status",Value::Null).map(|s|(s["running"]==true && s["guard"]==true,
+                format!("{}:{}",s["sessionId"],s["corePid"])));
         }
-        self.api("GET","/version",None).map(|_|true)
+        self.api("GET","/version",None).map(|_|(true,self.context_id()))
     }
     #[cfg(test)]
     pub(crate) fn loopback_fixture(port: u16) -> Self {

@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Separate authorization after merge: type Publish Atlas 2.5.1"
+        description: "Separate authorization after merge: type Publish Atlas 3.0.3"
         required: true
         type: string
 concurrency:
@@ -20,7 +20,7 @@ jobs:
       - release-readiness
       - release-acceptance
       - release-backend
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.3'
     runs-on: windows-latest
     env:
       ATLAS_BUILD_ID: ${{ github.sha }}
@@ -77,10 +77,10 @@ jobs:
           if-no-files-found: warn
   release-acceptance:
     needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.3'
     uses: ./.github/workflows/connected-upgrade.yml
     secrets: inherit
   release-backend:
     needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 2.5.1'
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.3'
     uses: ./.github/workflows/pr-check.yml
