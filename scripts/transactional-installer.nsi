@@ -59,6 +59,20 @@ Section "Atlas"
   CreateDirectory "$SMPROGRAMS\Atlas"
   CreateShortCut "$SMPROGRAMS\Atlas\Atlas.lnk" "$INSTDIR\Atlas.exe"
   CreateShortCut "$DESKTOP\Atlas.lnk" "$INSTDIR\Atlas.exe"
+  nsExec::ExecToStack '"$INSTDIR\AtlasUpdater.exe" --stamp-shortcut "$SMPROGRAMS\Atlas\Atlas.lnk"'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    SetErrorLevel 7
+    Abort "Atlas Start Menu identity: $1"
+  ${EndIf}
+  nsExec::ExecToStack '"$INSTDIR\AtlasUpdater.exe" --stamp-shortcut "$DESKTOP\Atlas.lnk"'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    SetErrorLevel 7
+    Abort "Atlas Desktop identity: $1"
+  ${EndIf}
 SectionEnd
 Section "Uninstall"
   InitPluginsDir

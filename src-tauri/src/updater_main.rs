@@ -15,6 +15,7 @@ mod update_candidate;
 mod update_service;
 mod update_data;
 mod update_launcher;
+mod shell_identity;
 mod maintenance;
 mod network_guard;
 mod windows;
@@ -37,6 +38,9 @@ fn signed_manifest(manifest:&std::path::Path,signature:&std::path::Path)->Result
 }
 fn run()->Result<(),String> {
     let args:Vec<String>=std::env::args().collect();
+    if args.len()==3 && args[1]=="--stamp-shortcut" {
+        return shell_identity::stamp_shortcut(std::path::Path::new(&args[2]), &std::env::current_exe().map_err(|e|e.to_string())?);
+    }
     if args.len()==3 && args[1]=="--download-install" {return update_install::run(&args[2]);}
     if args.len()==1 || args.len()==2 && args[1]=="--autostart" {
         let executable=std::env::current_exe().map_err(|e|e.to_string())?;
