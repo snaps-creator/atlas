@@ -72,6 +72,33 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
     recovery.active=Some(Scheduled{rx,generation:recovery.generation});
     recovery.poll_active(&fixture.client,&fixture.settings,Instant::now());
 }
+#[test] fn active_monitor_uses_ten_seconds_without_duplicate_jobs() {
+    let f=Fixture::new(60,true);let mut r=Recovery::default();let begin=Instant::now();
+    for cycle in 0..3 {
+        let at=begin+Duration::from_secs(cycle*10);
+        r.monitor(f.client.clone(),&f.settings,at);
+        assert_eq!(r.last_active,Some(at));assert!(r.active.is_some());
+        r.monitor(f.client.clone(),&f.settings,at+Duration::from_secs(1));
+        assert_eq!(r.last_active,Some(at));
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while r.active.is_some() {
+            r.poll_active(&f.client,&f.settings,at);
+            assert!(Instant::now()<deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        r.monitor(f.client.clone(),&f.settings,at+Duration::from_secs(9));
+        assert!(r.active.is_none());assert_eq!(r.last_active,Some(at));
+    }
+}
+#[test] fn healthy_ticks_do_not_launch_a_second_reserve_or_quarantine_scan() {
+    let f=Fixture::new(60,true);let mut r=Recovery::default();let now=Instant::now();
+    r.last_active=Some(now);r.last_environment_check=Some(now);
+    r.observed_current=Some("slow".into());
+    r.blocked.insert(node_key(&f.settings.servers()[1]),Quarantine{probe_after:now,failures:1});
+    for _ in 0..100 { r.tick(f.client.clone(),&f.settings); }
+    assert!(r.pending.is_none() && r.active.is_none());assert!(!r.needed);
+    assert_eq!(*f.selected.lock().unwrap(),"slow");
+}
 #[test] fn threshold_timeout_and_emergency_priority() {
     let f=Fixture::new(60,true);let mut r=Recovery::default();
     sample(&mut r,&f,Some(80),true);assert!(!r.needed);

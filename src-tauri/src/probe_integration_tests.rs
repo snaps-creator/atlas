@@ -127,6 +127,54 @@ fn real_core_success_handshake_failure_traffic_timeout_bad_status_and_recovery()
 }
 
 #[test]
+fn real_core_303_metric_excludes_first_request_setup_time() {
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint=format!("http://127.0.0.1:{}/generate_204",listener.local_addr().unwrap().port());
+    let origin=thread::spawn(move || {
+        let deadline=std::time::Instant::now()+Duration::from_secs(10);
+        let mut hits=0;
+        for _ in 0..2 {
+            let mut socket=loop {
+                if let Ok((socket,_))=listener.accept() {break socket;}
+                assert!(std::time::Instant::now()<deadline,"missing probe connection");
+                thread::sleep(Duration::from_millis(5));
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            for request in 0..2 {
+                let mut bytes=Vec::new();let mut buf=[0;1024];
+                while !bytes.windows(4).any(|w|w==b"\r\n\r\n") {
+                    let n=socket.read(&mut buf).unwrap_or(0);if n==0 {break;}
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                if bytes.is_empty() {break;}
+                hits+=1;
+                thread::sleep(Duration::from_millis(if request==0 {450} else {25}));
+                socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+            }
+        }
+        hits
+    });
+    let relay=Socks::new();let fixture=Fixture::new(&settings(vec![relay.node("warm")]));
+    let client=fixture.core.client();
+    let warm=display_probe(&client,"warm",&endpoint,2000);
+    let path=fixture.directory.join("candidate.yaml");
+    let mut config:Value=serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(config["unified-delay"],true);
+    config["unified-delay"]=json!(false);
+    std::fs::write(&path,serde_yaml::to_string(&config).unwrap()).unwrap();
+    client.api("PUT","/configs?force=true",Some(json!({"path":path}))).unwrap();
+    let cold=display_probe(&client,"warm",&endpoint,2000);
+    assert_eq!(origin.join().unwrap(),3);
+    assert_eq!(warm.status,"ok","{warm:?}");assert_eq!(cold.status,"ok","{cold:?}");
+    assert!(warm.delay.unwrap()>=20 && warm.delay.unwrap()<300,"{warm:?}");
+    assert!(cold.delay.unwrap()>=400,"{cold:?}");
+    assert_eq!(crate::latency::DISPLAY_URL,"http://cp.cloudflare.com/generate_204");
+    assert_eq!(crate::latency::TUNNEL_URL,"https://cp.cloudflare.com/generate_204");
+}
+
+#[test]
 fn real_https_204_verified_tls_timeout_and_recovery_through_concrete_proxy() {
     use std::os::windows::process::CommandExt;
     let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_owned();

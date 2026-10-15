@@ -9,9 +9,9 @@ test("product manifests agree and candidate is newer than supported upgrade base
   const version = json("package.json").version;
   assert.match(version, /^\d+\.\d+\.\d+$/);
   const parts = version.split(".").map(Number);
-  const baseline = [3, 0, 3];
+  const baseline = [3, 0, 4];
   const difference = parts.map((v, i) => v - baseline[i]).find((v) => v !== 0);
-  assert.ok(difference > 0, "candidate must be newer than the latest supported upgrade baseline 3.0.3");
+  assert.ok(difference > 0, "candidate must be newer than the latest supported upgrade baseline 3.0.4");
   const lock = json("package-lock.json");
   for (const value of [
     lock.version,

@@ -20,7 +20,7 @@ export type Latency = {
   connection?: {status:string;transport:string;observedAt:number;error:string} | null;
 };
 
-export const LATENCY_FRESH_MS = 10_000;
+export const LATENCY_FRESH_MS = 90_000;
 export function mergeLatency(old: Latency | undefined, incoming: Latency): Latency {
   // Completion time must not promote a probe which started before a newer one.
   const a = old?.startedAt ?? old?.measuredAt ?? 0;
@@ -41,7 +41,7 @@ export function expireLatencies(values: Record<string,Latency>, now=Date.now()) 
 export function latencyDetails(value?: Latency): string {
   const probe = value?.error ?? (freshLatency(value)?.status === "stale"
     ? "Измерение устарело. Доступность не подтверждена."
-    : `HTTPS 204 через ${value?.outboundTag ? `outbound ${value.outboundTag}` : "этот прокси"} до Cloudflare, включая handshake. UDP, другие сайты и пользовательские соединения не проверены.`);
+    : `HTTP 204 через ${value?.outboundTag ? `outbound ${value.outboundTag}` : "этот прокси"} до Cloudflare; методика 3.0.3, повторный запрос по установленному соединению. UDP, другие сайты и пользовательские соединения не проверены.`);
   const connection=value?.connection;
   return connection ? `${probe} Последняя ошибка ${connection.transport.toUpperCase()}-соединения (${new Date(connection.observedAt).toLocaleTimeString()}): ${connection.error}` : probe;
 }

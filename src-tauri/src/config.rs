@@ -101,9 +101,9 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         .as_array_mut()
         .unwrap()
         .push(json!({"name":"GLOBAL","type":"select","proxies":["ATLAS"]}));
-    // Measure handshake plus the validated request. A failed second request
-    // must not be hidden by Mihomo's warm-connection measurement fallback.
-    doc["unified-delay"] = json!(false);
+    // Preserve the 3.0.3 warm-request metric used by the displayed latency
+    // and auto-search threshold. Tunnel health is verified separately.
+    doc["unified-delay"] = json!(true);
     if s.mode == "tun" {
         for node in doc["proxies"].as_array_mut().unwrap() {
             if ["ss", "vmess", "vless", "trojan", "socks5"]
@@ -199,7 +199,7 @@ mod tests {
         let y: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(y["rules"][0], "MATCH,DIRECT");
         assert_eq!(y["allow-lan"], false);
-        assert_eq!(y["unified-delay"], false);
+        assert_eq!(y["unified-delay"], true);
         assert_eq!(y["proxy-groups"][1]["type"], "select");
         assert_eq!(y["proxy-groups"][2]["type"], "select");
         assert!(y["proxy-groups"][1]["url"].is_null());

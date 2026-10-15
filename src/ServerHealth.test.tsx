@@ -2,7 +2,7 @@ import { expect, test } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ServerCard } from "./ServerCard";
 import { ActiveServer } from "./ActiveServer";
-import { beginLatency, mergeLatency, expireLatencies, retainNodeLatencies, latencyDetails, type Latency } from "./latency";
+import { beginLatency, mergeLatency, expireLatencies, retainNodeLatencies, latencyDetails, LATENCY_FRESH_MS, type Latency } from "./latency";
 import { selectedLatency } from "./ActiveServer";
 
 const render = (latency: Latency) => ({
@@ -20,7 +20,7 @@ test("карточка и активный сервер согласованы: 
     const result=render({...ok,status:state});
     expect(result.card).not.toContain("server-card-delay fast");expect(result.active).not.toContain("56 мс");
   }
-  const stale=render({...ok,measuredAt:Date.now()-10_001});
+  const stale=render({...ok,measuredAt:Date.now()-LATENCY_FRESH_MS-1});
   expect(stale.card).not.toContain("server-card-delay fast");expect(stale.active).not.toContain("56 мс");
   expect(render({...ok,measuredAt:Date.now()}).active).toContain("56 мс");
 });

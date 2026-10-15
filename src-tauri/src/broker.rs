@@ -469,7 +469,7 @@ fn allowed_api(method: &str, path: &str) -> bool {
     if method == "GET" && (path.starts_with("/proxies/") || path.starts_with("/group/AUTO/delay?")) && path.contains("/delay?") {
         if let Ok(url) = url::Url::parse(&format!("http://localhost{path}")) {
             return url.query_pairs().all(|(k, v)| match k.as_ref() {
-                "url" => crate::latency::ENDPOINTS.contains(&v.as_ref()),
+                "url" => v == crate::latency::DISPLAY_URL || crate::latency::ENDPOINTS.contains(&v.as_ref()),
                 "timeout" => v.parse::<u64>().is_ok_and(|n| n <= 10000),
                 "expected" => v == "204" || v == "200",
                   "atlas_probe" => v == "1",
@@ -1624,6 +1624,10 @@ mod tests {
         assert!(allowed_api(
             "GET",
             "/proxies/x/delay?timeout=8000&expected=204&atlas_probe=1&url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
+        ));
+        assert!(allowed_api(
+            "GET",
+            "/proxies/x/delay?timeout=8000&expected=204&atlas_probe=1&url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
         ));
     }
     #[test]

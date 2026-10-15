@@ -1,13 +1,14 @@
 import { expect, test, vi } from "vitest";
 import { matchingLatencies } from "./latencyPolling";
-import { freshLatency, latencyRank, mergeLatency, expireLatencies } from "./latency";
+import { freshLatency, latencyRank, mergeLatency, expireLatencies, LATENCY_FRESH_MS } from "./latency";
 
 test("свежий пинг отображается числом; timeout остаётся видимым без старого ping", () => {
   const now=Date.now();
   const measured: Latency = {status:"ok",delay:210,attempts:1,measuredAt:now-1000};
   expect(latencyLabel(measured)).toBe("210 мс");
   expect(latencyLabel(freshLatency(measured,150,now))).toBe("210 мс");
-  expect(latencyLabel(freshLatency(measured,150,now+10000))).toBe("");
+  expect(latencyLabel(freshLatency(measured,150,now+60000))).toBe("210 мс");
+  expect(latencyLabel(freshLatency(measured,150,now+LATENCY_FRESH_MS))).toBe("");
   for (const status of ["ok", "high_latency", "stale"] as const) {
     expect(latencyLabel({status,delay:null,attempts:0})).toBe("");
   }
@@ -18,7 +19,7 @@ test("устаревшее измерение и превышение порог
   const value: Latency = {status:"ok",delay:80,attempts:1,measuredAt:1000};
   expect(freshLatency(value,150,2000)?.status).toBe("ok");
   expect(freshLatency({...value,delay:200},150,2000)?.status).toBe("high_latency");
-  expect(freshLatency(value,150,32000)?.status).toBe("stale");
+  expect(freshLatency(value,150,1000+LATENCY_FRESH_MS)?.status).toBe("stale");
   expect(latencyRank(value)).toBe(Infinity);
   expect(latencyLabel({status:"timeout",delay:null,attempts:1})).toBe("Таймаут");
   expect(latencyLabel({status:"queued",delay:null,attempts:0})).toBe("");
@@ -152,15 +153,17 @@ test("быстрый результат публикуется, пока мед�
 });
 
 
-test("успешные 56 мс исчезают при timeout и истечении 10 секунд", () => {
+test("успешные 56 мс сохраняются между минутными обходами, но не после timeout или срока свежести", () => {
   const ok: Latency = {status:"ok",delay:56,attempts:1,startedAt:100,measuredAt:200};
-  expect(freshLatency(ok,Infinity,10_199)?.status).toBe("ok");
-  expect(freshLatency(ok,Infinity,10_200)).toMatchObject({status:"stale",delay:null});
+  expect(LATENCY_FRESH_MS).toBe(90_000);
+  expect(freshLatency(ok,Infinity,60_200)?.status).toBe("ok");
+  expect(freshLatency(ok,Infinity,LATENCY_FRESH_MS+199)?.status).toBe("ok");
+  expect(freshLatency(ok,Infinity,LATENCY_FRESH_MS+200)).toMatchObject({status:"stale",delay:null});
   const failed: Latency = {status:"unreachable",delay:null,attempts:1,startedAt:300,measuredAt:400};
   expect(mergeLatency(ok,failed)).toEqual(failed);
   expect(mergeLatency(failed,{...ok,measuredAt:500})).toEqual(failed);
-  expect(expireLatencies({a:ok,b:failed},10_200).a.delay).toBeNull();
-  expect(expireLatencies({a:ok,b:failed},10_200).b).toEqual(failed);
+  expect(expireLatencies({a:ok,b:failed},LATENCY_FRESH_MS+200).a.delay).toBeNull();
+  expect(expireLatencies({a:ok,b:failed},LATENCY_FRESH_MS+200).b).toEqual(failed);
 });
 
 test("поздний итог batch не освежает ранний результат и не заменяет новую ошибку", () => {
@@ -168,7 +171,7 @@ test("поздний итог batch не освежает ранний резу�
   const failed: Latency={status:"unreachable",delay:null,attempts:1,startedAt:now-100,measuredAt:now};
   const late: Latency={status:"ok",delay:56,attempts:1,startedAt:now-1000,measuredAt:now};
   expect(mergeLatency(failed,late)).toEqual(failed);
-  expect(mergeLatency(undefined,{...late,measuredAt:now-11_000})).toMatchObject({status:"stale",delay:null});
+  expect(mergeLatency(undefined,{...late,measuredAt:now-LATENCY_FRESH_MS-1000})).toMatchObject({status:"stale",delay:null});
   expect(freshLatency({status:"ok",delay:56,attempts:1})).toMatchObject({status:"stale",delay:null});
 });
 

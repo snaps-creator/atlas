@@ -3,7 +3,8 @@ use crate::{latency::node_identity, model::Settings};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 
-pub const FRESH_MS: u64 = 10_000;
+// One minute between pool measurements, with room for a bounded batch to finish.
+pub const FRESH_MS: u64 = 90_000;
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }

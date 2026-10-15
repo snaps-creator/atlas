@@ -7,6 +7,7 @@ use std::{collections::{HashMap, HashSet}, sync::mpsc, time::{Duration, Instant}
 const QUARANTINE: u64 = 30;
 const PROBE_TIMEOUT: u64 = 1500;
 const SEARCH_WORKERS: usize = 6;
+const ACTIVE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 fn probe_timeout(settings: &Settings) -> u64 {
     // A user's permitted latency must not exceed the probe's own deadline.
     PROBE_TIMEOUT.max(settings.auto_search_ping_ms.saturating_add(250)).min(10000)
@@ -91,13 +92,10 @@ pub(crate) struct Recovery {
     pending: Option<Pending>,
     retry_at: Option<Instant>,
     needed: bool,
-    scheduled: Option<Scheduled>,
     samples: HashMap<String,NodeSample>,
-    probe_attempts: HashMap<String,Instant>,
     last_active: Option<Instant>,
     active: Option<Scheduled>,
     slow_samples: u8,
-    last_reserves: Option<Instant>,
     observed_current: Option<String>,
     current_since: Option<Instant>,
     improvement: Option<(String,u8)>,
@@ -128,7 +126,7 @@ impl Recovery {
         if self.phase!=Phase::RefreshingSubscriptions { self.invalidate(); return; }
         self.cancelled.store(true,std::sync::atomic::Ordering::SeqCst);
         self.cancelled=Default::default(); self.generation+=1;
-        self.pending=None; self.active=None; self.scheduled=None; self.verification=None;
+        self.pending=None; self.active=None; self.verification=None;
         self.samples.clear(); self.blocked.clear(); self.last_active=None;
         self.attempted.clear();
     }
@@ -169,9 +167,8 @@ impl Recovery {
         self.cancelled.store(true,std::sync::atomic::Ordering::SeqCst);
         self.cancelled=Default::default();
         self.generation += 1; self.pending = None; self.needed = false; self.retry_at = None;
-        self.scheduled = None; self.samples.clear(); self.last_active = None;
-        self.probe_attempts.clear();
-        self.last_reserves = None; self.observed_current = None;
+        self.samples.clear(); self.last_active = None;
+        self.observed_current = None;
         self.current_since = None; self.improvement = None; self.active = None; self.slow_samples = 0;
         self.verification=None; self.operation=None; self.phase=Phase::Disconnected;
         self.attempted.clear();
@@ -216,7 +213,7 @@ impl Recovery {
         }
     }
     fn monitor(&mut self, client: ApiClient, settings: &Settings, now: Instant) {
-        if self.active.is_some() || self.last_active.is_some_and(|at|now.duration_since(at)<Duration::from_secs(1)) { return; }
+        if self.active.is_some() || self.last_active.is_some_and(|at|now.duration_since(at)<ACTIVE_CHECK_INTERVAL) { return; }
         self.last_active = Some(now);
         let (tx,rx)=mpsc::channel();
         self.active=Some(Scheduled{rx,generation:self.generation});
@@ -249,64 +246,6 @@ impl Recovery {
                 }
                 Some((name,delay,traffic))
             }).collect();
-            let _=tx.send(results);
-        });
-    }
-    fn poll_scheduled(&mut self, _client: &ApiClient, _settings: &Settings, now: Instant) {
-        let Some(pending)=&self.scheduled else {return;};
-        let result=pending.rx.try_recv();
-        if matches!(result,Err(mpsc::TryRecvError::Empty)) {return;}
-        let pending=self.scheduled.take().unwrap();
-        if pending.generation!=self.generation {return;}
-        if let Ok(results)=result {for (name,delay,alive) in results {
-            self.samples.insert(name,NodeSample{checked_at:now,primary_delay:delay,alive});
-        }}
-    }
-    fn planned_names(&self, settings: &Settings, current: &str, now: Instant) -> Vec<String> {
-        let nodes=settings.servers();
-        let mut names:Vec<_>=nodes.iter().filter(|n|n["name"] != current && !self.blocked.contains_key(&node_key(n)))
-            .filter_map(|n|n["name"].as_str().map(str::to_owned))
-            .filter(|name|self.samples.get(name).is_none_or(|s|now.duration_since(s.checked_at)>=Duration::from_secs(settings.auto_test_interval_seconds)))
-            .filter(|name|self.probe_attempts.get(name).is_none_or(|at|now.duration_since(*at)>=Duration::from_secs(30)))
-            .collect();
-        names.sort_by_key(|name|self.probe_attempts.get(name).copied());
-        names.truncate(2);
-        names
-    }
-    fn schedule(&mut self, client: ApiClient, settings: &Settings, now: Instant) {
-        if self.scheduled.is_some() || self.pending.is_some() || self.needed { return; }
-        let Some(current) = self.observed_current.clone() else { return; };
-        // Fair background measurement is independent of optimization and of
-        // the current server's delay. Unknown nodes must not wait for manual ping.
-        if self.last_reserves.is_some_and(|at|now.duration_since(at)<Duration::from_secs(2)) { return; }
-        let names=self.planned_names(settings,&current,now);
-        self.last_reserves=Some(now);
-        if names.is_empty() { return; }
-        for name in &names { self.probe_attempts.insert(name.clone(),now); }
-        let (tx,rx)=mpsc::channel();
-        self.scheduled=Some(Scheduled{rx,generation:self.generation});
-        let timeout=probe_timeout(settings);
-        let cancelled=self.cancelled.clone();
-        std::thread::spawn(move || {
-            let mut results = Vec::with_capacity(names.len());
-            // Health never launches the whole pool at once. Two network probes
-            // leave room for a six-worker manual batch on the same controller.
-            for pair in names.chunks(2) {
-                results.extend(std::thread::scope(|scope| {
-                    let jobs: Vec<_>=pair.iter().map(|name| {
-                        let client=&client;
-                        let cancelled=&cancelled;
-                        scope.spawn(move || {
-                            match confirmed_probe(client,name,timeout,Some(cancelled)) {
-                                Ok(value) => Some((name.clone(),value["delay"].as_u64(),true)),
-                                Err(error) if remote_probe_failure(&error) => Some((name.clone(),None,false)),
-                                Err(_) => None, // Local busy/errors are not node failures.
-                            }
-                        })
-                    }).collect();
-                    jobs.into_iter().filter_map(|j|j.join().ok().flatten()).collect::<Vec<_>>()
-                }));
-            }
             let _=tx.send(results);
         });
     }
@@ -373,7 +312,6 @@ impl Recovery {
             }
         }
         self.poll_active(&client,settings,now);
-        self.poll_scheduled(&client,settings,now);
         // All selection decisions now pass through the recovery operation.
         if self.verification.is_none() { self.monitor(client.clone(),settings,now); }
         let automatic = matches!(settings.selected.as_str(),"AUTO"|"FAILOVER")
@@ -452,20 +390,9 @@ impl Recovery {
             }
         }
         if self.pending.is_some() || self.verification.is_some() || self.phase==Phase::RefreshingSubscriptions { return; }
-        if !self.needed {
-            self.schedule(client.clone(),settings,now);
-            if self.scheduled.is_some() { return; }
-            if let Some(node) = servers.iter().find(|n| self.blocked.get(&node_key(n)).is_some_and(|b|b.probe_after <= now)) {
-                let name = node["name"].as_str().unwrap_or("").to_owned();
-                let (tx,rx) = mpsc::channel();
-                self.pending = Some(Pending{rx,generation:self.generation,repair_only:true});
-                // Mark the next attempt while this trial is in flight. No user
-                // traffic uses this node until both control rounds succeed.
-                if let Some(b) = self.blocked.get_mut(&node_key(node)) { b.probe_after = now + Duration::from_secs(QUARANTINE); }
-                std::thread::spawn(move || { let _ = tx.send(verify_names(&client,&[name],&crate::latency::ENDPOINTS)); });
-            }
-            return;
-        }
+        // The application-owned minute refresh covers every node, including
+        // quarantined nodes. Recovery only adds work when the active path needs it.
+        if !self.needed { return; }
         if self.retry_at.is_some_and(|t|t>now) { return; }
         // Cooldown suppresses ping oscillation, never a confirmed dead path.
         if self.slow_samples>0 && self.last_switch.is_some_and(|at|now.duration_since(at)<Duration::from_secs(settings.recovery_policy.switch_cooldown_seconds)) { return; }
@@ -599,20 +526,19 @@ mod tests {
         let now=Instant::now();
         let mut recovery=Recovery::default();
         recovery.blocked.insert("old-node".into(),Quarantine{probe_after:now,failures:1});
-        recovery.probe_attempts.insert("old-node".into(),now);
         recovery.samples.insert("old-node".into(),NodeSample{checked_at:now,primary_delay:None,alive:false});
         recovery.propose_for_test(json!({"candidate":"old-node"}));
         let previous_epoch=recovery.path_epoch();
         let cancelled=recovery.cancelled.clone();
         recovery.network_changed();
         assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(recovery.blocked.is_empty() && recovery.samples.is_empty() && recovery.probe_attempts.is_empty());
-        assert!(recovery.pending.is_none() && recovery.scheduled.is_none());
+        assert!(recovery.blocked.is_empty() && recovery.samples.is_empty());
+        assert!(recovery.pending.is_none() && recovery.active.is_none());
         assert_ne!(recovery.path_epoch(),previous_epoch);
         assert_eq!(recovery.route_revision,0);
     }
     #[test]
-    fn healthy_connection_keeps_selection_when_measurements_improve() {
+    fn disabled_optimization_keeps_a_responding_active_server() {
         let settings=Settings::default();
         assert!(!settings.auto_optimize);
         let now=Instant::now();
@@ -623,35 +549,13 @@ mod tests {
         recovery.improvement=Some(("faster".into(),1));
         recovery.samples.insert("active".into(),NodeSample{checked_at:now,primary_delay:Some(500),alive:true});
         let (tx,rx)=mpsc::channel();
-        tx.send(vec![("faster".into(),Some(20),true)]).unwrap();
-        recovery.scheduled=Some(Scheduled{rx,generation:0});
+        tx.send(vec![("active".into(),Some(500),true)]).unwrap();
+        recovery.active=Some(Scheduled{rx,generation:0});
         let core=crate::core::Core::new(Default::default(),Default::default());
-        recovery.poll_scheduled(&core.client(),&settings,now);
+        recovery.poll_active(&core.client(),&settings,now);
         assert_eq!(recovery.observed_current.as_deref(),Some("active"));
         assert_eq!(recovery.route_revision,0);
-        assert_eq!(recovery.samples["faster"].primary_delay,Some(20));
-    }
-    #[test]
-    fn large_pool_unknown_nodes_are_fair_even_after_controller_errors() {
-        let mut settings=Settings::default();
-        settings.subscriptions.push(crate::model::Subscription{source:Default::default(),options:Default::default(),id:"source".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
-            servers:(0..126).map(|i|json!({"name":format!("node-{i}"),"server":"192.0.2.1","port":443})).collect()});
-        let mut recovery=Recovery::default();
-        let now=Instant::now();
-        let mut seen=HashSet::new();
-        // Failed local requests produce no availability sample but still yield
-        // their place in the queue to nodes that have never been attempted.
-        for round in 0..63 {
-            let at=now+Duration::from_secs(round*2);
-            let names=recovery.planned_names(&settings,"active",at);
-            assert_eq!(names.len(),2);
-            for name in names { assert!(seen.insert(name.clone())); recovery.probe_attempts.insert(name,at); }
-        }
-        assert_eq!(seen.len(),126);
-        let names=recovery.planned_names(&settings,"active",now+Duration::from_secs(126));
-        assert_eq!(names,vec!["node-0","node-1"]);
-        recovery.invalidate();
-        assert!(recovery.probe_attempts.is_empty());
+        assert!(!recovery.needed);
     }
     #[test]
     fn http_failure_with_working_https_is_not_a_dead_node() {
