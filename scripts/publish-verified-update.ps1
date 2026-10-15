@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 & node (Join-Path $PSScriptRoot 'check-updater-readiness.cjs')
 if ($LASTEXITCODE -ne 0) { throw 'Updater publication policy blocks preparation' }
 if (-not $env:GITHUB_REPOSITORY -or -not $env:ATLAS_BUILD_ID) { throw 'GitHub build/repository context is missing' }
-if (-not $VerifyOnly -and (-not $env:GITHUB_TOKEN -or $env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_REF -ne 'refs/heads/main' -or $env:ATLAS_BUILD_ID -ne $env:GITHUB_SHA -or $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or $env:ATLAS_RELEASE_AUTHORIZATION -ne 'Publish Atlas 3.0.3')) {
+if (-not $VerifyOnly -and (-not $env:GITHUB_TOKEN -or $env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_REF -ne 'refs/heads/main' -or $env:ATLAS_BUILD_ID -ne $env:GITHUB_SHA -or $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or $env:ATLAS_RELEASE_AUTHORIZATION -ne 'Publish Atlas 3.0.4')) {
     throw 'Publication requires the verified main CI build and separate manual publication authorization'
 }
 & (Join-Path $PSScriptRoot 'test-packaged-installer.ps1') -Installer $Installer

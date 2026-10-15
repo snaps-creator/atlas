@@ -40,6 +40,13 @@ jobs:
         run: node --test scripts/release-distribution.check.cjs
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
+      - name: Repeat the real 62-node timeout regression
+        shell: pwsh
+        run: |
+          1..5 | ForEach-Object {
+            cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact core::multi_client_tests::batch_62_nodes_all_timeout_finishes --nocapture
+            if ($LASTEXITCODE -ne 0) { throw "62-node timeout regression failed on attempt $_" }
+          }
       - name: Verify background ping across real expiry
         # The background timer must cross the previous 30-second expiry in real
         # time too; ordinary scheduler tests use controlled monotonic time.

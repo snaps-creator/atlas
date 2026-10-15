@@ -1,4 +1,5 @@
-param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller)
+param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller,
+    [ValidateSet('2.4.2','3.0.1','3.0.2','3.0.3')][string]$BaselineVersion='2.4.2')
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.
@@ -173,8 +174,8 @@ function Install-Checked([string]$path) {
         throw "Installer failed: $($process.ExitCode)"
     }
 }
-$previousVersion = if ($PreviousInstaller) { '2.4.3' } elseif ($LegacyBaseline) { '2.2.3-alpha.47.1' } else { '2.4.2' }
-$previousName = "Atlas_${previousVersion}_x64-setup.exe"
+$previousVersion = if ($PreviousInstaller) { '2.4.3' } elseif ($LegacyBaseline) { '2.2.3-alpha.47.1' } else { $BaselineVersion }
+$previousName = if ($previousVersion.StartsWith('3.')) { "Atlas-Setup-${previousVersion}.exe" } else { "Atlas_${previousVersion}_x64-setup.exe" }
 $previous = Join-Path $fixture $previousName
 $base = "https://github.com/snaps-creator/atlas/releases/download/v$previousVersion/"
 if ($PreviousInstaller) {
