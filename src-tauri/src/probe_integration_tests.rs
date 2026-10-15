@@ -131,7 +131,8 @@ fn real_https_204_verified_tls_timeout_and_recovery_through_concrete_proxy() {
     use std::os::windows::process::CommandExt;
     let root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_owned();
     let directory=root.join("temp").join(format!("health-https-{}",uuid::Uuid::new_v4()));
-    std::fs::create_dir(&directory).unwrap();
+    // A clean checkout has no ignored temp directory yet.
+    std::fs::create_dir_all(&directory).unwrap();
     let generated=std::process::Command::new("pwsh").creation_flags(0x08000000)
         .args(["-NoProfile","-File"]).arg(root.join("scripts/atlas-health-fixture-cert.ps1"))
         .arg("-Directory").arg(&directory).output().unwrap();

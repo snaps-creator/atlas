@@ -59,6 +59,8 @@ git diff --check
 
 Initial failures were investigated rather than counted as passes: Windows sandbox blocked Vite cache rename and MSVC PDB operations; commands succeeded outside that sandbox. Earlier recovery/controller fixtures lacked certified health records and expected the old timeout label. Their protocol and assertions were updated. Recovery backoff fixture now establishes a previously observed failure before asserting that repeated failures preserve backoff; a genuinely new outage still preempts it. The first UI smoke used a dev-URL binary and timed out; the embedded frontend build passed. NSIS required the same UTF-8 BOM used by the production build script.
 
+PR #65's first CI run failed in the HTTPS fixture before any probe: a clean checkout had no ignored `temp` parent, and `create_dir` returned Windows error 3. The fixture now uses `create_dir_all`. The exact failing test passed locally with the worktree's `temp` directory explicitly absent at test start; existing evidence was preserved and restored. The GitHub rerun must still be assessed independently.
+
 ## Windows update acceptance and limitations
 
 No accessible local disposable VM was found: the host is a physical MSI machine; Hyper-V management/Get-VM, VMMS, VMware and VirtualBox tools were unavailable. HypervisorPresent alone does not provide a test VM. No test installation, production updater, service restart, TUN/DNS/proxy modification or release publication was performed.
