@@ -675,12 +675,16 @@ fn controller_timeout(method: &str, path: &str, body: Option<&Value>) -> Duratio
     if path.contains("/delay?") {
         let timeout = path.split('?').nth(1).and_then(|q| url::form_urlencoded::parse(q.as_bytes())
             .find(|(key,_)|key == "timeout").and_then(|(_,v)|v.parse::<u64>().ok())).unwrap_or(10000);
-        return Duration::from_millis(timeout.clamp(100,10000) + 500);
+        // Group deadlines belong to individual probes. The controller still
+        // needs to collect their results and send the aggregate response.
+        // Keep a bounded response budget without extending any node's probe.
+        let response_budget = if path.starts_with("/group/") { 3000 } else { 500 };
+        return Duration::from_millis(timeout.clamp(100,10000) + response_budget);
     }
     Duration::from_secs(if method == "PATCH" && path == "/configs"
         && body.is_some_and(|value| value["tun"]["enable"] == false) {
         1
-    } else if path.contains("/delay?") { 12 } else { 3 })
+    } else { 3 })
 }
 
 #[cfg(test)]
@@ -914,6 +918,35 @@ mod integration_tests {
         assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":false}}))), Duration::from_secs(1));
         assert_eq!(controller_timeout("GET", "/configs", None), Duration::from_secs(3));
         assert_eq!(controller_timeout("PATCH", "/configs", Some(&json!({"tun":{"enable":true}}))), Duration::from_secs(3));
+    }
+    #[test]
+    fn group_delay_waits_for_controller_completion_after_node_deadlines() {
+        use std::io::{Read, Write};
+        // Node deadlines and the controller's aggregate response are distinct.
+        // Model a completed group whose response is queued for more than 500ms.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0; 4096];
+            let size = socket.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /group/AUTO/delay?timeout=100&"));
+            thread::sleep(Duration::from_millis(800));
+            // A fully failed group must retain its HTTP 504 classification.
+            let _ = socket.write_all(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let mut core = Core::new(PathBuf::from("unused.exe"), PathBuf::new());
+        core.ports[1] = port;
+        let result = core.api("GET", "/group/AUTO/delay?timeout=100&expected=204", None);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap_err(), "Mihomo API: HTTP 504");
+    }
+    #[test]
+    fn group_response_budget_is_bounded_and_does_not_extend_single_probes() {
+        assert_eq!(controller_timeout("GET", "/group/AUTO/delay?timeout=5000", None), Duration::from_secs(8));
+        assert_eq!(controller_timeout("GET", "/group/AUTO/delay?timeout=999999", None), Duration::from_secs(13));
+        assert_eq!(controller_timeout("GET", "/proxies/node/delay?timeout=5000", None), Duration::from_millis(5500));
     }
     #[test]
     fn disconnected_stop_does_not_launch_a_broker_for_a_stale_marker() {

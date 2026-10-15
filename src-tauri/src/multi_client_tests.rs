@@ -301,13 +301,17 @@ fn check_batch_62(healthy: usize) {
         thread::sleep(Duration::from_millis(25));
     }
     let started = Instant::now();
-    let result = crate::latency::batch_at(core.client(), &names, &format!("http://127.0.0.1:{origin_port}/")).unwrap();
+    let result = crate::latency::batch_at(core.client(), &names, &format!("http://127.0.0.1:{origin_port}/"));
     let elapsed = started.elapsed();
+    // Preserve the actual controller path on failure, after cleaning up the
+    // fixture. An early unwrap used to discard this diagnostic evidence.
+    let events = core.client().logs().unwrap_or_default();
     done.store(true, Ordering::SeqCst);
     let accepted = worker.join().unwrap();
     core.stop().unwrap();
     let directory = core.directory.clone(); drop(core);
     std::fs::remove_dir_all(directory).unwrap();
+    let result = result.unwrap_or_else(|error| panic!("62-node group failed after {elapsed:?}: {error}\n{}", events.join("\n")));
     assert!(elapsed < Duration::from_secs(10), "62 nodes took {elapsed:?}");
     assert!(accepted >= 62 - healthy, "all stalled nodes must actually be contacted: {accepted}");
     assert_eq!(result.as_object().unwrap().len(), 62);

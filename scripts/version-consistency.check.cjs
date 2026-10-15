@@ -5,13 +5,13 @@ const path = require("node:path");
 const root = path.join(__dirname, "..");
 const read = (p) => fs.readFileSync(path.join(root, p), "utf8");
 const json = (p) => JSON.parse(read(p));
-test("product manifests agree and candidate is newer than published 2.4.2", () => {
+test("product manifests agree and candidate is newer than supported upgrade baselines", () => {
   const version = json("package.json").version;
   assert.match(version, /^\d+\.\d+\.\d+$/);
   const parts = version.split(".").map(Number);
-  const baseline = [2, 4, 2];
+  const baseline = [3, 0, 3];
   const difference = parts.map((v, i) => v - baseline[i]).find((v) => v !== 0);
-  assert.ok(difference > 0, "candidate must be newer than 2.4.2");
+  assert.ok(difference > 0, "candidate must be newer than the latest supported upgrade baseline 3.0.3");
   const lock = json("package-lock.json");
   for (const value of [
     lock.version,

@@ -1,6 +1,12 @@
 # Changelog
 
-## 3.0.3 (unpublished)
+## 3.0.4 (unpublished)
+
+- Preserve controller HTTP timeout evidence while allowing bounded aggregation time for group health checks.
+- Include certified health checks, Windows single-instance activation and stable shortcut identity from PR #65.
+- Require installed upgrade acceptance from 3.0.1, 3.0.2 and 3.0.3 in addition to legacy baselines; reject reused release versions before building.
+
+## 3.0.3
 
 - App-owned, bounded ping refresh continues across navigation and tray use; manual checks share the same queue. Old configuration/network replies cannot replace current measurements.
 - Server cards show only fresh numeric HTTP delay, including values above the AUTO threshold; missing/failed/expired measurements leave the numeric area empty.

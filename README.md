@@ -6,11 +6,11 @@
 
 Windows 10/11 x64. В Assets выберите полный EXE-установщик: он включает приложение, сетевую службу, Mihomo, Xray и CEF; отдельно загружать ядра не нужно.
 
-Исходники в этой ветке — **3.0.3**, релиз ещё не опубликован. После проверки и отдельного разрешения файл `Atlas-Setup-3.0.3.exe` появится в Releases. Кнопка выше открывает фактически опубликованную версию. `Source code (zip)` предназначен для разработки.
+Исходники в этой ветке — **3.0.4**, релиз ещё не опубликован. После проверки и отдельного разрешения файл `Atlas-Setup-3.0.4.exe` появится в Releases. Кнопка выше открывает фактически опубликованную версию. `Source code (zip)` предназначен для разработки.
 
 **Atlas** — VPN-клиент для Windows с быстрым выбором сервера, гибкими правилами маршрутизации и понятной диагностикой соединения. Добавьте подписку, подключитесь и управляйте трафиком из одного приложения: вручную, автоматически или по правилам для конкретных сайтов и программ.
 
-Текущая версия исходников — **3.0.3**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
+Текущая версия исходников — **3.0.4**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)

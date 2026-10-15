@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Separate authorization after merge: type Publish Atlas 3.0.3"
+        description: "Separate authorization after merge: type Publish Atlas 3.0.4"
         required: true
         type: string
 concurrency:
@@ -20,7 +20,7 @@ jobs:
       - release-readiness
       - release-acceptance
       - release-backend
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.3'
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.4'
     runs-on: windows-latest
     env:
       ATLAS_BUILD_ID: ${{ github.sha }}
@@ -52,8 +52,7 @@ jobs:
             throw "Could not check whether tag v$version already exists."
           }
           if ($existingTag) {
-            "released=true" >> $env:GITHUB_OUTPUT
-            Write-Host "Version $version is already published; no duplicate Release is needed."
+            throw "Version $version already exists. Refusing to publish a different build under an existing version."
           } else {
             "released=false" >> $env:GITHUB_OUTPUT
           }
@@ -77,10 +76,10 @@ jobs:
           if-no-files-found: warn
   release-acceptance:
     needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.3'
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.4'
     uses: ./.github/workflows/connected-upgrade.yml
     secrets: inherit
   release-backend:
     needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.3'
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.4'
     uses: ./.github/workflows/pr-check.yml

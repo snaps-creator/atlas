@@ -20,8 +20,10 @@ if($Worker) {
         $env:PATH=$config.toolPath
         if($config.buildId){$env:ATLAS_BUILD_ID=$config.buildId}
         Set-Location -LiteralPath $config.repository
+        Write-Output ("Desktop setup: profile/environment ready at " + [DateTime]::UtcNow.ToString('o'))
         Add-Type -Path (Join-Path $PSScriptRoot 'installed-shell.cs')
         Add-Type -Path (Join-Path $PSScriptRoot 'installed-test-process.cs')
+        Write-Output ("Desktop setup: native helpers loaded at " + [DateTime]::UtcNow.ToString('o'))
         $principal=[Security.Principal.WindowsPrincipal]::new($identity)
         $admin=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         if($Bootstrap) {
@@ -38,8 +40,10 @@ if($Worker) {
             [AtlasInstalledShell]::VerifyShell($shellPid)
             $ownedShell=$shellPid
             if([AtlasInstalledShell]::Integrity($shellPid) -ne 8192){throw 'Fixture Explorer must remain at medium integrity'}
+            Write-Output ("Desktop setup: ordinary Explorer ready at " + [DateTime]::UtcNow.ToString('o'))
             Start-Sleep -Seconds 20
             Add-Type -Path (Join-Path $PSScriptRoot 'installed-tray-preflight.cs') -ReferencedAssemblies System,System.Windows.Forms,System.Drawing
+            Write-Output ("Desktop setup: checking real notification registration at " + [DateTime]::UtcNow.ToString('o'))
             [AtlasInstalledTrayPreflight]::Verify()
             [IO.File]::WriteAllText((Join-Path $root 'ready'),[string]$shellPid)
             Write-Output "PASS: ordinary desktop and actual fixture notification registration; shell PID=$shellPid"
@@ -110,10 +114,15 @@ try {
             [AtlasInstalledShell]::StopVerifiedShell($existing)
             $command='-NoProfile -ExecutionPolicy Bypass -File "'+$PSCommandPath+'" -Worker -Ticket "'+$ticketPath+'"'
             $bootstrap=Start-Process -FilePath "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -Credential $credential -LoadUserProfile -ArgumentList ($command+' -Bootstrap') -PassThru -WindowStyle Hidden
-            $deadline=[DateTime]::UtcNow.AddSeconds(70)
+            # A new Windows profile and its first PowerShell/.NET invocation can
+            # consume most of 70 seconds before the 20-second shell settle even
+            # begins. Bound environment setup separately from Atlas acceptance;
+            # still require the real medium-integrity notification preflight.
+            $bootstrapClock=[Diagnostics.Stopwatch]::StartNew()
+            $deadline=[DateTime]::UtcNow.AddSeconds(180)
             while(-not (Test-Path -LiteralPath (Join-Path $root 'ready')) -and -not $bootstrap.HasExited -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
             if(Test-Path -LiteralPath (Join-Path $root 'bootstrap.log')){Get-Content -LiteralPath (Join-Path $root 'bootstrap.log') | Write-Output}
-            if(-not (Test-Path -LiteralPath (Join-Path $root 'ready'))){throw 'Ordinary desktop did not pass real notification preflight'}
+            if(-not (Test-Path -LiteralPath (Join-Path $root 'ready'))){throw "Ordinary desktop did not pass real notification preflight after $([int]$bootstrapClock.Elapsed.TotalSeconds)s; bootstrap exited=$($bootstrap.HasExited)"}
             if(-not $bootstrap.WaitForExit(2100000)){throw 'Installed acceptance exceeded its bounded deadline'}
             $bootstrap.WaitForExit()
             if(Test-Path -LiteralPath (Join-Path $root 'installed-desktop.log')){Get-Content -LiteralPath (Join-Path $root 'installed-desktop.log') | Write-Output}
