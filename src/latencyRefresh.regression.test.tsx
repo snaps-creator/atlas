@@ -11,9 +11,11 @@ test("expired success is never rendered as a current ping", () => {
   expect(html).not.toContain("43<small>");
 });
 
-test("missing and failed measurements leave the numeric area empty", () => {
+test("missing values have no ping; failures have an explicit label without a cached number", () => {
   expect(latencyLabel()).toBe("");
-  for (const status of ["queued","testing","timeout","unreachable","error","stale","not_connected"] as Latency["status"][]) {
+  expect(latencyLabel({status:"timeout",delay:null,attempts:1})).toBe("Таймаут");
+  expect(latencyLabel({status:"error",delay:null,attempts:1})).toBe("Ошибка проверки");
+  for (const status of ["queued","testing","stale","not_connected"] as Latency["status"][]) {
     expect(latencyLabel({status,delay:null,attempts:1})).toBe("");
   }
 });

@@ -20,6 +20,6 @@ test("карточка сохраняет числовой пинг, включ�
 test("карточка без результата не выдумывает пинг и не показывает прочерк", () => {
   expect(card()).not.toContain("Не проверен");
   const html = card({status:"timeout",delay:null,attempts:1,lastDelay:210});
-  expect(html).not.toContain("Таймаут");
+  expect(html).toContain("Таймаут");
   expect(html).not.toMatch(/210|<small>мс|Устарело|выше порога|—|–/);
 });

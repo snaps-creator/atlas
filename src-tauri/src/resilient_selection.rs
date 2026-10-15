@@ -325,6 +325,11 @@ impl Recovery {
             if let Some(peer) = failed_endpoint(line) {
                 let matching: Vec<_> = servers.iter().filter(|n|endpoint(n) == peer).collect();
                 if !matching.is_empty() {
+                    if let Some(name)=self.observed_current.as_deref().filter(|name|matching.iter().any(|n|n["name"]==*name)) {
+                        client.connection_failed(name,if line.contains("[UDP]") {"udp"} else if line.contains("[TCP]") {"tcp"} else {"unknown"});
+                        // Request fresh evidence on the next existing monitor tick.
+                        self.last_active=None;
+                    }
                     // A single application connection error is not a failed
                     // health check, nor evidence against every node at this IP.
                     // The active monitor confirms failure before replacement.
@@ -680,7 +685,7 @@ mod tests {
                         let request=String::from_utf8_lossy(&request[..n]);
                         if request.contains("/slow/delay?") { let _=wait.lock().unwrap().recv_timeout(Duration::from_secs(30));slow_finished.store(true,Ordering::SeqCst); }
                         let body=if request.contains("/delay?") { json!({"delay":40}) } else {
-                            let health=json!({"alive":true,"extra":{crate::latency::DISPLAY_URL:{"alive":true}}});
+                            let health=json!({"alive":true,"extra":{format!("{}?atlas_probe=1",crate::latency::DISPLAY_URL):{"alive":true}}});
                             json!({"proxies":{"slow":health.clone(),"fast":health}})
                         }.to_string();
                         let _=write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
@@ -690,9 +695,9 @@ mod tests {
         });
         let mut settings=Settings::default();
         settings.subscriptions.push(crate::model::Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
-            servers:vec![json!({"name":"slow","server":"127.0.0.1","port":1}),json!({"name":"fast","server":"127.0.0.1","port":2})]});
+            servers:vec![json!({"name":"slow","type":"socks5","server":"127.0.0.1","port":1}),json!({"name":"fast","type":"socks5","server":"127.0.0.1","port":2})]});
         let (tx,rx)=mpsc::channel();
-        std::thread::spawn(move || { let _=tx.send(verify_replacement(&ApiClient::loopback_fixture(port),&settings,&HashSet::new(),None,Default::default())); });
+        std::thread::spawn(move || { let _=tx.send(verify_replacement(&ApiClient::loopback_fixture(port).with_probe_settings(&settings),&settings,&HashSet::new(),None,Default::default())); });
         let result=rx.recv_timeout(Duration::from_secs(3));
         let returned_before_slow=!observed_slow.load(Ordering::SeqCst);
         let _=release.send(()); stop.store(true,Ordering::SeqCst); server.join().unwrap();

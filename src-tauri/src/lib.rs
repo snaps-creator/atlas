@@ -14,6 +14,9 @@ pub use job::DesktopJob;
 mod lan_policy;
 mod latency;
 mod latency_refresh;
+mod probe_state;
+#[cfg(test)]
+mod probe_integration_tests;
 mod resilient_selection;
 mod model;
 mod network_guard;
@@ -1053,7 +1056,11 @@ async fn request_inner(
         if action == "latency" && !name.is_some_and(|name|snapshot.settings.servers().iter().any(|n|n["name"]==name)) {
             return Err("Сервер отсутствует в подписках".into());
         }
-        return Ok(app.state::<latency_refresh::Refresh>().view(&snapshot,name,action != "latency_state"));
+        let name=name.map(str::to_owned);
+        let refresh=app.state::<latency_refresh::Refresh>().inner().clone();
+        return tauri::async_runtime::spawn_blocking(move ||
+            Ok(refresh.view(&snapshot,name.as_deref(),action != "latency_state")))
+            .await.map_err(|e|e.to_string())?;
     }
     if action == "refresh_due" {
         subscription_refresh::wake();

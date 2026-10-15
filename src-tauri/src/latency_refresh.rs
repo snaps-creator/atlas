@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use tauri::Emitter;
 
-pub const FRESH_FOR: Duration = Duration::from_secs(30);
-const REFRESH_AFTER: Duration = Duration::from_secs(15);
+pub const FRESH_FOR: Duration = Duration::from_secs(10);
+const REFRESH_AFTER: Duration = Duration::from_secs(10);
 const RETRY_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -68,6 +68,7 @@ impl Catalog {
             self.sequence += 1;
             entry.attempt = self.sequence;
             entry.pending = true;
+            mark_pending(&mut entry.result);
             Ticket {name,identity:entry.identity.clone(),generation:self.generation,attempt:entry.attempt}
         }).collect::<Vec<_>>();
         self.batch_running = !tickets.is_empty();
@@ -81,15 +82,16 @@ impl Catalog {
         if !self.current(ticket) {return false;}
         let entry = self.entries.get_mut(&ticket.name).unwrap();
         if result["status"] == "testing" {
-            // A start is not a completed measurement. Keep a still-fresh success.
-            if entry.result.is_null() {entry.result = json!({"status":"testing","delay":null,"attempts":0});}
+            // Retry starts retain failures, never prior positive availability.
+            mark_pending(&mut entry.result);
             entry.result["lastAttemptAt"] = json!(wall_ms);
             return true;
         }
         let mut value = result.clone();
         value["lastAttemptAt"] = entry.result.get("lastAttemptAt").cloned().unwrap_or(json!(wall_ms));
-        value["measuredAt"] = json!(wall_ms);
-        value["lastSuccessAt"] = if value["status"] == "ok" {json!(wall_ms)} else {entry.result["lastSuccessAt"].clone()};
+        if value.get("measuredAt").is_none() {value["measuredAt"] = json!(wall_ms);}
+        value["pending"] = json!(false);
+        value["lastSuccessAt"] = if value["status"] == "ok" {value["measuredAt"].clone()} else {entry.result["lastSuccessAt"].clone()};
         value["lastDelay"] = if value["status"] == "ok" {value["delay"].clone()} else {entry.result["lastDelay"].clone()};
         value["attemptId"] = json!(ticket.attempt);
         value["networkGeneration"] = json!(ticket.generation);
@@ -103,7 +105,7 @@ impl Catalog {
     fn view(&self, now: Instant) -> Value {
         let results: BTreeMap<_,_> = self.entries.iter().map(|(name,e)| {
             let mut value = e.result.clone();
-            if e.completed.is_some_and(|at| now.saturating_duration_since(at) >= FRESH_FOR) {
+            if value["status"] == "ok" && e.completed.is_some_and(|at| now.saturating_duration_since(at) >= FRESH_FOR) {
                 value["status"] = json!("stale"); value["delay"] = Value::Null;
             }
             (name.clone(), value)
@@ -111,6 +113,31 @@ impl Catalog {
         json!({"results":results,"identities":self.entries.iter().map(|(n,e)|(n.clone(),e.identity.clone())).collect::<BTreeMap<_,_>>(),
             "pending":self.entries.iter().filter(|(_,e)|e.pending).map(|(n,_)|n.clone()).collect::<Vec<_>>(),"generation":self.generation})
     }
+}
+
+fn is_failure(value: &Value) -> bool {
+    matches!(value["status"].as_str(), Some("timeout"|"unreachable"|"error"))
+}
+fn mark_pending(value: &mut Value) {
+    if !is_failure(value) { *value=json!({"status":"testing","delay":null,"attempts":0,
+        "lastSuccessAt":value["lastSuccessAt"],"lastDelay":value["lastDelay"]}); }
+    value["pending"]=json!(true);
+    value["delay"]=Value::Null;
+}
+fn overlay_live(view: &mut Value, proxies: &Value) {
+    let pending=view["pending"].as_array().cloned().unwrap_or_default();
+    let identities=view["identities"].clone();
+    for (name,value) in view["results"].as_object_mut().unwrap() {
+        let record=&proxies["proxies"][name]["atlasHealth"];
+        *value=if record.is_object() && record["probeId"]==identities[name] {record.clone()} else {Value::Null};
+        if pending.iter().any(|n|n==name) {mark_pending(value);}
+    }
+    let mut selected="ATLAS";
+    let mut seen=std::collections::HashSet::new();
+    while seen.insert(selected) {
+        if let Some(next)=proxies["proxies"][selected]["now"].as_str() {selected=next;} else {break;}
+    }
+    view["selected"]=if identities.get(selected).is_some() {json!(selected)} else {Value::Null};
 }
 
 #[derive(Clone, Default)]
@@ -135,7 +162,22 @@ impl Refresh {
         self.reconcile(snapshot);
         let mut state = self.0.lock().unwrap_or_else(|e|e.into_inner());
         state.request(name,force,Instant::now());
-        state.view(Instant::now())
+        let mut view = state.view(Instant::now());
+        drop(state);
+        if snapshot.status == "Connected" {
+            // Connected UI reads the same authoritative evidence as recovery.
+            // A scheduler cache must not resurrect success after a newer probe
+            // failure, network epoch change, or controller loss.
+            match snapshot.client.api("GET", "/proxies", None) {
+                Ok(proxies) => overlay_live(&mut view, &proxies),
+                Err(error) => {
+                    for value in view["results"].as_object_mut().unwrap().values_mut() {
+                        if !is_failure(value) { *value=json!({"status":"error","delay":null,"attempts":0,"error":error}); }
+                    }
+                }
+            }
+        }
+        view
     }
     pub fn start(&self, reads: ReadState, stop: Arc<AtomicBool>, app: tauri::AppHandle) {
         self.spawn(reads,stop,Arc::new(move || {let _=app.emit("latency-updated",());}));
@@ -284,8 +326,8 @@ mod tests {
         c.accept(&jobs[0],&json!({"status":"ok","delay":42}),now,1000);c.batch_running=false;
         let next=c.take(now+REFRESH_AFTER);
         c.accept(&next[0],&json!({"status":"testing"}),now+REFRESH_AFTER,21000);
-        assert_eq!(c.view(now+REFRESH_AFTER)["results"]["a"]["measuredAt"],1000);
-        assert_eq!(c.view(now+REFRESH_AFTER)["results"]["a"]["delay"],42);
+        assert!(c.view(now+REFRESH_AFTER)["results"]["a"]["measuredAt"].is_null());
+        assert!(c.view(now+REFRESH_AFTER)["results"]["a"]["delay"].is_null());
         assert!(c.view(now+FRESH_FOR)["results"]["a"]["delay"].is_null());
         c.accept(&next[0],&json!({"status":"error","delay":null}),now+REFRESH_AFTER,22000);
         assert!(c.view(now+REFRESH_AFTER)["results"]["a"]["delay"].is_null());
@@ -310,7 +352,7 @@ mod tests {
                         let n=stream.read(&mut chunk).unwrap_or(0);if n==0 {break;}bytes.extend_from_slice(&chunk[..n]);
                     }
                     let request=String::from_utf8_lossy(&bytes);
-                    let body=if request.contains("/delay?") {count.fetch_add(1,Ordering::SeqCst);r#"{"delay":43}"#} else {r#"{"proxies":{}}"#};
+                    let body=if request.contains("/delay?") {count.fetch_add(1,Ordering::SeqCst);r#"{"delay":43}"#} else {r#"{"proxies":{"a":{"type":"Socks5","extra":{"https://cp.cloudflare.com/generate_204?atlas_probe=1":{"alive":true}}}}}"#};
                     let _=write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
                 } else {std::thread::sleep(Duration::from_millis(1));}
             }
@@ -319,14 +361,15 @@ mod tests {
         settings.subscriptions.push(crate::model::Subscription {source:crate::model::SubscriptionSource::Url,
             id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),options:Default::default(),updated_at:0,error:None,
             servers:vec![json!({"name":"a","server":"127.0.0.1","type":"socks5","port":12345})]});
+        let client=crate::core::ApiClient::loopback_fixture(port).with_probe_settings(&settings);
         let reads=ReadState::default();reads.set(ReadSnapshot {revision:0,settings,status:"Connected".into(),
-            client:crate::core::ApiClient::loopback_fixture(port),binary:Default::default(),directory:Default::default()});
+            client,binary:Default::default(),directory:Default::default()});
         let refresh=Refresh::default();let notified=Arc::new(std::sync::atomic::AtomicUsize::new(0));let events=notified.clone();
         let worker=refresh.spawn(reads.clone(),stop.clone(),Arc::new(move || {events.fetch_add(1,Ordering::SeqCst);}));
         let begin=Instant::now();let mut first=None;let mut max_age=0;
         while begin.elapsed()<Duration::from_secs(65) {
             let view=refresh.view(&reads.get().unwrap(),None,false);
-            if let Some(at)=view["results"]["a"]["measuredAt"].as_u64() {
+            if let Some(at)=view["results"]["a"]["measuredAt"].as_u64().filter(|_|view["results"]["a"]["status"]=="ok") {
                 first.get_or_insert(begin.elapsed().as_millis());
                 let wall=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                 max_age=max_age.max(wall.saturating_sub(at));
@@ -335,7 +378,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         stop.store(true,Ordering::SeqCst);worker.join().unwrap();server.join().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst),5);assert!(max_age<30000);
+        assert!(calls.load(Ordering::SeqCst)>=6);assert!(max_age<10000);
         println!("AUTO_CYCLES {}",json!({"durationMs":begin.elapsed().as_millis(),"firstMs":first,"requests":calls.load(Ordering::SeqCst),"maxAgeMs":max_age,"events":notified.load(Ordering::SeqCst)}));
+    }
+    #[test]
+    fn pending_keeps_failure_and_old_completion_cannot_renew_evidence() {
+        let now=Instant::now();let mut c=catalog(now);let first=c.take(now);
+        c.accept(&first[0],&json!({"status":"unreachable","errorKind":"timeout","delay":null,"measuredAt":100}),now,200);
+        c.batch_running=false;
+        let retry=c.take(now+RETRY_AFTER);
+        let view=c.view(now+Duration::from_secs(60));
+        assert_eq!(view["results"]["a"]["status"],"unreachable");
+        assert_eq!(view["results"]["a"]["pending"],true);
+        assert_eq!(view["results"]["a"]["measuredAt"],100);
+        assert!(!c.accept(&first[0],&json!({"status":"ok","delay":56}),now,500));
+        c.accept(&retry[0],&json!({"status":"ok","delay":81,"measuredAt":300}),now,500);
+        assert_eq!(c.view(now)["results"]["a"]["measuredAt"],300);
+        assert_eq!(c.view(now)["results"]["a"]["pending"],false);
+    }
+    #[test]
+    fn connected_view_uses_latest_core_failure_and_rejects_replaced_profile() {
+        let mut view=json!({"results":{"a":{"status":"ok","delay":56}},"identities":{"a":"id"},"pending":["a"]});
+        let proxies=json!({"proxies":{"ATLAS":{"now":"AUTO"},"AUTO":{"now":"a"},"a":{"atlasHealth":{
+            "probeId":"id","status":"unreachable","errorKind":"timeout","delay":null,"measuredAt":100}}}});
+        overlay_live(&mut view,&proxies);
+        assert_eq!(view["selected"],"a");assert_eq!(view["results"]["a"]["status"],"unreachable");
+        assert_eq!(view["results"]["a"]["pending"],true);
+        view["pending"]=json!([]);view["identities"]["a"]=json!("replaced");overlay_live(&mut view,&proxies);
+        assert!(view["results"]["a"].is_null());
     }
 }

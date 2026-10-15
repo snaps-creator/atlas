@@ -81,6 +81,7 @@ impl Prepared {
                 let password=uuid::Uuid::new_v4().simple().to_string();
                 let inbound=json!({"tag":tag,"listen":"127.0.0.1","port":port,"protocol":"socks",
                     "settings":{"auth":"password","accounts":[{"user":user,"pass":password}],"udp":true,"ip":"127.0.0.1"}});
+                let mut probe_proxy=serde_json::Value::Null;
                 if node["xraySimple"]==true {
                     let prefix=format!("{tag}/");
                     let mut outbounds=xray_config::namespace_simple(&node["xray"],&prefix)?;
@@ -95,10 +96,26 @@ impl Prepared {
                     simple_ports.push(port);
                 } else {
                     if profiles.len()>=16 {return Err("Не более 16 независимых полных Xray JSON-профилей в одной сессии".into());}
-                    profiles.push((xray_config::controlled_profile(&node["xray"],inbound)?,vec![port]));
+                    let mut config=xray_config::controlled_profile(&node["xray"],inbound)?;
+                    let mut ports=vec![port];
+                    if let Some((index,outbound))=crate::probe_state::profile_outbound(&config) {
+                        let reservation=reserve()?;
+                        let probe_port=reservation.0.local_addr().map_err(|e|e.to_string())?.port();
+                        prepared.reservations.push(reservation);ports.push(probe_port);
+                        let probe_tag=format!("{tag}-probe");
+                        config["outbounds"][index]["tag"]=json!(outbound);
+                        config["inbounds"].as_array_mut().unwrap().push(json!({"tag":probe_tag,"listen":"127.0.0.1","port":probe_port,
+                            "protocol":"socks","settings":{"auth":"password","accounts":[{"user":user,"pass":password}],"udp":false}}));
+                        if !config["routing"].is_object() {config["routing"]=json!({});}
+                        if !config["routing"]["rules"].is_array() {config["routing"]["rules"]=json!([]);}
+                        config["routing"]["rules"].as_array_mut().unwrap().insert(0,json!({"type":"field","inboundTag":[probe_tag],"outboundTag":outbound}));
+                        probe_proxy=json!({"name":crate::probe_state::target_name(node),"type":"socks5","server":"127.0.0.1","port":probe_port,
+                            "username":user,"password":password,"udp":false});
+                    }
+                    profiles.push((config,ports));
                 }
                 *node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":port,
-                    "username":user,"password":password,"udp":true,"atlas-xray-bridge":true});
+                    "username":user,"password":password,"udp":true,"atlas-xray-bridge":true,"atlas-probe":probe_proxy});
             }
         }
         if !simple_ports.is_empty() {

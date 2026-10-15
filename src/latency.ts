@@ -2,6 +2,7 @@ export type Latency = {
   status: "queued" | "testing" | "ok" | "high_latency" | "timeout" | "unreachable" | "stale" | "not_connected" | "error";
   delay: number | null;
   attempts: number;
+  pending?: boolean;
   error?: string | null;
   measuredAt?: number;
   lastSuccessAt?: number;
@@ -11,13 +12,45 @@ export type Latency = {
   attemptId?: number;
   networkGeneration?: number;
   probeId?: string;
+  startedAt?: number;
+  operationId?: number;
+  errorKind?: string;
+  scope?: string;
+  outboundTag?: string;
+  connection?: {status:string;transport:string;observedAt:number;error:string} | null;
 };
+
+export const LATENCY_FRESH_MS = 10_000;
+export function mergeLatency(old: Latency | undefined, incoming: Latency): Latency {
+  // Completion time must not promote a probe which started before a newer one.
+  const a = old?.startedAt ?? old?.measuredAt ?? 0;
+  const b = incoming.startedAt ?? incoming.measuredAt ?? 0;
+  if (old && (a > b || (a === b && (old.operationId ?? 0) > (incoming.operationId ?? 0)))) return old;
+  if (incoming.status === "testing" && old && (old.status === "timeout" || old.status === "unreachable" || old.status === "error")) {
+    return {...incoming, status:old.status, delay:null, pending:true, error:old.error,
+      errorKind:old.errorKind, measuredAt:old.measuredAt, connection:old.connection};
+  }
+  return freshLatency(incoming)!;
+}
+export function beginLatency(old: Latency | undefined, startedAt: number): Latency {
+  return mergeLatency(old, {status:"testing", delay:null, attempts:0, startedAt, pending:true});
+}
+export function expireLatencies(values: Record<string,Latency>, now=Date.now()) {
+  return Object.fromEntries(Object.entries(values).map(([name,value])=>[name,freshLatency(value,Infinity,now)!]));
+}
+export function latencyDetails(value?: Latency): string {
+  const probe = value?.error ?? (freshLatency(value)?.status === "stale"
+    ? "Измерение устарело. Доступность не подтверждена."
+    : `HTTPS 204 через ${value?.outboundTag ? `outbound ${value.outboundTag}` : "этот прокси"} до Cloudflare, включая handshake. UDP, другие сайты и пользовательские соединения не проверены.`);
+  const connection=value?.connection;
+  return connection ? `${probe} Последняя ошибка ${connection.transport.toUpperCase()}-соединения (${new Date(connection.observedAt).toLocaleTimeString()}): ${connection.error}` : probe;
+}
 
 export type LatencyProgress = { batchId: string; probeId: string; name: string; result: Latency };
 
 export function recordLatency(old: Latency | undefined, result: Latency): Latency {
   if (result.status === "testing" || result.status === "queued") {
-    return old ? {...old,lastAttemptAt:result.lastAttemptAt ?? Date.now()} : {...result,lastAttemptAt:Date.now()};
+    return {...mergeLatency(old,result),lastAttemptAt:result.lastAttemptAt ?? Date.now()};
   }
   const now=result.measuredAt ?? Date.now();
   return {...result,measuredAt:now,measurement:"http_via_node_ms",
@@ -27,8 +60,9 @@ export function recordLatency(old: Latency | undefined, result: Latency): Latenc
 
 export function applyLatencyProgress(previous: Record<string, Latency>, event: LatencyProgress,
   batchId: string, identities: Record<string,string>, names: Set<string>): Record<string, Latency> {
-  if (event.batchId !== batchId || event.probeId !== identities[event.name] || !names.has(event.name)) return previous;
-  return {...previous, [event.name]: recordLatency(previous[event.name],event.result)};
+  if (event.batchId !== batchId || event.probeId !== identities[event.name] ||
+      (event.result.probeId !== undefined && event.result.probeId !== event.probeId) || !names.has(event.name)) return previous;
+  return {...previous, [event.name]: recordLatency(previous[event.name], mergeLatency(previous[event.name], event.result))};
 }
 
 export function retainNodeLatencies(values: Record<string,Latency>, before: Record<string,string>, after: Record<string,string>) {
@@ -39,24 +73,16 @@ export function retainNodeLatencies(values: Record<string,Latency>, before: Reco
 export function failPendingLatencies(previous: Record<string, Latency>, names: string[], error: unknown): Record<string, Latency> {
   const next = {...previous};
   for (const name of names) {
-    if (next[name]?.status === "testing" || next[name]?.status === "queued") next[name] = recordLatency(next[name],{
+    if (next[name]?.pending && next[name].status !== "testing") {
+      next[name] = {...next[name], pending:false};
+    } else if (next[name]?.status === "testing" || next[name]?.status === "queued") next[name] = recordLatency(next[name],{
       status: "error", delay: null, attempts: 0, error: String(error), measuredAt: Date.now(),
     });
   }
   return next;
 }
 
-export type ProxyHealth = { alive?: boolean; history?: {time:string; delay:number}[]; extra?: Record<string, {alive?:boolean;history?:{time:string;delay:number}[]}> };
-export function historyLatency(proxy?: ProxyHealth, testUrl?: string): Latency | undefined {
-  // AUTO chooses using the history of its own URL. A successful test against
-  // another URL must not conceal a failed AUTO check.
-  if (testUrl && proxy?.extra?.[testUrl]) proxy = proxy.extra[testUrl];
-  const last = proxy?.history?.at(-1);
-  const measuredAt = last ? Date.parse(last.time) : NaN;
-  if (!last || !Number.isFinite(measuredAt) || !Number.isFinite(last.delay)) return;
-  if (proxy?.alive === false) return {status:"unreachable",delay:null,attempts:1,measuredAt};
-  if (proxy?.alive === true && last.delay >= 0) return {status:"ok",delay:last.delay,attempts:1,measuredAt};
-}
+export type ProxyHealth = { atlasHealth?: Latency | null; alive?: boolean; history?: {time:string; delay:number}[]; extra?: Record<string, {alive?:boolean;history?:{time:string;delay:number}[]}> };
 
 export async function boundedBatch<T>(request: Promise<T>, timeoutMs = 18000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -90,6 +116,9 @@ export class LatencyEpoch {
 }
 
 export function latencyLabel(value?: Latency): string {
+  value = freshLatency(value);
+  if (value?.status === "timeout" || value?.status === "unreachable") return "Таймаут";
+  if (value?.status === "error") return "Ошибка проверки";
   if (value && ["ok", "high_latency"].includes(value.status) && value.delay !== null && Number.isFinite(value.delay) && value.delay >= 0)
     return `${value.delay} мс`;
   return "";
@@ -99,8 +128,8 @@ export function freshLatency(value?: Latency, threshold = Infinity, now = Date.n
   if (!value) return;
   if (["ok","high_latency"].includes(value.status) && (value.measuredAt === undefined || !Number.isFinite(value.measuredAt) ||
       value.delay === null || !Number.isFinite(value.delay) || value.delay < 0)) return {...value,status:"stale",delay:null};
-  if (value.status !== "testing" && value.status !== "queued" && value.measuredAt !== undefined &&
-      (now - value.measuredAt >= 30_000 || value.measuredAt > now + 5000)) return {...value,status:"stale",delay:null};
+  if (["ok","high_latency"].includes(value.status) && value.measuredAt !== undefined &&
+      (now - value.measuredAt >= LATENCY_FRESH_MS || value.measuredAt > now + 1000)) return {...value,status:"stale",delay:null};
   if (value.status === "ok" && value.delay !== null && value.delay > threshold) return {...value,status:"high_latency"};
   return value;
 }
@@ -113,12 +142,13 @@ export function latencyRank(value?: Latency): number {
 // cannot overwrite a subsequent test because only the raced promise is consumed.
 export async function boundedLatency(request: Promise<Latency>, timeoutMs = 90_000): Promise<Latency> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const startedAt = Date.now();
   try {
     return await Promise.race([
       request,
       new Promise<Latency>((resolve) => {
         timer = setTimeout(() => resolve({
-          status: "error", delay: null, attempts: 0,
+          status: "error", delay: null, attempts: 0, startedAt, measuredAt:Date.now(),
           error: "Atlas не завершил проверку вовремя. Доступность сервера не определена.",
         }), timeoutMs);
       }),

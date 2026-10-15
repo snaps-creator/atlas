@@ -1,12 +1,11 @@
 import { allSubscriptions } from "./subscriptionSource";
+import { freshLatency, type Latency } from "./latency";
 import { useEffect, useRef, useState } from "react";
 import { request } from "./api";
 import type { Snapshot } from "./types";
 
 export type PoolHealth = { phase: "idle" | "checking" | "refreshing" | "healthy" | "degraded" | "all_timeout" | "local_error"; text: string; checkedAt: number };
-type Proxy = { now?: string; testUrl?: string; alive?: boolean; history?: { delay: number; time?: string }[]; extra?: Record<string, Proxy> };
-const PRIMARY = "http://cp.cloudflare.com/generate_204";
-const SECONDARY = "https://www.google.com/generate_204";
+type Proxy = { atlasHealth?: Latency | null; now?: string; testUrl?: string; alive?: boolean; history?: { delay: number; time?: string }[]; extra?: Record<string, Proxy> };
 export function observedHealth(names: string[], proxies: Record<string, Proxy>, maxAgeMs: number, now = Date.now()): PoolHealth {
   let selected = "ATLAS";
   const seen = new Set<string>();
@@ -14,15 +13,11 @@ export function observedHealth(names: string[], proxies: Record<string, Proxy>, 
     seen.add(selected); selected = proxies[selected].now!;
   }
   const state = (name: string) => {
-    const p = proxies[name];
-    const controls = [PRIMARY, SECONDARY].map(url => p?.extra?.[url]).filter(Boolean) as Proxy[];
-    const records = (controls.length ? controls : [p]).map(h => {
-      const at = Date.parse(h?.history?.at(-1)?.time ?? "");
-      return { alive: h?.alive, at, fresh: Number.isFinite(at) && now - at <= maxAgeMs && at <= now + 5000 };
-    });
-    const fresh = records.filter(r => r.fresh);
-    return { alive: fresh.some(r => r.alive === true) ? true : fresh.length === 2 && fresh.every(r => r.alive === false) ? false : undefined,
-      at: Math.max(0,...fresh.map(r => r.at)), fresh: fresh.length > 0 };
+    const evidence = freshLatency(proxies[name]?.atlasHealth ?? undefined, Infinity, now);
+    const at = evidence?.measuredAt ?? 0;
+    const fresh = at > 0 && now - at < Math.min(maxAgeMs, 10_000);
+    return {alive:evidence?.status === "ok" ? true : evidence?.status === "unreachable" ? false : undefined,
+      at, fresh: fresh && evidence?.status !== "testing" && evidence?.status !== "stale"};
   };
   const active = state(selected), working = names.filter(n => { const h=state(n); return h.fresh && h.alive === true; }).length;
   if (!active.fresh) return {phase:"idle",text:"Нет свежей проверки выбранного сервера. Доступность не подтверждена.",checkedAt:0};

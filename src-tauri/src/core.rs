@@ -13,6 +13,7 @@ mod multi_client_tests;
 #[path = "selector_state.rs"]
 pub(crate) mod selector_state;
 pub struct Core {
+    probes: std::sync::Arc<std::sync::Mutex<crate::probe_state::State>>,
     pub continue_running: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub binary: PathBuf,
     pub directory: PathBuf,
@@ -48,6 +49,7 @@ impl Core {
     }
     pub fn new(binary: PathBuf, directory: PathBuf) -> Self {
         Self {
+            probes: Default::default(),
             continue_running: None,
             binary,
             directory,
@@ -185,6 +187,9 @@ impl Core {
     }
     pub fn client(&self) -> ApiClient {
         ApiClient {
+            #[cfg(test)]
+            fixture_tunnel_endpoint: None,
+            probes: self.probes.clone(),
             secret: self.secret.clone(),
             controller_port: self.ports[1],
             mixed_port: self.ports[0],
@@ -227,6 +232,7 @@ impl Core {
         if self.running() {
             return Ok(());
         }
+        self.probes.lock().unwrap().configure(s);
         if s.mode == "tun" && !self.elevated {
             crate::broker::validate_settings(s)?;
             self.validate(s)?;
@@ -478,6 +484,7 @@ impl Core {
         let selectors = self.api("GET", "/proxies", None)?;
         let selected = selectors["proxies"]["ATLAS"]["now"]
             .as_str().ok_or("Не удалось сохранить выбранный сервер для отката")?.to_owned();
+        let previous_probe_nodes = self.probes.lock().unwrap().suspend();
         let result = self
             .api("PUT", "/configs?force=true", Some(json!({"path":path})))
             .and_then(|_| self.restore_nested_selectors(&selectors))
@@ -489,7 +496,10 @@ impl Core {
                 } else {
                     Ok(config)
                 }
-            }).and_then(|_| verify(self, false)).and_then(|_| self.commit(&path));
+            }).and_then(|_| {
+                self.probes.lock().unwrap().configure(s);
+                verify(self, false)
+            }).and_then(|_| self.commit(&path));
         if let Err(e) = result {
             self.client().event(json!({"kind":"configuration_transition","operationId":operation_id,
                 "previousState":"Candidate","nextState":"RollingBack","error":e}));
@@ -508,6 +518,7 @@ impl Core {
                     || self.api("GET", "/proxies/ATLAS", None)?["now"] != selected {
                     return Err("Ядро не подтвердило восстановление конфигурации и сервера".to_owned());
                 }
+                self.probes.lock().unwrap().restore(previous_probe_nodes.clone());
                 verify(self, true)?;
                 std::fs::write(self.directory.join("current.yaml"), &previous).map_err(|e| e.to_string())?;
                 std::fs::write(&old, &previous).map_err(|e| e.to_string())?;
@@ -550,6 +561,7 @@ impl Core {
         Ok(())
     }
     pub fn stop(&mut self) -> Result<(), String> {
+        self.probes.lock().unwrap().invalidate();
         self.stop_with_tun_observer(crate::network_guard::tun_identity)
     }
 
@@ -1194,6 +1206,9 @@ mod integration_tests {
 
 #[derive(Clone)]
 pub struct ApiClient {
+    #[cfg(test)]
+    fixture_tunnel_endpoint: Option<String>,
+    probes: std::sync::Arc<std::sync::Mutex<crate::probe_state::State>>,
     controller_port: u16,
     mixed_port: u16,
     secret: String,
@@ -1223,13 +1238,19 @@ impl ApiClient {
     }
     #[cfg(test)]
     pub(crate) fn loopback_fixture(port: u16) -> Self {
-        Self { controller_port:port, mixed_port:port, secret:String::new(), broker:None, logs:Default::default() }
+        Self { fixture_tunnel_endpoint:None, controller_port:port, mixed_port:port, secret:String::new(), broker:None, logs:Default::default(), probes:Default::default() }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_fixture_tunnel_endpoint(mut self, endpoint: &str) -> Self {
+        self.fixture_tunnel_endpoint=Some(endpoint.to_owned());self
     }
     pub(crate) fn recovery_command(&self, op: &str, value: Value) -> Result<Value,String> {
         self.broker.as_ref().ok_or("Нет службы восстановления")?.call(op,value)
     }
     /// Real HTTP traffic through the live mixed listener, distinct from node RTT.
     pub(crate) fn tunnel_responds(&self, timeout: u64) -> bool {
+        #[cfg(test)]
+        if let Some(endpoint)=&self.fixture_tunnel_endpoint {return self.tunnel_responds_at(endpoint,timeout);}
         self.tunnel_responds_at(crate::latency::DISPLAY_URL, timeout)
             || self.tunnel_responds_at(crate::latency::SECONDARY_URL, timeout)
     }
@@ -1238,6 +1259,17 @@ impl ApiClient {
         let Ok(client) = reqwest::blocking::Client::builder().no_proxy().proxy(proxy)
             .timeout(Duration::from_millis(timeout.clamp(1500,10000))).redirect(reqwest::redirect::Policy::none()).build() else { return false; };
         client.get(endpoint).send().is_ok_and(|r|r.status().as_u16()==204)
+    }
+    #[cfg(test)]
+    pub(crate) fn with_probe_settings(self, settings: &Settings) -> Self {
+        self.probes.lock().unwrap().configure(settings); self
+    }
+    pub(crate) fn invalidate_probe_results(&self) {
+        let mut probes=self.probes.lock().unwrap();
+        let nodes=probes.suspend(); probes.restore(nodes);
+    }
+    pub(crate) fn connection_failed(&self,name:&str,transport:&str) {
+        self.probes.lock().unwrap().connection_failed(name,transport);
     }
     pub(crate) fn event(&self, value: Value) {
         // Service-side events travel through the existing authenticated logs pipe.
@@ -1308,6 +1340,52 @@ impl ApiClient {
             }
             return broker.call("api", json!({"method":method,"path":path}));
         }
+        if method == "GET" && path.contains("atlas_probe=1") {
+            return self.certified_probe(path, cancelled);
+        }
+        let mut value = self.controller_api(method, path, body, cancelled)?;
+        if method == "GET" && path == "/proxies" {
+            self.probes.lock().unwrap().annotate(&mut value);
+        }
+        Ok(value)
+    }
+    fn certified_probe(&self, path: &str, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Value,String> {
+        let url=url::Url::parse(&format!("http://localhost{path}")).map_err(|e|e.to_string())?;
+        let encoded=url.path().strip_prefix("/proxies/").and_then(|s|s.strip_suffix("/delay")).ok_or("ROUTE: нужен конкретный сервер")?;
+        let name=url::form_urlencoded::parse(format!("name={encoded}").as_bytes()).next().unwrap().1.into_owned();
+        let params: std::collections::HashMap<_,_>=url.query_pairs().into_owned().collect();
+        let endpoint=params.get("url").ok_or("Не указан URL проверки")?;
+        let timeout=params.get("timeout").and_then(|s|s.parse::<u64>().ok()).unwrap_or(10000).min(10000);
+        let ticket=self.probes.lock().unwrap().begin(&name,endpoint)?;
+        let gate=ticket.gate.clone();
+        let _serial=gate.lock().map_err(|_|"Проверка сервера недоступна")?;
+        if !self.probes.lock().unwrap().current(&ticket) {return Err("CANCELLED: проверка устарела".into());}
+        let result=(|| {
+            crate::probe_state::validate_route(&ticket.node)?;
+            let target=crate::probe_state::target_name(&ticket.node);
+            // A fixed private URL key isolates our status check from legacy
+            // diagnostics without growing Mihomo's per-URL map on every cycle.
+            let mut control=url::Url::parse(endpoint).map_err(|e|e.to_string())?;
+            control.query_pairs_mut().append_pair("atlas_probe","1");
+            let control=control.to_string();
+            let path=format!("/proxies/{}/delay?timeout={timeout}&expected=204&url={}",
+                crate::latency::encode_name(&target),crate::latency::encode_name(&control));
+            let response=self.controller_api("GET",&path,None,cancelled)?;
+            let proxies=self.controller_api("GET","/proxies",None,cancelled)?;
+            let proxy=&proxies["proxies"][&target];
+            if proxy.get("now").is_some() || matches!(proxy["type"].as_str(),Some("Direct"|"Reject"|"Selector"|"URLTest"|"Fallback")) {
+                return Err("ROUTE: ядро использовало группу или DIRECT".into());
+            }
+            if proxy["extra"][&control]["alive"] != true {
+                return Err("RESPONSE: Контрольный URL не подтвердил ожидаемый HTTP 204".into());
+            }
+            response["delay"].as_u64().ok_or("Ядро не вернуло задержку".into())
+        })();
+        let record=self.probes.lock().unwrap().finish(&ticket,&result)?;
+        Ok(json!({"delay":record["delay"],"atlasProbe":record}))
+    }
+    fn controller_api(&self, method: &str, path: &str, body: Option<Value>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Value, String> {
         // Service-owned scheduled probes and desktop-submitted probes share
         // one bounded admission gate before the network timeout starts.
         let _permit = if path.contains("/delay?") {

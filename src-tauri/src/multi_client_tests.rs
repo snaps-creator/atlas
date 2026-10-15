@@ -686,7 +686,9 @@ fn recovery_accepts_one_working_control_and_encoded_names_on_real_vless() {
     assert_eq!(verified["candidate"],name,"{verified}");assert_eq!(verified["results"][0]["checks"].as_array().unwrap().len(),4);
     reject.store(true,Ordering::SeqCst);
     let display = crate::latency::display_probe(&client.client(), name, &second, 10000);
-    assert_eq!(display.status,"ok","Clash-compatible latency records a received HTTP response: {display:?}");
+    assert_eq!(display.status,"error","Unexpected HTTP status must never certify latency: {display:?}");
+    assert_eq!(display.delay,None);
+    assert_eq!(display.evidence["errorKind"],"unexpected_response");
     assert_eq!(display.attempts,1);
     let missing = crate::latency::display_probe(&client.client(), "missing + /", &first, 10000);
     assert_eq!(missing.status,"error","404 is a controller error, not a server timeout");

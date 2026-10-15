@@ -30,12 +30,15 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         return Err("Интервал проверки серверов должен быть от 30 секунд до 60 минут".into());
     }
     let mut proxies = s.servers();
+    let probe_proxies:Vec<_>=proxies.iter().filter_map(|n|n.get("atlas-probe").filter(|v|v.is_object()).cloned()).collect();
     let xray=proxies.iter().any(|n|n["type"]=="xray" || n["atlas-xray-bridge"]==true);
     // Shape-only validation. Runtime preparation supplies actual authenticated
     // loopback endpoints before any generated configuration can be launched.
     for node in &mut proxies {
         if node["type"]=="xray" {*node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":9});}
-        if let Some(object)=node.as_object_mut() {object.remove("atlas-xray-bridge");object.remove("extraParams");object.remove("atlas");}
+        if let Some(fields) = node.as_object_mut() {
+            for key in ["atlas-xray-bridge", "extraParams", "atlas", "atlas-probe"] { fields.remove(key); }
+        }
     }
     if proxies.is_empty() {
         return Err("Сначала добавьте подписку с серверами".into());
@@ -74,6 +77,11 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     selection.extend(names.clone());
     let mut seen = std::collections::HashSet::new();
     selection.retain(|n| seen.insert(n.clone()));
+    // Probe-only adapters never enter selectors or the subscription list.
+    for probe in probe_proxies {
+        if names.iter().any(|name|probe["name"]==*name) {return Err("Имя сервера конфликтует с внутренней проверкой".into());}
+        proxies.push(probe);
+    }
     let mut doc: Value = json!({"mixed-port":17890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"warning","ipv6":s.dns.ipv6,"find-process-mode":"always","external-controller":"127.0.0.1:19090","secret":secret,"profile":{"store-selected":false},"tun":{"enable":s.mode=="tun","stack":"mixed","auto-route":true,"strict-route":true,"auto-detect-interface":true,"dns-hijack":["any:53"]},"dns":{"enable":true,"listen":"127.0.0.1:11053","ipv6":s.dns.ipv6,"enhanced-mode":if s.dns.fake_ip{"fake-ip"}else{"redir-host"},"fake-ip-range":"198.18.0.1/16","nameserver":s.dns.servers,"default-nameserver":["1.1.1.1","8.8.8.8"]},"proxies":proxies,"proxy-groups":[{"name":"ATLAS","type":"select","proxies":selection},{"name":"AUTO","type":"select","proxies":names},{"name":"FAILOVER","type":"select","proxies":names}],"rules":rules::compile(s)?});
     doc["mode"] = json!(s.routing_mode);
     // Global mode would bypass PROCESS-PATH rules and feed Xray's outbound
@@ -93,8 +101,9 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         .as_array_mut()
         .unwrap()
         .push(json!({"name":"GLOBAL","type":"select","proxies":["ATLAS"]}));
-    // Match Clash Verge's warm-connection URL latency measurement.
-    doc["unified-delay"] = json!(true);
+    // Measure handshake plus the validated request. A failed second request
+    // must not be hidden by Mihomo's warm-connection measurement fallback.
+    doc["unified-delay"] = json!(false);
     if s.mode == "tun" {
         for node in doc["proxies"].as_array_mut().unwrap() {
             if ["ss", "vmess", "vless", "trojan", "socks5"]
@@ -190,7 +199,7 @@ mod tests {
         let y: Value = serde_yaml::from_str(&generate(&s, "secret").unwrap()).unwrap();
         assert_eq!(y["rules"][0], "MATCH,DIRECT");
         assert_eq!(y["allow-lan"], false);
-        assert_eq!(y["unified-delay"], true);
+        assert_eq!(y["unified-delay"], false);
         assert_eq!(y["proxy-groups"][1]["type"], "select");
         assert_eq!(y["proxy-groups"][2]["type"], "select");
         assert!(y["proxy-groups"][1]["url"].is_null());

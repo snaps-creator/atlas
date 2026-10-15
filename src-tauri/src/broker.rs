@@ -472,6 +472,7 @@ fn allowed_api(method: &str, path: &str) -> bool {
                 "url" => crate::latency::ENDPOINTS.contains(&v.as_ref()),
                 "timeout" => v.parse::<u64>().is_ok_and(|n| n <= 10000),
                 "expected" => v == "204" || v == "200",
+                  "atlas_probe" => v == "1",
                 _ => false,
             });
         }
@@ -583,6 +584,7 @@ impl HealthState {
             *network_epoch = network_epoch.wrapping_add(1);
             queries.invalidate();
             recovery.network_changed();
+            core.client().invalidate_probe_results();
             self.path_due = true;
             self.path_retry_at = None;
             // Retry exhaustion on the office uplink says nothing about home.
@@ -1360,6 +1362,10 @@ mod tests {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let client=crate::core::ApiClient::loopback_fixture(listener.local_addr().unwrap().port());
+        let mut settings=Settings::default();
+        settings.subscriptions.push(crate::model::Subscription {source:Default::default(),options:Default::default(),id:"test".into(),name:"test".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:vec![json!({"name":"fixture","type":"socks5","server":"127.0.0.1","port":1234})]});
+        let client=client.with_probe_settings(&settings);
         let worker=thread::spawn(move || {
             let mut delays=0;
             for _ in 0..4 {
@@ -1388,7 +1394,7 @@ mod tests {
                         if delays==1 { (504,json!({"message":"timeout"})) } else { (200,json!({"delay":30})) }
                     } else {
                         assert!(request.starts_with("GET /proxies "));
-                        (200,json!({"proxies":{"fixture":{"extra":{crate::latency::SECONDARY_URL:{"alive":true}}}}}))
+                        (200,json!({"proxies":{"fixture":{"extra":{format!("{}?atlas_probe=1",crate::latency::SECONDARY_URL):{"alive":true}}}}}))
                     };
                 let body=body.to_string();
                 write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
@@ -1465,10 +1471,10 @@ mod tests {
                                 return json!({"id":id,"done":false});
                             }
                             let reply = if path.contains("/node-1/") {
-                                json!({"id":id,"done":true,"error":"Mihomo API: HTTP 504"})
+                                json!({"id":id,"done":true,"value":{"atlasProbe":{"status":"unreachable","delay":null,"attempts":1,"error":"Mihomo API: HTTP 504","errorKind":"timeout"}}})
                             } else if path.contains("/node-2/") {
                                 json!({"id":id,"done":true,"error":"Mihomo API: HTTP 401"})
-                            } else { json!({"id":id,"done":true,"value":{"delay":210}}) };
+                            } else { json!({"id":id,"done":true,"value":{"atlasProbe":{"status":"ok","delay":210,"attempts":1}}}) };
                             jobs.remove(id);
                             completed += 1;
                             reply
@@ -1492,7 +1498,7 @@ mod tests {
         assert_eq!(results.as_object().unwrap().len(), count);
         assert_eq!(published.into_inner().unwrap().len(), count);
         assert_eq!(results["node-0"]["delay"], 210);
-        assert_eq!(results["node-1"]["status"], "timeout");
+        assert_eq!(results["node-1"]["status"], "unreachable");
         assert_eq!(results["node-2"]["status"], "error");
     }
 
@@ -1617,7 +1623,7 @@ mod tests {
         ));
         assert!(allowed_api(
             "GET",
-            "/proxies/x/delay?timeout=8000&url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
+            "/proxies/x/delay?timeout=8000&expected=204&atlas_probe=1&url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
         ));
     }
     #[test]
