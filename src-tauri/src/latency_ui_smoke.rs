@@ -15,7 +15,7 @@ pub fn reply(action:&str) -> Result<Value,String> {
                 "startup":{"launchWithWindows":false,"autoConnect":false,"startInTray":false,"delaySeconds":0,"restoreConnection":false},"autoTestIntervalSeconds":300,"autoSearchPingMs":150,"theme":"light","wasConnected":false,"favorites":[]}})),
         "latency_state"=>{
             let success=|delay,at|json!({"status":"ok","delay":delay,"attempts":1,"measuredAt":at});
-            let failure=json!({"status":"timeout","delay":null,"attempts":1,"measuredAt":now});
+            let failure=json!({"status":"timeout","delay":null,"attempts":1,"measuredAt":now,"pending":age>=5 && age<8});
             let results=if age<2 {json!({})} else {json!({
                 "Low":if age<5 {success(43,now)} else if age<8 {failure.clone()} else {success(55,now)},
                 "High":if age<5 {success(1501,now)} else if age<8 || age>=11 {success(321,now)} else {success(321,now-31000)},

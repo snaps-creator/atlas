@@ -14,6 +14,9 @@ pub use job::DesktopJob;
 mod lan_policy;
 mod latency;
 mod latency_refresh;
+mod probe_state;
+#[cfg(test)]
+mod probe_integration_tests;
 mod resilient_selection;
 mod model;
 mod network_guard;
@@ -44,6 +47,10 @@ mod interface_evidence;
 mod lan_diagnostics;
 mod lan_discovery;
 mod windows;
+pub mod shell_identity;
+pub mod window_activation;
+#[cfg(debug_assertions)]
+pub mod lifecycle_smoke;
 mod update_lock;
 mod update_process;
 mod update_health;
@@ -1053,7 +1060,11 @@ async fn request_inner(
         if action == "latency" && !name.is_some_and(|name|snapshot.settings.servers().iter().any(|n|n["name"]==name)) {
             return Err("Сервер отсутствует в подписках".into());
         }
-        return Ok(app.state::<latency_refresh::Refresh>().view(&snapshot,name,action != "latency_state"));
+        let name=name.map(str::to_owned);
+        let refresh=app.state::<latency_refresh::Refresh>().inner().clone();
+        return tauri::async_runtime::spawn_blocking(move ||
+            Ok(refresh.view(&snapshot,name.as_deref(),action != "latency_state")))
+            .await.map_err(|e|e.to_string())?;
     }
     if action == "refresh_due" {
         subscription_refresh::wake();
@@ -1143,23 +1154,29 @@ fn persist_window_hidden(app:&tauri::AppHandle,hidden:bool) {
         }
     });
 }
-fn show_main(app:&tauri::AppHandle) {
-    if let Some(w)=app.get_webview_window("main") {
-        let _=w.show();let _=w.unminimize();let _=w.set_focus();
-        if app.try_state::<Shared>().is_some() {persist_window_hidden(app,false);}
-    }
-}
+fn show_main(app:&tauri::AppHandle) { window_activation::request(app); }
 pub fn run() {
+    let mut admission = match window_activation::admit(shell_identity::APP_ID) {
+        Ok(Some(gate)) => Some(gate),
+        Ok(None) => return,
+        Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+    };
+    if let Err(error) = shell_identity::process() { eprintln!("Atlas identity: {error}"); }
     tauri::Builder::default()
+        .manage(window_activation::Activation::default())
         .manage(ManualRestart(std::sync::atomic::AtomicBool::new(false)))
         .runtime(tauri_runtime_cef::Cef::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
             if startup_coordinator::LaunchReason::from_args(&args)==startup_coordinator::LaunchReason::ManualLaunch {
-                show_main(app);
+                window_activation::request(app);
             }
         }))
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let executable = std::env::current_exe()?;
+                shell_identity::window(window.hwnd()?.0 as isize, &executable).map_err(std::io::Error::other)?;
+            }
             let _startup_update_guard=if update_health::challenge().is_none(){Some(update_lock::UpdateLock::admit_session().map_err(std::io::Error::other)?)}else{None};
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -1305,7 +1322,7 @@ pub fn run() {
                     let id = event.id.as_ref();
                     if update_health::pending() && !matches!(id,"show"|"quit") {return;}
                     if id == "show" {
-                        show_main(app);
+                        window_activation::request(app);
                     } else {
                         let handle = app.clone();
                         let action = id.to_owned();
@@ -1567,7 +1584,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![request,update_health_ready])
         .build(tauri::generate_context!())
         .expect("Atlas failed to initialize")
-        .run(|handle,event| {
+        .run(move |handle,event| {
+            if matches!(event, tauri::RunEvent::Ready) {
+                window_activation::ready(handle);
+                drop(admission.take());
+            }
             if matches!(event,tauri::RunEvent::Exit) && handle.state::<ManualRestart>().0.load(std::sync::atomic::Ordering::SeqCst) {
                 let mut environment=handle.env();
                 environment.args_os=startup_coordinator::manual_restart_args(environment.args_os[0].clone());

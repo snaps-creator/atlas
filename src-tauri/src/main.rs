@@ -31,6 +31,21 @@ fn main() {
 }
 
 fn run_application() {
+    if let Some(directory) = std::env::var_os("ATLAS_LIFECYCLE_SMOKE_DIR") {
+        #[cfg(debug_assertions)]
+        {
+            if let Err(error)=atlas::lifecycle_smoke::run(std::path::Path::new(&directory)) {
+                eprintln!("{error}");std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _=directory;
+            eprintln!("Lifecycle fixture requires a debug build; refusing production setup");
+            std::process::exit(2);
+        }
+    }
     // A short, side-effect-free UI launch for process-name acceptance. It
     // deliberately bypasses Atlas setup, stored preferences, service and VPN.
     if std::env::var_os("ATLAS_UI_PROCESS_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1")) {

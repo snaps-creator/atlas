@@ -49,7 +49,7 @@ import { LanDiagnostics } from "./LanDiagnostics";
 import { usePoolRecovery } from "./usePoolRecovery";
 import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
-import { latencyRank, type Latency } from "./latency";
+import { freshLatency, latencyRank, type Latency } from "./latency";
 import { matchingLatencies, startLatencyPolling, type LatencySnapshot } from "./latencyPolling";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
@@ -387,6 +387,7 @@ function App() {
     if (!native) return;
     const polling = startLatencyPolling(()=>request<LatencySnapshot>("latency_state"), snapshot=>{
       setLatencies(matchingLatencies(snapshot,identitiesRef.current));
+      setActiveServer(snapshot.selected ?? null);
       setTestingAll(snapshot.pending.length > 0);
     });
     latencyWake.current=()=>void polling.wake();
@@ -427,7 +428,7 @@ function App() {
           atlas<span className="brand-dot">.</span>
         </a>
         <div className="workspace">
-          <ActiveServer connected={connected} onChange={setActiveServer} poolHealth={poolHealth} />
+          <ActiveServer connected={connected} name={activeServer} latency={activeServer ? freshLatency(latencies[activeServer]) : undefined} poolHealth={poolHealth} />
           <button
             role="switch"
             aria-label="Подключение VPN"
@@ -873,7 +874,7 @@ function App() {
                             selected={isServerSelected(s, n) || (connected && activeServer === n.name)}
                             favorite={isFavorite(s?.favorites ?? [], n)}
                             latency={latencies[n.name]} disabled={busy}
-                            testing={latencies[n.name]?.status === "testing"}
+                            testing={latencies[n.name]?.pending === true || latencies[n.name]?.status === "testing"}
                             onSelect={() => s && run(() => act("select", serverSelectionPayload(n)))}
                             onTest={() => run(() => test(n.name))}
                             onFavorite={() => s && run(() => act("favorite", { nodeId: n.nodeId, enabled: !isFavorite(s.favorites, n) }))}

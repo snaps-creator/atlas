@@ -3,7 +3,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-pub const DISPLAY_URL: &str = "http://cp.cloudflare.com/generate_204";
+// TLS authenticates the control endpoint; a plaintext interception page must
+// not be able to manufacture a successful primary availability measurement.
+pub const DISPLAY_URL: &str = "https://cp.cloudflare.com/generate_204";
 pub const DISPLAY_TIMEOUT_MS: u64 = 10000;
 pub(crate) const DISPLAY_WORKERS: usize = 64;
 /// Opaque identity of actual node parameters, independent of UI preferences,
@@ -81,10 +83,10 @@ fn display_batch_stream_cancel(client: ApiClient, names: &[String], endpoint: &s
     }
     // The caller already queues the full list. Publish only starts and results.
     Ok(discover_batch(&names, timeout, &|name, deadline| {
-        if !current(name) {return TestResult {status:"cancelled".into(),delay:None,attempts:0,error:None};}
+        if !current(name) {return TestResult {evidence:Default::default(),status:"cancelled".into(),delay:None,attempts:0,error:None};}
         progress(name,&json!({"status":"testing","delay":null,"attempts":0}));
         display_probe(&client, name, endpoint, deadline)
-    }, progress))
+    }, &|name,result| {if current(name) {progress(name,result);}}))
 }
 
 // One IPC request submits a set of independent tests; one poll collects their
@@ -101,8 +103,9 @@ fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String],
     let mut pending = std::collections::BTreeMap::<String,(String,Instant)>::new();
     let mut results = serde_json::Map::new();
     let mut publish = |name: &str, reply: Result<Value,String>| {
-        let result = display_attempt(endpoint, |_| reply.clone().and_then(|value|
-            value["delay"].as_u64().ok_or("Ядро не вернуло задержку".into())));
+        if !current(name) {return;}
+        let result = reply.and_then(certified_record).and_then(|record|serde_json::from_value(record).map_err(|e|e.to_string()))
+            .unwrap_or_else(|error|failed_result(error,crate::probe_state::now_ms()));
         let mut value = serde_json::to_value(result).unwrap();
         stamp_result(&mut value);
         progress(name, &value);
@@ -151,7 +154,7 @@ fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String],
 }
 
 fn stamp_result(value: &mut Value) {
-    value["measuredAt"]=json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+    if value.get("measuredAt").is_none() {value["measuredAt"]=json!(crate::probe_state::now_ms());}
     value["measurement"]=json!("http_via_node_ms");
 }
 
@@ -263,22 +266,22 @@ pub(crate) fn verified_probe_with(client: &ApiClient, name: &str, endpoint: &str
 }
 fn verified_probe_inner(client: &ApiClient, name: &str, endpoint: &str, timeout: u64,
     cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Value,String> {
-    let path = format!("/proxies/{}/delay?timeout={timeout}&expected={}&url={}",encode_name(name),expected_status(endpoint),encode_name(endpoint));
-    let result = client.api_cancellable("GET",&path,None,cancelled)?;
-    let proxies = client.api_cancellable("GET","/proxies",None,cancelled)?;
-    // Mihomo returns a delay even when expected HTTP status did not match.
-    // Its per-URL alive flag includes that status check; the delay alone does not.
-    let health = &proxies["proxies"][name]["extra"][endpoint];
-    if health["alive"] != true {
-        client.event(json!({"kind":"control_status_rejected","at":crate::model::now(),"name":name,
-            "controlHost":url::Url::parse(endpoint).ok().and_then(|u|u.host_str().map(str::to_owned)),
-            "expectedStatus":expected_status(endpoint),"returnedDelay":result["delay"],"health":health}));
-        return Err(format!("Контрольный URL не подтвердил ожидаемый HTTP {} (per-URL health); returnedDelay={}, perUrlAlive={}",
-            expected_status(endpoint),result["delay"],health["alive"]));
-    }
-    if result["delay"].as_u64().is_none() { return Err("Ядро не вернуло задержку".into()); }
-    Ok(json!({"delay":result["delay"],"expectedStatusMatched":true,"health":health}))
+    let result = certified_record(client.api_cancellable("GET", &display_path(name,endpoint,timeout), None, cancelled)?)?;
+    if result["status"] != "ok" { return Err(result["error"].as_str().unwrap_or("Проверка не завершена").to_owned()); }
+    Ok(json!({"delay":result["delay"],"expectedStatusMatched":true,"atlasProbe":result}))
 }
+fn certified_result(client: &ApiClient, name: &str, endpoint: &str, timeout: u64) -> Result<Value,String> {
+    certified_record(client.api("GET", &display_path(name,endpoint,timeout), None)?)
+}
+fn display_path(name: &str, endpoint: &str, timeout: u64) -> String {
+    format!("/proxies/{}/delay?timeout={timeout}&expected=204&atlas_probe=1&url={}", encode_name(name), encode_name(endpoint))
+}
+fn certified_record(response: Value) -> Result<Value,String> {
+    let record = &response["atlasProbe"];
+    if !record.is_object() { return Err("Ядро не вернуло подтверждённый результат проверки".into()); }
+    Ok(record.clone())
+}
+
 pub(crate) fn verified_batch(client: ApiClient, names: &[String], endpoint: &str) -> serde_json::Map<String,Value> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(serde_json::Map::new());
@@ -296,8 +299,10 @@ pub(crate) fn verified_batch(client: ApiClient, names: &[String], endpoint: &str
     });
     results.into_inner().unwrap()
 }
-#[derive(Serialize, Debug)]
+#[derive(Serialize, serde::Deserialize, Debug)]
 pub struct TestResult {
+    #[serde(flatten)]
+    pub evidence: serde_json::Map<String,Value>,
     pub status: String,
     pub delay: Option<u64>,
     pub attempts: u8,
@@ -312,18 +317,22 @@ pub fn test(client: ApiClient, name: &str) -> TestResult {
     result
 }
 pub(crate) fn display_probe(client: &ApiClient, name: &str, endpoint: &str, timeout: u64) -> TestResult {
-    display_attempt(endpoint, |url| {
-        let path = display_path(name, url, timeout);
-        client.api("GET", &path, None).and_then(|v|v["delay"].as_u64().ok_or("Ядро не вернуло задержку".into()))
-    })
+    let started=crate::probe_state::now_ms();
+    match certified_result(client, name, endpoint, timeout) {
+        Ok(record) => serde_json::from_value(record).unwrap_or_else(|e| failed_result(e.to_string(),started)),
+        Err(error) => failed_result(error,started),
+    }
 }
-fn display_path(name: &str, endpoint: &str, timeout: u64) -> String {
-    format!("/proxies/{}/delay?timeout={timeout}&url={}", encode_name(name), encode_name(endpoint))
+fn failed_result(error:String,started:u64)->TestResult {
+    TestResult {evidence:json!({"startedAt":started,"measuredAt":crate::probe_state::now_ms()}).as_object().unwrap().clone(),
+        status:"error".into(),delay:None,attempts:0,error:Some(error)}
 }
+
+#[cfg(test)]
 fn display_attempt(endpoint: &str, mut probe: impl FnMut(&str)->Result<u64,String>) -> TestResult {
     match probe(endpoint) {
-        Ok(delay) => TestResult {status:"ok".into(),delay:Some(delay),attempts:1,error:None},
-        Err(error) => TestResult {status:if error=="Mihomo API: HTTP 504" {"timeout"} else if error=="Mihomo API: HTTP 503" {"unreachable"} else {"error"}.into(),
+        Ok(delay) => TestResult { evidence: Default::default(), status:"ok".into(),delay:Some(delay),attempts:1,error:None},
+        Err(error) => TestResult { evidence: Default::default(), status:if error == "Mihomo API: HTTP 504" {"unreachable"} else {"error"}.into(),
             delay:None,attempts:1,error:Some(error)},
     }
 }
@@ -475,11 +484,11 @@ mod tests {
             checked.fetch_add(1,Ordering::SeqCst);
             assert_eq!(timeout, DISPLAY_TIMEOUT_MS);
             if name == "17" || (name == "16" && timeout == DISPLAY_TIMEOUT_MS) {
-                TestResult { status:"ok".into(),delay:Some(80),attempts:1,error:None }
+                TestResult { evidence: Default::default(), status:"ok".into(),delay:Some(80),attempts:1,error:None }
             } else if name == "15" {
-                TestResult { status:"error".into(),delay:None,attempts:1,error:Some("local IPC".into()) }
+                TestResult { evidence: Default::default(), status:"error".into(),delay:None,attempts:1,error:Some("local IPC".into()) }
             } else {
-                TestResult { status:"timeout".into(),delay:None,attempts:1,error:Some("Mihomo API: HTTP 504".into()) }
+                TestResult { evidence: Default::default(), status:"unreachable".into(),delay:None,attempts:1,error:Some("Mihomo API: HTTP 504".into()) }
             }
         }, &|name,value|published.lock().unwrap().push((name.to_owned(),value.clone())));
         let published = published.into_inner().unwrap();
@@ -488,7 +497,7 @@ mod tests {
         assert_eq!(result["17"]["attempts"],1);
         assert_eq!(result["16"]["status"],"ok");
         assert_eq!(result["16"]["attempts"],1);
-        assert_eq!(result["0"]["status"],"timeout");
+        assert_eq!(result["0"]["status"],"unreachable");
         assert_eq!(result["0"]["attempts"],1);
         assert_eq!(result["15"]["status"],"error");
         assert_eq!(result["15"]["attempts"],1);
@@ -499,10 +508,13 @@ mod tests {
         use std::{io::{Read,Write}, net::TcpListener, time::{Duration,Instant}};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let client = ApiClient::loopback_fixture(listener.local_addr().unwrap().port());
+        let mut settings=Settings::default();
+        settings.subscriptions.push(crate::model::Subscription {source:Default::default(),options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:vec![json!({"name":"slow","type":"socks5","server":"127.0.0.1","port":12345}),json!({"name":"fast","type":"socks5","server":"127.0.0.1","port":12346})]});
+        let client = ApiClient::loopback_fixture(listener.local_addr().unwrap().port()).with_probe_settings(&settings);
         let server = std::thread::spawn(move || {
             std::thread::scope(|scope| {
-                for _ in 0..3 {
+                for _ in 0..5 {
                     let deadline = Instant::now()+Duration::from_secs(5);
                     let (mut stream,_) = loop {
                         match listener.accept() {
@@ -513,11 +525,14 @@ mod tests {
                         }
                     };
                     scope.spawn(move || {
+                        stream.set_nonblocking(false).unwrap();
                         stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                         let mut bytes = [0;4096];
                         let len = stream.read(&mut bytes).unwrap();
                         let request = String::from_utf8_lossy(&bytes[..len]);
-                        let body = if request.starts_with("GET /proxies HTTP/") { "{\"proxies\":{}}" }
+                        let health=json!({"type":"Socks5","extra":{format!("{}?atlas_probe=1",DISPLAY_URL):{"alive":true}}});
+                        let proxies=json!({"proxies":{"slow":health,"fast":health}}).to_string();
+                        let body = if request.starts_with("GET /proxies HTTP/") { proxies.as_str() }
                         else {
                             assert!(request.contains("timeout=10000"));
                             if request.contains("/slow/") { std::thread::sleep(Duration::from_millis(1700)); }
@@ -554,7 +569,7 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
-                TestResult {status:"ok".into(),delay:Some(56),attempts:1,error:None}
+                TestResult { evidence: Default::default(), status:"ok".into(),delay:Some(56),attempts:1,error:None}
             }, &|name,_| {let _=tx.send(name.to_owned());})
         });
         let first=rx.recv_timeout(Duration::from_secs(2));
@@ -587,12 +602,15 @@ mod tests {
                 connection.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             }
         });
+        let relay=crate::probe_integration_tests::Socks::new();
         let mut settings = Settings::default();
         settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
-            servers:vec![json!({"name":"fixture","type":"direct"})]});
+            servers:vec![relay.node("fixture")]});
         let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
         with_offline_core(settings,binary,std::env::temp_dir(),|client| {
-            assert_eq!(display_probe(&client,"fixture",&endpoint,3000).status,"unreachable");
+            let failed = display_probe(&client,"fixture",&endpoint,3000);
+            assert_eq!(failed.status,"error");
+            assert_eq!(failed.evidence["errorKind"],"proxy_or_transport");
             client.api("PUT","/proxies/ATLAS",Some(json!({"name":"fixture"})))?;
             assert_eq!(display_probe(&client,"fixture",&endpoint,3000).status,"ok");
             Ok(())
@@ -621,7 +639,7 @@ mod tests {
     #[test]
     fn display_uses_one_cloudflare_request_and_keeps_local_errors_distinct() {
         let r=display_attempt(DISPLAY_URL, |_| Err("Mihomo API: HTTP 504".into()));
-        assert_eq!(r.status,"timeout"); assert_eq!(r.attempts,1);
+        assert_eq!(r.status,"unreachable"); assert_eq!(r.attempts,1);
         let r=display_attempt(DISPLAY_URL, |_| Err("Очередь проверок серверов заполнена".into()));
         assert_eq!(r.status,"error"); assert_eq!(r.attempts,1);
     }
@@ -663,12 +681,13 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
             connection.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
+        let relay=crate::probe_integration_tests::Socks::new();
         let mut settings=Settings::default();
         settings.mode="tun".into();
         settings.selected="fixture".into();
         settings.subscriptions.push(Subscription { source: Default::default(), options: Default::default(),id:"fixture".into(),name:"fixture".into(),
             masked_url:String::new(),updated_at:0,error:None,
-            servers:vec![json!({"name":"fixture","type":"direct"})]});
+            servers:vec![relay.node("fixture")]});
         let binary=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
         let parent=std::env::temp_dir().join(format!("atlas-probe-recovery-{}",uuid::Uuid::new_v4()));
         std::fs::create_dir(&parent).unwrap();

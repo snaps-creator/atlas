@@ -12,10 +12,10 @@
     if (cards.length !== 3) return;
     const values=Object.fromEntries(cards.map(card=>[card.querySelector('strong').textContent,card.querySelector('.server-card-delay').textContent.replace(/\s/g,'')]));
     const delays=cards.map(card=>card.querySelector('.server-card-delay').textContent);
-    if (delays.some(v=>/Устарело|выше порога|—|–|Ожидание|Проверяется|Неизвестно|Нет данных|Не проверен|Таймаут/.test(v))) {
+    if (delays.some(v=>/Устарело|выше порога|—|–|Ожидание|Проверяется|Неизвестно|Нет данных|Не проверен/.test(v))) {
       clearInterval(timer);throw Error('Forbidden ping label rendered');
     }
-    const expected=[{'Low':'43мс','High':'1501мс','Failed':''},{'Low':'','High':'321мс','Failed':''},{'Low':'55мс','High':'','Failed':''},{'Low':'55мс','High':'321мс','Failed':''}];
+    const expected=[{'Low':'43мс','High':'1501мс','Failed':'Таймаут'},{'Low':'Таймаут','High':'321мс','Failed':'Таймаут'},{'Low':'55мс','High':'','Failed':'Таймаут'},{'Low':'55мс','High':'321мс','Failed':'Таймаут'}];
     if (Object.entries(expected[phase]).every(([name,value])=>values[name]===value)) {
       seen.push(values);phase++;
       if (phase===expected.length) {

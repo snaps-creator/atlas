@@ -42,7 +42,7 @@ impl Fixture {
                 } else if request.starts_with("GET /proxies/AUTO ") {
                     json!({"now":*selection.lock().unwrap()})
                 } else {
-                    let health=json!({"alive":true,"extra":{crate::latency::DISPLAY_URL:{"alive":true}}});
+                    let health=json!({"alive":true,"extra":{format!("{}?atlas_probe=1",crate::latency::DISPLAY_URL):{"alive":true}}});
                     json!({"proxies":{"AUTO":{"now":*selection.lock().unwrap()},"slow":health.clone(),"fast":health}})
                 };
                 let body=if code==204 {String::new()} else {body.to_string()};
@@ -51,7 +51,10 @@ impl Fixture {
         });
         let mut settings=Settings::default();settings.auto_optimize=true;
         settings.subscriptions.push(crate::model::Subscription {source:Default::default(),options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
-            servers:vec![json!({"name":"slow","server":"127.0.0.1","port":1}),json!({"name":"fast","server":"127.0.0.1","port":2})]});
+            servers:vec![json!({"name":"slow","type":"socks5","server":"127.0.0.1","port":1}),json!({"name":"fast","type":"socks5","server":"127.0.0.1","port":2})]});
+        // Scenario fixture models real mixed-listener HTTP traffic locally;
+        // TLS authentication itself is covered by probe_integration_tests.
+        let client=client.with_probe_settings(&settings).with_fixture_tunnel_endpoint("http://fixture.invalid/generate_204");
         Self{client,settings,selected,traffic,stop,worker:Some(worker)}
     }
     fn drive(&self, recovery: &mut Recovery, phase: Phase) {
@@ -95,6 +98,10 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
     assert!(!f.client.logs().unwrap().iter().any(|line|line.contains("RecoverySucceeded")));
     let id=r.operation.clone().unwrap();
     let ticket=r.refresh_ticket.clone().unwrap();
+    // Establish the failed active path before backoff. A first new timeout
+    // after a previously healthy sample is intentionally allowed to preempt it;
+    // this assertion covers repeated evidence of the same failure.
+    sample(&mut r,&f,None,false);
     assert!(r.refresh_finished(&ticket,false,&f.client));
     f.drive(&mut r,Phase::WaitingRetry);
     assert_eq!(f.client.logs().unwrap().iter().filter(|line|line.contains("SubscriptionRefreshStarted")).count(),1);

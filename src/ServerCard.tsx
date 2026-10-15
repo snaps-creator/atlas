@@ -1,7 +1,7 @@
 import { serverDisplayName } from "./serverDisplayName";
 import { Globe2, Star } from "lucide-react";
 import type { Server } from "./types";
-import { freshLatency, latencyLabel, type Latency } from "./latency";
+import { freshLatency, latencyDetails, latencyLabel, type Latency } from "./latency";
 import "./servers.css";
 
 export function ServerCard({ server, selected, favorite, latency, disabled, testing, onSelect, onFavorite, onTest }: {
@@ -11,7 +11,7 @@ export function ServerCard({ server, selected, favorite, latency, disabled, test
   const label = serverDisplayName(server.name);
   latency = freshLatency(latency?.probeId !== undefined && latency.probeId !== server.probeId ? undefined : latency);
   const delay = latency && ["ok", "high_latency"].includes(latency.status) ? latency.delay : null;
-  const tone = latency?.status === "unreachable" ? "timeout" : delay == null ? "unknown" : delay < 250 ? "fast" : delay < 400 ? "medium" : "slow";
+  const tone = (latency?.status === "unreachable" || latency?.status === "timeout") ? "timeout" : delay == null ? "unknown" : delay < 250 ? "fast" : delay < 400 ? "medium" : "slow";
   return <article className={`server-card ${selected ? "is-selected" : ""}`}>
     <button className="server-card-select" onClick={onSelect} disabled={disabled} aria-pressed={selected} title={label}>
       <span className="server-card-title">
@@ -22,7 +22,7 @@ export function ServerCard({ server, selected, favorite, latency, disabled, test
     </button>
     <button className={`server-card-delay ${tone}`} disabled={testing} onClick={onTest}
       aria-label={`Проверить задержку: ${label}. ${latencyLabel(latency)}`}
-      title={latency?.error ?? "HTTP-задержка через этот узел до Cloudflare. Не скорость скачивания."}>
+      title={latencyDetails(latency)}>
       {delay == null ? latencyLabel(latency) : <>{delay}<small>мс</small></>}
     </button>
     <button className="server-card-favorite" onClick={onFavorite} disabled={disabled} aria-pressed={favorite} aria-label={`${favorite ? "Убрать из избранного" : "В избранное"}: ${label}`}>
