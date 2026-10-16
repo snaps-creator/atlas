@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { resolveServer, selectedLatency } from "./ActiveServer";
+import { LATENCY_FRESH_MS } from "./latency";
 
 test("active view uses certified evidence, ignores unrelated history and expires it", () => {
   const measuredAt=Date.now();
@@ -9,7 +10,7 @@ test("active view uses certified evidence, ignores unrelated history and expires
     .toMatchObject({status:"unreachable",delay:null});
   expect(selectedLatency({ATLAS:{now:"Paris"},Paris:{alive:true,history}})).toBeUndefined();
   expect(selectedLatency({ATLAS:{now:"Paris"},Paris:{atlasHealth:{...atlasHealth,status:"ok",delay:56}}})).toMatchObject({status:"ok",delay:56});
-  expect(selectedLatency({ATLAS:{now:"Paris"},Paris:{atlasHealth:{...atlasHealth,status:"ok",delay:56,measuredAt:measuredAt-10_001}}})).toMatchObject({status:"stale",delay:null});
+  expect(selectedLatency({ATLAS:{now:"Paris"},Paris:{atlasHealth:{...atlasHealth,status:"ok",delay:56,measuredAt:measuredAt-LATENCY_FRESH_MS-1}}})).toMatchObject({status:"stale",delay:null});
   expect(selectedLatency({ATLAS:{now:"ATLAS"}})).toBeUndefined();
 });
 

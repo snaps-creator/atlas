@@ -19,17 +19,21 @@ test("installers and split offline payloads cannot be distributed through the Gi
       !/filter=lfs/.test(fs.readFileSync(".gitattributes", "utf8")),
   );
 });
-test("publication requires separate manual authorization on main and preserves signed verification", () => {
+test("main pushes publish automatically; manual retries and signed verification remain gated", () => {
   const workflow = YAML.parse(
     fs.readFileSync(".github/workflows/release.yml", "utf8"),
   );
   assert(workflow.on.workflow_dispatch);
-  assert(!workflow.on.push);
+  assert.deepEqual(workflow.on.push.branches, ["main"]);
+  assert(!workflow.on.pull_request && !workflow.on.pull_request_target);
   assert.match(workflow.jobs["publish-windows"].if, /refs\/heads\/main/);
   assert.match(workflow.jobs["publish-windows"].if, /inputs.confirmation/);
+  assert.match(workflow.jobs["publish-windows"].if, /github.event_name == 'push'/);
+  assert.match(workflow.jobs["publish-windows"].if, /needs.release-readiness.outputs.version/);
   const script = fs.readFileSync("scripts/publish-verified-update.ps1", "utf8");
   for (const requirement of [
     "workflow_dispatch",
+    "'push'",
     "ATLAS_RELEASE_AUTHORIZATION",
     "ATLAS_BUILD_ID",
     "GITHUB_SHA",

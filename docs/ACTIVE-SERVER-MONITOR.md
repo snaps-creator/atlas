@@ -19,14 +19,25 @@ events record an operation ID, lock wait and execution time without payloads.
 Regression checks hold a command lock while 32 snapshot readers complete, and
 exercise 20 simultaneous frontend reads followed by failure and a fresh retry.
 
-AUTO and FAILOVER monitor the selected node once per second, with one pending
+The application-owned catalogue checks every node initially and then once per
+minute, regardless of the active node's health or the visible page. Failed
+nodes use the same cadence. Manual requests and network/profile changes can
+trigger earlier checks; batches do not overlap. Successful measurements expire
+after 90 seconds; failures replace prior successes immediately. The service
+does not run an additional continuous reserve/quarantine sweep.
+
+AUTO and FAILOVER monitor the selected node every ten seconds, with one pending
 probe at a time. With autoOptimize enabled, the first sample above
 autoSearchPingMs (default 150 ms) starts a bounded six-worker candidate search.
 Confirmed failure starts recovery regardless of autoOptimize. A candidate must meet that
 threshold. Only the service changes the selector; a fresh node check, real
-HTTP traffic through its live proxy listener and selector confirmation precede
+HTTPS traffic through its live proxy listener and selector confirmation precede
 success. Manual selections invalidate automatic work. A failed switch restores
 the former selector without claiming that the former path is healthy.
+
+Display and search use the restored 3.0.3 HTTP warm-request metric, with the
+existing HTTP 204 and concrete-outbound checks. Authenticated HTTPS route and
+tunnel verification remains separate. See [the measured comparison](ping-3.0.3-comparison.md).
 
 An exhausted search requests one bounded subscription refresh and rescan.
 Failed incidents use exponential backoff, a refresh cooldown, and a single

@@ -1,5 +1,5 @@
 param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller,
-    [ValidateSet('2.4.2','3.0.1','3.0.2','3.0.3')][string]$BaselineVersion='2.4.2')
+    [ValidateSet('2.4.2','3.0.1','3.0.2','3.0.3','3.0.4')][string]$BaselineVersion='2.4.2')
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.

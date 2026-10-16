@@ -74,9 +74,10 @@ function Invoke-RestMethod {
 try { & ./scripts/publish-verified-update.ps1 -Installer './artifacts/${input.asset}' }
 finally { ConvertTo-Json -InputObject $global:atlasTestApiCalls -Depth 5 | Set-Content calls.json -Encoding utf8NoBOM }
 `);
-  for (const fail of ['0','1']) {
+  const authorized={GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_STEP_SUMMARY:''};
+  for (const event of ['push','workflow_dispatch']) for (const fail of ['0','1']) {
     const published=spawnSync('pwsh',['-NoProfile','-File','run.ps1'],{cwd:root,encoding:'utf8',env:{...process.env,
-      GITHUB_REPOSITORY:input.repository,ATLAS_BUILD_ID:input.build,GITHUB_SHA:input.build,GITHUB_ACTIONS:'true',GITHUB_REF:'refs/heads/main',GITHUB_TOKEN:'test-only-token',GITHUB_EVENT_NAME:'workflow_dispatch',ATLAS_RELEASE_AUTHORIZATION:'Publish Atlas 3.0.4',GITHUB_STEP_SUMMARY:'',ATLAS_TEST_FAIL_UPLOAD:fail}});
+      ...authorized,GITHUB_EVENT_NAME:event,ATLAS_RELEASE_AUTHORIZATION:event==='push'?'':`Publish Atlas ${input.version}`,ATLAS_TEST_FAIL_UPLOAD:fail}});
     assert.ifError(published.error);
     assert(fs.existsSync(path.join(root,'calls.json')),published.stdout+'\n'+published.stderr);
     const calls=JSON.parse(fs.readFileSync(path.join(root,'calls.json')));
@@ -93,5 +94,20 @@ finally { ConvertTo-Json -InputObject $global:atlasTestApiCalls -Depth 5 | Set-C
       assert.equal(calls.at(-1).method,'Patch');
       assert.equal(JSON.parse(calls.at(-1).body).draft,false);
     }
+  }
+  for (const denied of [
+    {GITHUB_EVENT_NAME:'pull_request'},
+    {GITHUB_EVENT_NAME:'pull_request_target'},
+    {GITHUB_REF:'refs/heads/feature'},
+    {GITHUB_SHA:'b'.repeat(40)},
+    {GITHUB_ACTIONS:'false'},
+    {GITHUB_TOKEN:''},
+    {GITHUB_EVENT_NAME:'workflow_dispatch',ATLAS_RELEASE_AUTHORIZATION:''},
+    {GITHUB_EVENT_NAME:'workflow_dispatch',ATLAS_RELEASE_AUTHORIZATION:'Publish Atlas 0.0.0'},
+  ]) {
+    const result=spawnSync('pwsh',['-NoProfile','-File','run.ps1'],{cwd:root,encoding:'utf8',env:{...process.env,
+      ...authorized,GITHUB_EVENT_NAME:'push',ATLAS_RELEASE_AUTHORIZATION:'',ATLAS_TEST_FAIL_UPLOAD:'0',...denied}});
+    assert.ifError(result.error);assert.notEqual(result.status,0,result.stdout+'\n'+result.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root,'calls.json'))),[], 'unauthorized context must make no release API calls');
   }
 });

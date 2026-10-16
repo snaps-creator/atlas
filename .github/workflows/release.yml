@@ -1,9 +1,11 @@
 name: Publish Atlas update
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Separate authorization after merge: type Publish Atlas 3.0.4"
+        description: "Manual retry: type Publish Atlas followed by the current version"
         required: true
         type: string
 concurrency:
@@ -20,7 +22,7 @@ jobs:
       - release-readiness
       - release-acceptance
       - release-backend
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.4'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.confirmation == format('Publish Atlas {0}', needs.release-readiness.outputs.version))
     runs-on: windows-latest
     env:
       ATLAS_BUILD_ID: ${{ github.sha }}
@@ -76,10 +78,10 @@ jobs:
           if-no-files-found: warn
   release-acceptance:
     needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.4'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.confirmation == format('Publish Atlas {0}', needs.release-readiness.outputs.version))
     uses: ./.github/workflows/connected-upgrade.yml
     secrets: inherit
   release-backend:
     needs: release-readiness
-    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'Publish Atlas 3.0.4'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.confirmation == format('Publish Atlas {0}', needs.release-readiness.outputs.version))
     uses: ./.github/workflows/pr-check.yml

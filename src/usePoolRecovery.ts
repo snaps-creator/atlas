@@ -1,5 +1,5 @@
 import { allSubscriptions } from "./subscriptionSource";
-import { freshLatency, type Latency } from "./latency";
+import { freshLatency, LATENCY_FRESH_MS, type Latency } from "./latency";
 import { useEffect, useRef, useState } from "react";
 import { request } from "./api";
 import type { Snapshot } from "./types";
@@ -15,7 +15,7 @@ export function observedHealth(names: string[], proxies: Record<string, Proxy>, 
   const state = (name: string) => {
     const evidence = freshLatency(proxies[name]?.atlasHealth ?? undefined, Infinity, now);
     const at = evidence?.measuredAt ?? 0;
-    const fresh = at > 0 && now - at < Math.min(maxAgeMs, 10_000);
+    const fresh = at > 0 && now - at < Math.min(maxAgeMs, LATENCY_FRESH_MS);
     return {alive:evidence?.status === "ok" ? true : evidence?.status === "unreachable" ? false : undefined,
       at, fresh: fresh && evidence?.status !== "testing" && evidence?.status !== "stale"};
   };
@@ -48,7 +48,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
       if (!valid(revision)) return;
       const settings = latest.current!.settings;
       publish(observedHealth(allSubscriptions(settings).flatMap(sub => sub.servers.map(server => server.name)), proxies,
-        30000));
+        LATENCY_FRESH_MS));
     };
     const check = async (force = false) => {
       if (!alive || pending || (!force && Date.now() < nextCheck)) return;
@@ -62,7 +62,7 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
         if (!force) {
           const { proxies } = await request<{ proxies: Record<string, Proxy> }>("proxies");
           if (!valid(revision)) return;
-          publish(observedHealth(names, proxies, 30000));
+          publish(observedHealth(names, proxies, LATENCY_FRESH_MS));
           nextCheck = Date.now() + 5000;
           return;
         }
@@ -72,8 +72,8 @@ export function usePoolRecovery(snapshot: Snapshot | null) {
         const verdict = poolVerdict(result.delays, result.secondaryHealthy);
         if (verdict.phase === "healthy") await publishSelected(revision);
         else publish(verdict);
-        // Only an explicit diagnostic request scans the full pool. The service
-        // owns periodic checks and selection while the UI remains passive.
+        // This hook scans only on explicit requests. The native minute refresh
+        // owns periodic pool checks; the service owns active recovery.
         nextCheck = Date.now() + 5000;
       } catch (error) {
         if (valid(revision)) publish({ phase: "local_error", text: `Проверка или восстановление Atlas не завершены: ${String(error)}. Недоступность всех VPN-серверов не подтверждена.`, checkedAt: Date.now() });

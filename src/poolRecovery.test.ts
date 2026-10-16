@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { exhausted, poolVerdict, observedHealth } from "./usePoolRecovery";
+import { LATENCY_FRESH_MS } from "./latency";
+it("retains minute-cadence pool evidence but never extends its expiry", () => {
+  const measuredAt=1000;
+  const proxies={ATLAS:{now:"node"},node:{atlasHealth:{status:"ok" as const,delay:56,attempts:1,measuredAt}}};
+  expect(observedHealth(["node"],proxies,LATENCY_FRESH_MS,measuredAt+60_000).phase).toBe("healthy");
+  expect(observedHealth(["node"],proxies,LATENCY_FRESH_MS,measuredAt+LATENCY_FRESH_MS).phase).toBe("idle");
+});
 it("never conceals a failed selected node behind healthy alternatives or stale history", () => {
   const now = Date.now();
   const p = {ATLAS:{now:"bad"},bad:{atlasHealth:{status:"unreachable" as const,delay:null,attempts:1,measuredAt:now},alive:false,history:[{delay:0,time:new Date(now).toISOString()}]},good:{atlasHealth:{status:"ok" as const,delay:30,attempts:1,measuredAt:now},alive:true,history:[{delay:30,time:new Date(now).toISOString()}]}};

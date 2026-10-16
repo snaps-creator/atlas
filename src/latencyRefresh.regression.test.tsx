@@ -1,12 +1,12 @@
 import { expect, test } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ServerCard } from "./ServerCard";
-import { latencyLabel, type Latency } from "./latency";
+import { latencyLabel, LATENCY_FRESH_MS, type Latency } from "./latency";
 
 test("expired success is never rendered as a current ping", () => {
   const html = renderToStaticMarkup(<ServerCard server={{name:"fixture",type:"vless",probeId:"a"}}
     selected={false} favorite={false} disabled={false} testing={false}
-    latency={{status:"ok",delay:43,attempts:1,measuredAt:Date.now()-31000}}
+    latency={{status:"ok",delay:43,attempts:1,measuredAt:Date.now()-LATENCY_FRESH_MS-1}}
     onSelect={()=>{}} onFavorite={()=>{}} onTest={()=>{}} />);
   expect(html).not.toContain("43<small>");
 });

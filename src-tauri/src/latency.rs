@@ -3,9 +3,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-// TLS authenticates the control endpoint; a plaintext interception page must
-// not be able to manufacture a successful primary availability measurement.
-pub const DISPLAY_URL: &str = "https://cp.cloudflare.com/generate_204";
+// Match the 3.0.3 HTTP warm-request latency, not connection setup time.
+pub const DISPLAY_URL: &str = "http://cp.cloudflare.com/generate_204";
+pub const TUNNEL_URL: &str = "https://cp.cloudflare.com/generate_204";
 pub const DISPLAY_TIMEOUT_MS: u64 = 10000;
 pub(crate) const DISPLAY_WORKERS: usize = 64;
 /// Opaque identity of actual node parameters, independent of UI preferences,
@@ -247,7 +247,8 @@ pub(crate) fn batch_at(client: ApiClient, names: &[String], endpoint: &str) -> R
 }
 // Independent provider; Android/Chromium also use this HTTP 204 control.
 pub const SECONDARY_URL: &str = "https://www.google.com/generate_204";
-pub const ENDPOINTS: [&str; 2] = [DISPLAY_URL, SECONDARY_URL];
+// Route admission remains authenticated; display latency is a separate metric.
+pub const ENDPOINTS: [&str; 2] = [TUNNEL_URL, SECONDARY_URL];
 pub fn expected_status(_endpoint: &str) -> u16 {
     204
 }

@@ -2,6 +2,10 @@ name: Verify updater release readiness
 
 on:
   workflow_call:
+    outputs:
+      version:
+        description: Validated candidate version
+        value: ${{ jobs.readiness.outputs.version }}
 
 permissions:
   contents: read
@@ -9,6 +13,8 @@ permissions:
 jobs:
   readiness:
     name: Release readiness
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,3 +25,6 @@ jobs:
         run: node scripts/check-updater-readiness.cjs
       - name: Reject an already published candidate version before building
         run: node scripts/check-release-version.cjs
+      - name: Export validated candidate version
+        id: candidate
+        run: node -e "require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'version=' + require('./package.json').version + '\n')"

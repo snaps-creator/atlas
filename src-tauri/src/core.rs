@@ -1284,7 +1284,7 @@ impl ApiClient {
     pub(crate) fn tunnel_responds(&self, timeout: u64) -> bool {
         #[cfg(test)]
         if let Some(endpoint)=&self.fixture_tunnel_endpoint {return self.tunnel_responds_at(endpoint,timeout);}
-        self.tunnel_responds_at(crate::latency::DISPLAY_URL, timeout)
+        self.tunnel_responds_at(crate::latency::TUNNEL_URL, timeout)
             || self.tunnel_responds_at(crate::latency::SECONDARY_URL, timeout)
     }
     pub(crate) fn tunnel_responds_at(&self, endpoint: &str, timeout: u64) -> bool {

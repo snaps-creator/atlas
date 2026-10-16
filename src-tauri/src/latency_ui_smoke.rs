@@ -1,11 +1,15 @@
 //! Fixtures for the existing isolated packaged-UI acceptance mode only.
 use serde_json::{json,Value};
+const STALE_AGE_MS: u64 = 91_000;
 pub fn enabled() -> bool { std::env::var("ATLAS_LATENCY_UI_SMOKE").as_deref()==Ok("1") }
 pub fn reply(action:&str) -> Result<Value,String> {
     if !enabled() {return Err("Isolated UI smoke has no application session".into());}
     static START:std::sync::OnceLock<std::time::Instant>=std::sync::OnceLock::new();
     let age=START.get_or_init(std::time::Instant::now).elapsed().as_secs();
     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    reply_at(action, age, now)
+}
+fn reply_at(action: &str, age: u64, now: u64) -> Result<Value,String> {
     let ids=json!({"Low":"low-v1","High":"high-v1","Failed":"failed-v1"});
     match action {
         "snapshot"=>Ok(json!({"revision":1,"status":"Disconnected","running":false,"guardActive":false,"error":null,"duration":0,"logs":[],
@@ -18,11 +22,37 @@ pub fn reply(action:&str) -> Result<Value,String> {
             let failure=json!({"status":"timeout","delay":null,"attempts":1,"measuredAt":now,"pending":age>=5 && age<8});
             let results=if age<2 {json!({})} else {json!({
                 "Low":if age<5 {success(43,now)} else if age<8 {failure.clone()} else {success(55,now)},
-                "High":if age<5 {success(1501,now)} else if age<8 || age>=11 {success(321,now)} else {success(321,now-31000)},
+                "High":if age<5 {success(1501,now)} else if age<8 || age>=11 {success(321,now)} else {success(321,now.saturating_sub(STALE_AGE_MS))},
                 "Failed":failure})};
             Ok(json!({"results":results,"identities":ids,"pending":[],"generation":1}))
         },
         "refresh_due"|"diagnostic_event"=>Ok(Value::Null),
         _=>Err("Action is not part of the read-only latency fixture".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_fixture_covers_success_failure_expiry_and_recovery() {
+        let now = 1_000_000;
+        assert_eq!(reply_at("latency_state", 0, now).unwrap()["results"], json!({}));
+        for (age, low_status, low_delay, high_delay, high_at, pending) in [
+            (2, "ok", Some(43), 1501, now, false),
+            (5, "timeout", None, 321, now, true),
+            (8, "ok", Some(55), 321, now - STALE_AGE_MS, false),
+            (11, "ok", Some(55), 321, now, false),
+        ] {
+            let state = reply_at("latency_state", age, now).unwrap();
+            let results = &state["results"];
+            assert_eq!(results["Low"]["status"], low_status);
+            assert_eq!(results["Low"]["delay"], json!(low_delay));
+            assert_eq!(results["High"]["delay"], high_delay);
+            assert_eq!(results["High"]["measuredAt"], high_at);
+            assert_eq!(results["Failed"]["status"], "timeout");
+            assert_eq!(results["Failed"]["pending"], pending);
+        }
     }
 }

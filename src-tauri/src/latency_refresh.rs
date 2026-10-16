@@ -5,9 +5,9 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use tauri::Emitter;
 
-pub const FRESH_FOR: Duration = Duration::from_secs(10);
-const REFRESH_AFTER: Duration = Duration::from_secs(10);
-const RETRY_AFTER: Duration = Duration::from_secs(10);
+pub const FRESH_FOR: Duration = Duration::from_millis(crate::probe_state::FRESH_MS);
+const REFRESH_AFTER: Duration = Duration::from_secs(60);
+const RETRY_AFTER: Duration = REFRESH_AFTER;
 
 #[derive(Clone)]
 struct Entry {
@@ -289,6 +289,23 @@ mod tests {
         let mut c=Catalog::default();c.reconcile(BTreeMap::from([("a".into(),"config-a".into()),("b".into(),"config-b".into())]),"network".into(),now);c
     }
     #[test]
+    fn every_node_retries_once_a_minute_regardless_of_previous_health() {
+        let now=Instant::now();let mut c=Catalog::default();
+        c.reconcile((0..126).map(|i|(format!("node-{i}"),format!("identity-{i}"))).collect(),"network".into(),now);
+        let jobs=c.take(now);assert_eq!(jobs.len(),126);
+        for (i,job) in jobs.iter().enumerate() {
+            let result=if i%2==0 {json!({"status":"ok","delay":43})} else {json!({"status":"timeout","delay":null})};
+            c.accept(job,&result,now,1000);
+        }
+        c.batch_running=false;
+        for second in 1..60 {
+            c.request(None,false,now+Duration::from_secs(second));
+            assert!(c.take(now+Duration::from_secs(second)).is_empty());
+        }
+        assert_eq!(c.take(now+Duration::from_secs(60)).len(),126);
+        assert!(c.take(now+Duration::from_secs(120)).is_empty());
+    }
+    #[test]
     fn startup_navigation_manual_and_many_ticks_share_one_queue() {
         let now=Instant::now();let mut c=catalog(now);let work=c.take(now);assert_eq!(work.len(),2);
         for i in 0..1000 {c.request(None,true,now+Duration::from_secs(i));assert!(c.take(now+Duration::from_secs(i)).is_empty());}
@@ -352,7 +369,7 @@ mod tests {
                         let n=stream.read(&mut chunk).unwrap_or(0);if n==0 {break;}bytes.extend_from_slice(&chunk[..n]);
                     }
                     let request=String::from_utf8_lossy(&bytes);
-                    let body=if request.contains("/delay?") {count.fetch_add(1,Ordering::SeqCst);r#"{"delay":43}"#} else {r#"{"proxies":{"a":{"type":"Socks5","extra":{"https://cp.cloudflare.com/generate_204?atlas_probe=1":{"alive":true}}}}}"#};
+                    let body=if request.contains("/delay?") {count.fetch_add(1,Ordering::SeqCst);json!({"delay":43})} else {json!({"proxies":{"a":{"type":"Socks5","extra":{format!("{}?atlas_probe=1",latency::DISPLAY_URL):{"alive":true}}}}})}.to_string();
                     let _=write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
                 } else {std::thread::sleep(Duration::from_millis(1));}
             }
@@ -378,7 +395,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         stop.store(true,Ordering::SeqCst);worker.join().unwrap();server.join().unwrap();
-        assert!(calls.load(Ordering::SeqCst)>=6);assert!(max_age<10000);
+        assert_eq!(calls.load(Ordering::SeqCst),2);
+        assert!(max_age>=59000 && max_age<FRESH_FOR.as_millis() as u64);
         println!("AUTO_CYCLES {}",json!({"durationMs":begin.elapsed().as_millis(),"firstMs":first,"requests":calls.load(Ordering::SeqCst),"maxAgeMs":max_age,"events":notified.load(Ordering::SeqCst)}));
     }
     #[test]

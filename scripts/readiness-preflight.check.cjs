@@ -43,7 +43,15 @@ test('PR and release use one readiness gate; publication cannot start before it 
   assert.equal(release.jobs['release-backend'].uses,'./.github/workflows/pr-check.yml');
   assert(!release.jobs['publish-windows'].if?.includes('always()'), 'must not bypass failed dependency');
   assert.match(release.jobs['publish-windows'].if, /inputs.confirmation/);
-  assert(release.on.workflow_dispatch && !release.on.push);
+  assert(release.on.workflow_dispatch);
+  assert.deepEqual(release.on.push.branches,['main']);
+  for (const name of ['publish-windows','release-acceptance','release-backend']) {
+    assert.match(release.jobs[name].if,/refs\/heads\/main/);
+    assert.match(release.jobs[name].if,/github.event_name == 'push'/);
+    assert.match(release.jobs[name].if,/needs.release-readiness.outputs.version/);
+  }
+  assert.equal(gate.on.workflow_call.outputs.version.value,'${{ jobs.readiness.outputs.version }}');
+  assert.equal(gate.jobs.readiness.outputs.version,'${{ steps.candidate.outputs.version }}');
   assert(Object.hasOwn(gate.on, 'workflow_call'));
   const check = gate.jobs.readiness.steps.find(step => step.run === 'node scripts/check-updater-readiness.cjs');
   assert(check);
@@ -69,8 +77,8 @@ test('both pipelines run publication preparation after installed acceptance on t
   const baselineMatrix=connected.jobs['connected-upgrade'].strategy.matrix.baseline;
   assert.equal(connected.on.workflow_call.inputs.include_unpublished_243.default,false);
   assert.equal(connected.on.workflow_dispatch.inputs.include_unpublished_243.default,false);
-  assert(baselineMatrix.includes(`'["legacy","2.4.2","3.0.1","3.0.2","3.0.3"]'`), 'deployed baselines including current 3.0.x must remain mandatory by default');
-  assert(baselineMatrix.includes(`inputs.include_unpublished_243 && '["legacy","2.4.2","2.4.3","3.0.1","3.0.2","3.0.3"]'`));
+  assert(baselineMatrix.includes(`'["legacy","2.4.2","3.0.1","3.0.2","3.0.3","3.0.4"]'`), 'deployed baselines including installed 3.0.4 must remain mandatory by default');
+  assert(baselineMatrix.includes(`inputs.include_unpublished_243 && '["legacy","2.4.2","2.4.3","3.0.1","3.0.2","3.0.3","3.0.4"]'`));
   assert(connected.jobs['baseline-243'].if.startsWith('inputs.include_unpublished_243 &&'));
   assert(connected.jobs['connected-upgrade'].if.includes("needs.build-installer.result == 'success'"));
   assert(connected.jobs['connected-upgrade'].if.includes("needs.baseline-243.result == 'skipped'"), 'optional unpublished baseline must not skip deployed coverage');
