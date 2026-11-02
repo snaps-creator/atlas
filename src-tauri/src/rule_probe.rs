@@ -127,7 +127,7 @@ pub fn run(s: &Settings, client: ApiClient, rule: &Rule, route: &Route) -> Probe
                 out.detail = if status == 403 || status == 429 {
                     format!("HTTP {status}: сайт ограничил запрос. Причиной может быть IP сервера или защита от автоматических запросов.")
                 } else {
-                    format!("HTTP {status}")
+                    format!("HTTP {status} · работа сервиса и доступ в аккаунте не подтверждены")
                 };
                 if *route == Route::Block {
                     out.status = "warning".into();
@@ -144,6 +144,12 @@ pub fn run(s: &Settings, client: ApiClient, rule: &Rule, route: &Route) -> Probe
                 if html {
                     let mut body = String::new();
                     if response.take(512 * 1024).read_to_string(&mut body).is_ok() {
+                        let outcome = crate::service_check::classify(status, base.host_str().unwrap_or(""), Some(&body));
+                        if *route != Route::Block && matches!(outcome,
+                            crate::service_check::Outcome::RegionalHint | crate::service_check::Outcome::AuthRequired) {
+                            out.status = "warning".into();
+                            out.detail = format!("HTTP {status} · {}", crate::service_check::description(&outcome));
+                        }
                         candidates.extend(resources(&body, &base));
                     }
                 }

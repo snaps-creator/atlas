@@ -1,6 +1,6 @@
 [package]
 name = "atlas-vpn"
-version = "3.1.4"
+version = "3.2.3"
 edition = "2021"
 default-run = "atlas-vpn"
 
@@ -41,7 +41,10 @@ ipnet = "2"
 keyring = { version = "3", features = ["windows-native"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
-tokio = { version = "=1.53.1", features = ["rt", "time"] }
+tokio = { version = "=1.53.1", features = ["rt", "time", "net", "io-util", "macros"] }
+h2 = "0.4"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 minisign-verify = "=0.2.5"
 ring = "0.17"
 maxminddb = "0.32.0"

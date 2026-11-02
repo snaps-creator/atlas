@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { request } from "./api";
 import { stringify } from "yaml";
 import type { Settings, Route, Snapshot } from "./types";
@@ -22,11 +22,15 @@ export function RuleChecks({
   connected,
   visible,
   refresh,
+  revision,
+  diagnosticEpoch,
 }: {
   settings?: Settings;
   connected: boolean;
   visible: boolean;
   refresh: () => Promise<void>;
+  revision?: number;
+  diagnosticEpoch?: number;
 }) {
   const active = useRef(false);
   const generation = useRef(0);
@@ -34,6 +38,15 @@ export function RuleChecks({
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const [checks, setChecks] = useState<Record<string, Check>>({});
   const [error, setError] = useState("");
+  useEffect(() => {
+    generation.current++;
+    active.current = false;
+    setChecking(false);
+    setChecks({});
+    setCheckedAt(null);
+    setError("");
+    return () => { generation.current++; };
+  }, [connected, revision, diagnosticEpoch]);
   async function checkRules() {
     if (!connected || active.current || (settings?.routingMode && settings.routingMode !== "rule")) return;
     active.current = true;

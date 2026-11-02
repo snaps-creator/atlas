@@ -23,6 +23,7 @@ pub struct Ticket {
     key: (String, String),
     pub gate: Arc<Mutex<()>>,
     pub node: Value,
+    previous: Option<Value>,
 }
 impl State {
     pub fn suspend(&mut self) -> HashMap<String,Value> {
@@ -33,7 +34,7 @@ impl State {
     }
     pub fn configure(&mut self, settings: &Settings) {
         self.invalidate();
-        self.nodes = settings.servers().into_iter().filter_map(|n|
+        self.nodes = crate::transport_guard::runtime_settings(settings).servers().into_iter().filter_map(|n|
             n["name"].as_str().map(|name| (name.to_owned(), n.clone()))).collect();
     }
     pub fn invalidate(&mut self) {
@@ -48,16 +49,17 @@ impl State {
         let node = self.nodes.get(name).ok_or("Проверяемый сервер отсутствует в текущей конфигурации")?.clone();
         self.sequence += 1;
         let key = (name.to_owned(), endpoint.to_owned());
-        let previous = self.records.get(&key).filter(|v| matches!(v["status"].as_str(), Some("unreachable"|"error"))).cloned();
+        let previous = self.records.get(&key).cloned();
         self.records.insert(key.clone(), json!({"status":"testing","delay":null,"attempts":1,"pending":true,
             "operationId":self.sequence,"generation":self.generation,"probeId":node_identity(&node),
             "endpoint":endpoint,"startedAt":now_ms(),"scope":"tcp_http","udp":"untested"}));
         let record=self.records.get_mut(&key).unwrap();
-        // Starting work is not new network evidence. Retain the last failure
-        // while advancing the operation fence, so an older success cannot win.
-        if let Some(previous) = previous {
-            for field in ["status", "error", "errorKind", "measuredAt"] {
-                record[field] = previous[field].clone();
+        // Rechecking is not new evidence. Keep failures and unexpired successes
+        // with their original timestamps while advancing the operation fence.
+        if let Some(previous) = previous.as_ref().filter(|v| matches!(v["status"].as_str(),Some("unreachable"|"error")) ||
+            (v["status"]=="ok" && now_ms().saturating_sub(v["measuredAt"].as_u64().unwrap_or(0))<FRESH_MS)) {
+            for field in ["status", "delay", "error", "errorKind", "measuredAt"] {
+                if let Some(value)=previous.get(field) {record[field] = value.clone();}
             }
         }
         record["outbound"]=json!(target_name(&node));
@@ -66,7 +68,7 @@ impl State {
             record["scope"]=json!("tcp_http_profile_outbound");
         }
         let gate=self.gates.entry(key.clone()).or_default().clone();
-        Ok(Ticket { generation:self.generation, sequence:self.sequence, key, node, gate })
+        Ok(Ticket { generation:self.generation, sequence:self.sequence, key, node, gate, previous })
     }
     pub fn current(&self, ticket: &Ticket) -> bool {
         ticket.generation == self.generation && self.records.get(&ticket.key)
@@ -92,6 +94,16 @@ impl State {
             }
         }
         Ok(record.clone())
+    }
+    pub fn defer(&mut self, ticket:&Ticket)->Result<Value,String> {
+        if !self.current(ticket) {return Err("CANCELLED: результат проверки устарел".into());}
+        let record=self.records.get_mut(&ticket.key).unwrap();
+        let fence=(record["operationId"].clone(),record["generation"].clone(),record["startedAt"].clone());
+        if let Some(previous)=&ticket.previous {*record=previous.clone();}
+        else {record.as_object_mut().unwrap().remove("measuredAt");}
+        record["operationId"]=fence.0;record["generation"]=fence.1;record["startedAt"]=fence.2;
+        record["pending"]=json!(true);
+        let mut reply=record.clone();reply["retryFull"]=json!(true);Ok(reply)
     }
     pub fn annotate(&self, proxies: &mut Value) {
         if let Some(proxies) = proxies["proxies"].as_object_mut() {
@@ -152,6 +164,18 @@ pub fn validate_route(node: &Value) -> Result<(),String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_defers_without_publishing_a_timeout_or_renewing_success() {
+        let mut state=State::default();state.configure(&settings(1234));let endpoint=crate::latency::DISPLAY_URL;
+        let quick=state.begin("node",endpoint).unwrap();let unknown=state.defer(&quick).unwrap();
+        assert_eq!(unknown["status"],"testing");assert_eq!(unknown["retryFull"],true);assert!(unknown["measuredAt"].is_null());
+        let full=state.begin("node",endpoint).unwrap();let success=state.finish(&full,&Ok(51)).unwrap();
+        let retry=state.begin("node",endpoint).unwrap();let deferred=state.defer(&retry).unwrap();
+        assert_eq!(deferred["status"],"ok");assert_eq!(deferred["delay"],51);assert_eq!(deferred["measuredAt"],success["measuredAt"]);
+        let newer=state.begin("node",endpoint).unwrap();assert!(state.finish(&retry,&Err("Mihomo API: HTTP 504".into())).is_err());
+        let final_failure=state.finish(&newer,&Err("Mihomo API: HTTP 504".into())).unwrap();assert_eq!(final_failure["status"],"unreachable");
+        state.configure(&settings(1235));assert!(state.defer(&newer).is_err());
+    }
     fn settings(port:u16)->Settings {
         let mut s=Settings::default();
         s.subscriptions.push(crate::model::Subscription {source:Default::default(), options:Default::default(),

@@ -25,6 +25,12 @@ pub fn file_version(path:&Path)->Result<String,String>{unsafe{
 }}
 
 pub fn upgrade(root:&Path,source:&Path,installer:&Path)->Result<(),String>{
+    upgrade_mode(root,source,installer,false)
+}
+pub fn stage(root:&Path,source:&Path,installer:&Path)->Result<(),String>{
+    upgrade_mode(root,source,installer,true)
+}
+fn upgrade_mode(root:&Path,source:&Path,installer:&Path,deferred:bool)->Result<(),String>{
     // The embedded receipt authenticates every candidate byte before touching
     // the installation. A user-writable external JSON is not authority here.
     let candidate=crate::update_bundle::payload(source)?;
@@ -38,6 +44,9 @@ pub fn upgrade(root:&Path,source:&Path,installer:&Path)->Result<(),String>{
     let previous_service=service.as_ref().map(|s|s.binary.clone()).unwrap_or_default();
     let mut transaction=if root.join("current.json").exists() {
         let mut transaction=Transaction::open(root)?;
+        if deferred && !can_stage_deferred(root,&transaction) {
+            return Err("An earlier update is unfinished; deferred staging will not recover or stop the running Atlas".into());
+        }
         if matches!(transaction.journal.stage,Stage::Created|Stage::Downloading|Stage::Downloaded|Stage::Verified|Stage::Prepared) {
             transaction.advance(Stage::Failed)?;
         }else if !matches!(transaction.journal.stage,Stage::Committed|Stage::RolledBack|Stage::Failed) {
@@ -67,8 +76,71 @@ pub fn upgrade(root:&Path,source:&Path,installer:&Path)->Result<(),String>{
     // installation tree, whose users have read/execute but no write access.
     // Failure here still precedes all desktop, service and network shutdown.
     crate::update_user::check_executable(&transaction.version_path(&transaction.journal.candidate).join("AtlasUpdater.exe"))?;
+    if deferred {
+        // No quiesce, service switch, settings snapshot or process launch occurs here.
+        let helper=transaction.version_path(&transaction.journal.candidate).join("AtlasUpdater.exe");
+        let bytes=crate::update_integrity::read_bounded(&helper,64*1024*1024)?;
+        let marker=serde_json::json!({"transactionId":transaction.journal.transaction_id,"candidateId":transaction.journal.candidate.id});
+        crate::update_transaction::durable_write(&root.join("deferred-update.json"),&serde_json::to_vec(&marker).map_err(|e|e.to_string())?)?;
+        for name in ["AtlasUpdater.exe","Atlas.exe"] {crate::update_transaction::durable_write(&root.join(name),&bytes)?;}
+        return Ok(());
+    }
     let mut host=crate::update_windows::Windows::prepare(&transaction,crate::update_user::database()?)?;
     crate::update_supervisor::activate(&mut transaction,&mut host)
+}
+
+fn can_stage_deferred(root:&Path,transaction:&Transaction)->bool {
+    matches!(transaction.journal.stage,Stage::Committed|Stage::RolledBack|Stage::Failed) || deferred_matches(root,transaction)
+}
+pub fn deferred_matches(root:&Path,transaction:&Transaction)->bool {
+    if transaction.journal.stage!=Stage::Prepared {return false;}
+    let marker=crate::update_integrity::read_bounded(&root.join("deferred-update.json"),4096).ok()
+        .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok()).unwrap_or_default();
+    marker["transactionId"]==transaction.journal.transaction_id && marker["candidateId"]==transaction.journal.candidate.id
+}
+pub fn activate_prepared(root:&Path)->Result<(),String>{
+    let mut transaction=Transaction::open(root)?;
+    if !deferred_matches(root,&transaction) {return Err("No matching prepared local update".into());}
+    transaction.journal.candidate.verify(&transaction.version_path(&transaction.journal.candidate))?;
+    let mut host=crate::update_windows::Windows::prepare(&transaction,crate::update_user::database()?)?;
+    crate::update_supervisor::activate(&mut transaction,&mut host)?;
+    // Deferred activation skips the NSIS section that normally updates Apps & Features.
+    // Refresh its display version only after the candidate has actually committed.
+    if let Ok(key)=winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas",winreg::enums::KEY_SET_VALUE) {
+        if let Err(error)=key.set_value("DisplayVersion",&transaction.journal.active.version) {
+            crate::update_launcher::record_failure(&format!("Committed update display version: {error}"));
+        }
+    }
+    let _=std::fs::remove_file(root.join("deferred-update.json"));
+    Ok(())
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+    use sha2::{Digest,Sha256};
+    #[test]
+    fn deferred_marker_is_bound_to_a_verified_prepared_transaction_and_keeps_old_active() {
+        let root=std::env::temp_dir().join(format!("atlas-deferred-{}",uuid::Uuid::new_v4()));
+        let source=root.join("source");std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("Atlas.exe"),b"candidate").unwrap();
+        let candidate=Version{id:"new".into(),version:"3.2.1".into(),build:"new".into(),absent:false,files:vec![crate::update_transaction::Payload{
+            path:"Atlas.exe".into(),size:9,sha256:format!("{:x}",Sha256::digest(b"candidate"))}]};
+        let mut tx=Transaction::create(&root,Version::absent(),candidate,"a".repeat(64),String::new()).unwrap();
+        let marker=serde_json::json!({"transactionId":tx.journal.transaction_id,"candidateId":tx.journal.candidate.id});
+        std::fs::write(root.join("deferred-update.json"),marker.to_string()).unwrap();
+        assert!(!deferred_matches(&root,&tx));
+        assert!(!can_stage_deferred(&root,&tx));
+        for stage in [Stage::Downloading,Stage::Downloaded,Stage::Verified] {tx.advance(stage).unwrap();}
+        tx.stage_payload(&source).unwrap();
+        assert!(deferred_matches(&root,&tx));assert!(tx.journal.active.absent);
+        assert!(can_stage_deferred(&root,&tx));
+        let mut wrong=marker;wrong["transactionId"]=serde_json::json!("other");std::fs::write(root.join("deferred-update.json"),wrong.to_string()).unwrap();
+        assert!(!deferred_matches(&root,&tx));
+        assert!(!can_stage_deferred(&root,&tx));
+        drop(tx);std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub fn prepare_uninstall(root:&Path)->Result<(),String>{

@@ -3,16 +3,21 @@ use std::{io::{Read,Write}, net::TcpListener, sync::{Arc,Mutex,atomic::{AtomicBo
 
 struct Fixture {
     client: ApiClient, settings: Settings, selected: Arc<Mutex<String>>,
+    requests: Arc<Mutex<Vec<String>>>,
     traffic: Arc<AtomicBool>, stop: Arc<AtomicBool>, worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Fixture {
     fn new(fast_delay: u64, traffic_ok: bool) -> Self {
+        Self::with_secondary(fast_delay,traffic_ok,None)
+    }
+    fn with_secondary(fast_delay: u64, traffic_ok: bool, secondary_delay: Option<u64>) -> Self {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let client=ApiClient::loopback_fixture(listener.local_addr().unwrap().port());
         let selected=Arc::new(Mutex::new("slow".to_owned()));
         let traffic=Arc::new(AtomicBool::new(traffic_ok));
         let stop=Arc::new(AtomicBool::new(false));
+        let requests=Arc::new(Mutex::new(Vec::new()));let observed=requests.clone();
         let (selection,healthy,done)=(selected.clone(),traffic.clone(),stop.clone());
         let worker=std::thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
@@ -29,6 +34,7 @@ impl Fixture {
                     }
                 }
                 let request=String::from_utf8_lossy(&input);
+                observed.lock().unwrap().push(request.lines().next().unwrap_or("").to_owned());
                 let mut code=200;
                 let body=if request.starts_with("PUT ") {
                     if let Some(body)=request.split("\r\n\r\n").nth(1) {
@@ -38,12 +44,14 @@ impl Fixture {
                 } else if request.starts_with("GET http://") {
                     code=if healthy.load(Ordering::SeqCst) {204} else {503}; Value::Null
                 } else if request.contains("/delay?") {
-                    json!({"delay":if request.contains("/slow/") {200} else {fast_delay}})
+                    json!({"delay":if request.contains("/slow/") {200} else if request.contains("/guarded/") {40}
+                        else if request.contains("www.google.com") {secondary_delay.unwrap_or(fast_delay)} else {fast_delay}})
                 } else if request.starts_with("GET /proxies/AUTO ") {
                     json!({"now":*selection.lock().unwrap()})
                 } else {
-                    let health=json!({"alive":true,"extra":{format!("{}?atlas_probe=1",crate::latency::DISPLAY_URL):{"alive":true}}});
-                    json!({"proxies":{"AUTO":{"now":*selection.lock().unwrap()},"slow":health.clone(),"fast":health}})
+                    let mut health=json!({"alive":true,"extra":{}});
+                    for endpoint in crate::latency::ENDPOINTS {health["extra"][format!("{endpoint}?atlas_probe=1")]=json!({"alive":true});}
+                    json!({"proxies":{"AUTO":{"now":*selection.lock().unwrap()},"slow":health.clone(),"guarded":health.clone(),"fast":health}})
                 };
                 let body=if code==204 {String::new()} else {body.to_string()};
                 let _=write!(socket,"HTTP/1.1 {code} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",body.len());
@@ -55,7 +63,7 @@ impl Fixture {
         // Scenario fixture models real mixed-listener HTTP traffic locally;
         // TLS authentication itself is covered by probe_integration_tests.
         let client=client.with_probe_settings(&settings).with_fixture_tunnel_endpoint("http://fixture.invalid/generate_204");
-        Self{client,settings,selected,traffic,stop,worker:Some(worker)}
+        Self{client,settings,selected,requests,traffic,stop,worker:Some(worker)}
     }
     fn drive(&self, recovery: &mut Recovery, phase: Phase) {
         let deadline=Instant::now()+Duration::from_secs(5);
@@ -66,9 +74,50 @@ impl Fixture {
         }
     }
 }
+fn add_guarded(f: &mut Fixture) {
+    f.settings.subscriptions[0].servers.push(json!({"name":"guarded","type":"socks5","server":"127.0.0.1","port":3,"atlasRecoveryVariant":"slow"}));
+    f.client=f.client.clone().with_probe_settings(&f.settings);
+}
+#[test] fn ordinary_candidate_wins_without_probing_fragmented_path() {
+    let mut f=Fixture::new(60,true);add_guarded(&mut f);
+    let report=verify_replacement(&f.client,&f.settings,&HashSet::new(),None,Default::default());
+    assert_eq!(report["candidate"],"fast");assert_eq!(report["transportFallback"],false);
+    assert!(!f.requests.lock().unwrap().iter().any(|r|r.contains("/guarded/")));
+    let requests=f.requests.lock().unwrap();let fast:Vec<_>=requests.iter().filter(|r|r.contains("/fast/delay?")).collect();
+    assert_eq!(fast.len(),2);assert!(fast[0].contains("cp.cloudflare.com"));assert!(fast[1].contains("www.google.com"));
+}
+#[test] fn fast_primary_cannot_hide_slow_secondary_when_selecting_replacement() {
+    let f=Fixture::with_secondary(50,true,Some(700));
+    let report=verify_replacement(&f.client,&f.settings,&HashSet::new(),None,Default::default());
+    assert!(report["candidate"].is_null());assert!(report["error"].is_null());
+    assert!(!f.requests.lock().unwrap().iter().any(|r|r.starts_with("PUT ")));
+    let fast=report["results"].as_array().unwrap().iter().find(|r|r["name"]=="fast").unwrap();
+    assert_eq!(fast["controls"][0]["delay"],50);assert_eq!(fast["controls"][1]["delay"],700);
+}
+#[test] fn fragmented_path_is_verified_after_normal_candidates_and_rolls_back() {
+    let mut f=Fixture::new(300,false);add_guarded(&mut f);
+    let report=verify_replacement(&f.client,&f.settings,&HashSet::new(),None,Default::default());
+    assert_eq!(report["candidate"],"guarded");assert_eq!(report["transportFallback"],true);
+    let requests=f.requests.lock().unwrap().clone();
+    let guard=requests.iter().position(|r|r.contains("/guarded/delay")).unwrap();
+    assert!(requests[..guard].iter().any(|r|r.contains("/slow/delay")));
+    assert!(requests[..guard].iter().any(|r|r.contains("/fast/delay")));
+    assert_eq!(requests.iter().filter(|r|r.contains("/guarded/delay")).count(),2);
+    let mut recovery=Recovery::default();recovery.observed_current=Some("slow".into());
+    recovery.propose_for_test(report);f.drive(&mut recovery,Phase::RefreshingSubscriptions);
+    assert_eq!(*f.selected.lock().unwrap(),"slow");
+    assert!(f.client.logs().unwrap().iter().any(|line|line.contains("SwitchFailed")));
+}
+#[test] fn manual_pin_never_commits_a_pending_fragmented_candidate() {
+    let mut f=Fixture::new(300,true);add_guarded(&mut f);f.settings.selected="slow".into();
+    let mut r=Recovery::default();r.propose_for_test(json!({"candidate":"guarded","results":[]}));
+    r.tick(f.client.clone(),&f.settings);
+    assert_eq!(*f.selected.lock().unwrap(),"slow");
+    assert!(!f.requests.lock().unwrap().iter().any(|r|r.starts_with("PUT ")));
+}
 impl Drop for Fixture { fn drop(&mut self) {self.stop.store(true,Ordering::SeqCst);self.worker.take().unwrap().join().unwrap();} }
 fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive: bool) {
-    let (tx,rx)=mpsc::channel(); tx.send(vec![("slow".into(),delay,alive)]).unwrap();
+    let (tx,rx)=mpsc::channel(); tx.send(vec![("slow".into(),delay,alive,0)]).unwrap();
     recovery.active=Some(Scheduled{rx,generation:recovery.generation});
     recovery.poll_active(&fixture.client,&fixture.settings,Instant::now());
 }
@@ -89,6 +138,10 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
         r.monitor(f.client.clone(),&f.settings,at+Duration::from_secs(9));
         assert!(r.active.is_none());assert_eq!(r.last_active,Some(at));
     }
+    let requests=f.requests.lock().unwrap();
+    let probes:Vec<_>=requests.iter().filter(|r|r.contains("/delay?")).collect();
+    assert_eq!(probes.len(),3,"Rotating controls must not add probes to healthy cycles");
+    assert!(probes[0].contains("cp.cloudflare.com"));assert!(probes[1].contains("www.google.com"));assert!(probes[2].contains("cp.cloudflare.com"));
 }
 #[test] fn healthy_ticks_do_not_launch_a_second_reserve_or_quarantine_scan() {
     let f=Fixture::new(60,true);let mut r=Recovery::default();let now=Instant::now();
@@ -103,6 +156,8 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
     let f=Fixture::new(60,true);let mut r=Recovery::default();
     sample(&mut r,&f,Some(80),true);assert!(!r.needed);
     sample(&mut r,&f,Some(150),true);assert!(!r.needed);
+    sample(&mut r,&f,Some(200),true);assert!(!r.needed);
+    sample(&mut r,&f,Some(200),true);assert!(!r.needed);
     sample(&mut r,&f,Some(200),true);assert!(r.needed);
     r.last_switch=Some(Instant::now());r.retry_at=Some(Instant::now()+Duration::from_secs(100));
     sample(&mut r,&f,None,false);assert_eq!(r.slow_samples,0);assert!(r.retry_at.is_none());
@@ -110,7 +165,7 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
 }
 #[test] fn replacement_is_confirmed_by_real_proxy_traffic() {
     let f=Fixture::new(60,true);let mut r=Recovery::default();
-    sample(&mut r,&f,Some(200),true);
+    for _ in 0..3 {sample(&mut r,&f,Some(200),true);}
     f.drive(&mut r,Phase::Verifying);
     assert_ne!(r.phase,Phase::ConnectedHealthy);
     f.drive(&mut r,Phase::ConnectedHealthy);
@@ -119,7 +174,7 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
 }
 #[test] fn broken_tunnel_rolls_back_and_refreshes_once() {
     let f=Fixture::new(60,false);let mut r=Recovery::default();
-    sample(&mut r,&f,Some(200),true);
+    for _ in 0..3 {sample(&mut r,&f,Some(200),true);}
     f.drive(&mut r,Phase::RefreshingSubscriptions);
     assert_eq!(*f.selected.lock().unwrap(),"slow");
     assert!(!f.client.logs().unwrap().iter().any(|line|line.contains("RecoverySucceeded")));
@@ -150,7 +205,7 @@ fn sample(recovery: &mut Recovery, fixture: &Fixture, delay: Option<u64>, alive:
 }
 #[test] fn no_candidate_above_threshold_can_replace_current_path() {
     let f=Fixture::new(300,true);let mut r=Recovery::default();
-    sample(&mut r,&f,Some(200),true);f.drive(&mut r,Phase::RefreshingSubscriptions);
+    for _ in 0..3 {sample(&mut r,&f,Some(200),true);}f.drive(&mut r,Phase::RefreshingSubscriptions);
     assert_eq!(*f.selected.lock().unwrap(),"slow");
 }
 #[test] fn bounded_backoff_and_legacy_settings_defaults() {

@@ -1,3 +1,4 @@
+import { SettingsQueue } from "./settingsQueue";
 import { serverDisplayName } from "./serverDisplayName";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { allSubscriptions, sourceLabels, validSubscriptionInput, serverSelectionPayload, isServerSelected, isFavorite } from "./subscriptionSource";
@@ -51,6 +52,8 @@ import { ConnectionRules, connectionRoute } from "./ConnectionRules";
 import "flag-icons/css/flag-icons.min.css";
 import { freshLatency, latencyRank, type Latency } from "./latency";
 import { matchingLatencies, startLatencyPolling, type LatencySnapshot } from "./latencyPolling";
+import { ServerRefreshButton } from "./ServerRefreshButton";
+import { watchVisibleServers } from "./visibleServerPriority";
 import "./frosted.css";
 type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof check>>>;
 type UpdateStatus = "idle" | "downloading" | "installing" | "error";
@@ -102,6 +105,15 @@ function App() {
   const [error, setError] = useState("");
   const [pendingOperations, setPendingOperations] = useState(0);
   const busy = pendingOperations > 0;
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [, settingsChanged] = useState(0);
+  const settingsQueue = useRef<SettingsQueue | null>(null);
+  if (!settingsQueue.current) settingsQueue.current = new SettingsQueue(
+    () => request<Snapshot>("snapshot"),
+    (settings, revision) => request<Snapshot>("save", { settings, revision }),
+    snapshot => setData(current => current && (current.revision ?? 0) > (snapshot.revision ?? 0) ? current : snapshot),
+    () => settingsChanged(value => value + 1),
+  );
   const [reportBusy, setReportBusy] = useState(false);
   const [reportSaved, setReportSaved] = useState(false);
   const [query, setQuery] = useState("");
@@ -112,6 +124,7 @@ function App() {
   const [latencies, setLatencies] = useState<Record<string, Latency>>({});
   const [testingAll, setTestingAll] = useState(false);
   const latencyWake = useRef<() => void>(()=>{});
+  const visibleServerNames = useRef<string[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [traffic, setTraffic] = useState({ up: 0, down: 0 });
   const [samples, setSamples] = useState<TrafficSample[]>([]);
@@ -293,6 +306,7 @@ function App() {
     };
   }, [data?.running]);
   async function act(action: string, payload?: unknown) {
+    if (action === "disconnect") setDisconnecting(true);
     if (action === "connect") setProtection(connectionProtection(false, "Connecting")!);
     setPendingOperations(count => count + 1);
     setError("");
@@ -304,11 +318,15 @@ function App() {
       setError(String(e));
       throw e;
     } finally {
+      if (action === "disconnect") setDisconnecting(false);
       setPendingOperations(count => Math.max(0, count - 1));
     }
   }
-  async function save(s: Settings) {
-    await act("save", { settings: s, revision: data?.revision });
+  async function save(next: Settings) {
+    if (!data) return;
+    setError("");
+    try { await settingsQueue.current!.push(s!, next); }
+    catch (error) { setError(String(error)); throw error; }
   }
   function run(f: () => Promise<unknown>) {
     void f().catch(() => {});
@@ -333,13 +351,14 @@ function App() {
       setUpdateStatus("error"); setUpdateError(String(error));
     }
   }
-  const s = data?.settings;
+  const s = data ? settingsQueue.current.overlay(data.settings) : undefined;
   const subscriptions = allSubscriptions(s);
   const servers = subscriptions.flatMap((v) => v.servers);
   const connected = data?.running ?? false;
   const recovering = connected && data?.recovery?.phase !== undefined && data.recovery.phase !== "CONNECTED_HEALTHY";
   const connecting = data?.status === "Connecting";
   const initializing = data?.status === "Initializing";
+  const canDisconnect = connected || connecting || data?.guardActive || data?.desiredConnected;
   const protectedPause = data?.status === "ProtectedPause";
   const header = (
     _eyebrow: string,
@@ -385,7 +404,7 @@ function App() {
   const latencyContext = JSON.stringify(identities);
   useEffect(() => {
     if (!native) return;
-    const polling = startLatencyPolling(()=>request<LatencySnapshot>("latency_state"), snapshot=>{
+    const polling = startLatencyPolling(()=>request<LatencySnapshot>("latency_state",{priority:document.visibilityState === "visible" ? visibleServerNames.current : []}), snapshot=>{
       setLatencies(matchingLatencies(snapshot,identitiesRef.current));
       setActiveServer(snapshot.selected ?? null);
       setTestingAll(snapshot.pending.length > 0);
@@ -402,10 +421,17 @@ function App() {
     latencyWake.current();
     if (native && page === "Servers") void request("refresh_due").catch(()=>{});
   }, [page,latencyContext,data?.running]);
+  useEffect(() => {
+    if (page !== "Servers") {visibleServerNames.current=[];return;}
+    const grid=document.querySelector(".server-grid");
+    if (!grid) return;
+    return watchVisibleServers(grid,names=>{visibleServerNames.current=names;latencyWake.current();});
+  },[page,latencyContext]);
   async function testAll() {
     setSortLatency(true);
+    setTestingAll(true);
     try {await request("latency_batch");latencyWake.current();}
-    catch(error) {setError(String(error));}
+    catch(error) {setTestingAll(false);setError(String(error));}
   }
   async function test(name:string) {
     try {await request("latency",{name});latencyWake.current();}
@@ -576,6 +602,8 @@ function App() {
             </section>
           )}
           <RuleChecks
+            revision={data?.revision}
+            diagnosticEpoch={data?.diagnosticEpoch}
             key={s?.routingMode ?? "rule"}
             settings={s}
             connected={connected}
@@ -664,7 +692,7 @@ function App() {
                           connecting ? "Отменить подключение" : connected || protectedPause ? "Отключить VPN" : "Подключить VPN"
                         }
                         className="power"
-                        disabled={initializing || (busy && !connecting) || !servers.length || data.status === "CleanupError"}
+                        disabled={initializing || disconnecting || data.status === "Disconnecting" || (!canDisconnect && (busy || !servers.length || data.status === "CleanupError"))}
                         onClick={() =>
                           run(() =>
                             act(
@@ -693,7 +721,7 @@ function App() {
                       </div>
                       <button
                         className="primary connect-btn"
-                        disabled={initializing || (busy && !connecting) || !servers.length || data.status === "CleanupError"}
+                        disabled={initializing || disconnecting || data.status === "Disconnecting" || (!canDisconnect && (busy || !servers.length || data.status === "CleanupError"))}
                         onClick={() =>
                           run(() =>
                             act(
@@ -759,7 +787,7 @@ function App() {
                       </div>
                     </div>
                   </section>
-                  <DashboardTools connected={connected} settings={s} busy={busy} save={save} samples={samples} traffic={traffic} memory={memory} connections={connections.length} error={trafficError} />
+                  <DashboardTools connected={connected} settings={s} revision={data?.revision} diagnosticEpoch={data?.diagnosticEpoch} busy={busy} save={save} samples={samples} traffic={traffic} memory={memory} connections={connections.length} error={trafficError} />
                   <section className="section">
                     <div className="default-route">
                       <span>
@@ -798,22 +826,7 @@ function App() {
                     "GLOBAL NETWORK",
                     "Найдите свой маршрут.",
                     "Серверы из ваших подписок. Доступность проверяется через Mihomo.",
-                    <button
-                      disabled={testingAll || busy || !servers.length}
-                      onClick={() =>
-                        run(async () => {
-                          setTestingAll(true);
-                          try {
-                            await testAll();
-                          } finally {
-                            setTestingAll(false);
-                          }
-                        })
-                      }
-                    >
-                      <Activity size={16} />
-                      Проверить все
-                    </button>,
+                    <ServerRefreshButton count={servers.length} checking={testingAll} onRefresh={() => void testAll()} />,
                   )}
                   <div className="toolbar">
                     {search}
@@ -845,7 +858,7 @@ function App() {
                               : "Резервное переключение"}
                           </strong>
                           <small>
-                            {n === "AUTO"
+                            {n === "AUTO" && s?.autoOptimize
                               ? `Текущий: 10 с · все: 60 с · поиск выше ${s?.autoSearchPingMs ?? 150} мс`
                               : `Резерв при потере ответа · текущий: 10 с · все: 60 с`}
                           </small>
@@ -854,6 +867,11 @@ function App() {
                       </button>
                     ))}
                   </div>
+                  {s && !["AUTO", "FAILOVER"].includes(s.selectedNodeId ?? s.selected) && (
+                    <p className="server-selection-note">
+                      Ручной выбор: сервер закреплён. Для автоматической замены при отказе включите «Резервное переключение».
+                    </p>
+                  )}
                   {servers.length ? (
                     <div className="server-grid">                      {servers
                         .filter(

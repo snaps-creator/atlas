@@ -7,6 +7,15 @@
   align-items: end;
   gap: 12px;
 }
+.lan-management { margin-block: 28px; min-width: 0; }
+.lan-management fieldset { border: 0; padding: 0; margin-block: 16px; min-width: 0; }
+.lan-management h4 { margin-block: 28px 16px; }
+.lan-management details { padding-block: 12px; border-bottom: 1px solid var(--border, #333844); }
+.lan-management summary { cursor: pointer; overflow-wrap: anywhere; }
+.lan-management input, .lan-management select { max-width: 100%; }
+.lan-management .lan-rule { margin-block: 12px; }
+.lan-management .lan-rule-value { flex: 1; }
+.lan-management > p[role="alert"], .lan-management > p[role="status"] { overflow-wrap: anywhere; }
 .lan-heading {
   align-items: center;
   justify-content: space-between;

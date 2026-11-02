@@ -70,7 +70,7 @@ Section 'Neighbor cache and network profile' {
     Get-NetConnectionProfile | Select-Object InterfaceAlias,NetworkCategory,IPv4Connectivity,IPv6Connectivity
 }
 Section 'Core TCP egress (no browsing names)' {
-    $coreIds = @(Get-CimInstance Win32_Process -Filter "Name='Atlas.Core.exe' OR Name='mihomo.exe'" | Select-Object -ExpandProperty ProcessId)
+    $coreIds = @(Get-CimInstance Win32_Process -Filter "Name='Atlas.Core.exe' OR Name='mihomo.exe' OR Name='Atlas.Xray.exe'" | Select-Object -ExpandProperty ProcessId)
     Get-NetTCPConnection | Where-Object { $_.OwningProcess -in $coreIds } |
         Select-Object OwningProcess,LocalAddress,LocalPort,RemoteAddress,RemotePort,State
 }

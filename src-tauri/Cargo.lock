@@ -267,11 +267,12 @@ dependencies = [
 
 [[package]]
 name = "atlas-vpn"
-version = "3.1.4"
+version = "3.2.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "h2",
  "ipnet",
  "keyring",
  "maxminddb",
@@ -293,8 +294,10 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-runtime-cef",
  "tokio",
+ "tokio-rustls",
  "url",
  "uuid",
+ "webpki-roots",
  "windows",
  "windows-sys 0.59.0",
  "winreg 0.55.0",
@@ -1935,6 +1938,25 @@ dependencies = [
  "libc",
  "pango-sys",
  "system-deps",
+]
+
+[[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap 2.14.2",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -5185,7 +5207,19 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5207,6 +5241,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

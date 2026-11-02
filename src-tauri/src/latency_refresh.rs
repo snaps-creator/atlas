@@ -4,6 +4,9 @@ use crate::{latency, published_state::{ReadSnapshot, ReadState}};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use tauri::Emitter;
+#[cfg(test)]
+#[path="latency_refresh_pass_tests.rs"]
+mod pass_tests;
 
 pub const FRESH_FOR: Duration = Duration::from_millis(crate::probe_state::FRESH_MS);
 const REFRESH_AFTER: Duration = Duration::from_secs(60);
@@ -14,9 +17,11 @@ struct Entry {
     identity: String,
     attempt: u64,
     pending: bool,
+    requested: bool,
     due: Instant,
     completed: Option<Instant>,
     result: Value,
+    needs_full: bool,
 }
 #[derive(Default)]
 struct Catalog {
@@ -26,17 +31,23 @@ struct Catalog {
     sequence: u64,
     batch_running: bool,
     revision: Option<u64>,
+    live: Option<(Instant, Value)>,
+    priority: std::collections::HashSet<String>,
+    visible: Option<(Instant,std::collections::HashSet<String>)>,
 }
 #[derive(Clone)]
-struct Ticket { name: String, identity: String, generation: u64, attempt: u64 }
+struct Ticket { name: String, identity: String, generation: u64, attempt: u64, quick: bool }
 
 impl Catalog {
     fn invalidate(&mut self, now: Instant) {
         self.generation += 1;
+        self.live = None;
         for entry in self.entries.values_mut() {
             entry.result = Value::Null;
             entry.completed = None;
             entry.pending = false;
+            entry.requested = false;
+            entry.needs_full = false;
             entry.due = now;
         }
     }
@@ -47,29 +58,48 @@ impl Catalog {
         }
         self.entries.retain(|name, entry| identities.get(name) == Some(&entry.identity));
         for (name, identity) in identities {
-            self.entries.entry(name).or_insert(Entry {identity, attempt:0, pending:false,
-                due:now, completed:None, result:Value::Null});
+            self.entries.entry(name).or_insert(Entry {identity, attempt:0, pending:false, requested:false,
+                due:now, completed:None, result:Value::Null, needs_full:false});
         }
     }
     fn request(&mut self, name: Option<&str>, force: bool, now: Instant) {
+        if !force { return; }
         for (key, entry) in &mut self.entries {
-            if name.is_some_and(|name|name != key) || entry.pending {continue;}
-            // Entering the page never defeats retry backoff or re-tests fresh data.
-            if force { entry.due = now; }
+            if name.is_some_and(|name|name != key) {continue;}
+            // Retire this ticket, including in-flight work. The existing worker
+            // exits before the scheduler starts the replacement; clicks never
+            // create another batch or allow its old replies to satisfy a restart.
+            entry.pending = false;
+            entry.requested = true;
+            entry.needs_full = false;
+            entry.due = now;
+            mark_pending(&mut entry.result);
         }
     }
     fn take(&mut self, now: Instant) -> Vec<Ticket> {
+        self.take_pass(now,usize::MAX,false)
+    }
+    fn take_pass(&mut self, now:Instant, limit:usize, phased:bool)->Vec<Ticket> {
         if self.batch_running {return vec![];}
         let mut due: Vec<_> = self.entries.iter().filter(|(_,e)|!e.pending && now >= e.due)
-            .map(|(name,e)|(e.due,name.clone())).collect();
-        due.sort(); // Oldest first: a large catalogue cannot starve its tail.
-        let tickets = due.into_iter().map(|(_,name)| {
+            .map(|(name,e)| {
+                let rank=if e.requested {0}else if self.priority.contains(name) {1}
+                    else if self.visible.as_ref().is_some_and(|(at,names)|now.saturating_duration_since(*at)<Duration::from_secs(5) && names.contains(name)){2}
+                    else if e.result["status"]=="ok" {3}
+                    else if !e.needs_full && e.completed.is_none() {4}
+                    else if e.needs_full {5}else{6};
+                (rank,e.due,name.clone(),phased && !e.needs_full)
+            }).collect();
+        due.sort();
+        let quick=due.first().is_some_and(|d|d.3);
+        let tickets = due.into_iter().filter(|d|d.3==quick).take(limit).map(|(_,_,name,_)| {
             let entry = self.entries.get_mut(&name).unwrap();
             self.sequence += 1;
             entry.attempt = self.sequence;
             entry.pending = true;
+            entry.requested = false;
             mark_pending(&mut entry.result);
-            Ticket {name,identity:entry.identity.clone(),generation:self.generation,attempt:entry.attempt}
+            Ticket {name,identity:entry.identity.clone(),generation:self.generation,attempt:entry.attempt,quick}
         }).collect::<Vec<_>>();
         self.batch_running = !tickets.is_empty();
         tickets
@@ -81,8 +111,12 @@ impl Catalog {
     fn accept(&mut self, ticket: &Ticket, result: &Value, now: Instant, wall_ms: u64) -> bool {
         if !self.current(ticket) {return false;}
         let entry = self.entries.get_mut(&ticket.name).unwrap();
+        if ticket.quick && result["retryFull"]==true {
+            entry.needs_full=true;entry.pending=false;entry.due=now;
+            return true;
+        }
         if result["status"] == "testing" {
-            // Retry starts retain failures, never prior positive availability.
+            // Starting work does not erase still-fresh evidence or renew its age.
             mark_pending(&mut entry.result);
             entry.result["lastAttemptAt"] = json!(wall_ms);
             return true;
@@ -99,6 +133,7 @@ impl Catalog {
         entry.due = now + if value["status"] == "ok" {REFRESH_AFTER} else {RETRY_AFTER};
         entry.completed = Some(now);
         entry.pending = false;
+        entry.needs_full = false;
         entry.result = value;
         true
     }
@@ -111,7 +146,7 @@ impl Catalog {
             (name.clone(), value)
         }).collect();
         json!({"results":results,"identities":self.entries.iter().map(|(n,e)|(n.clone(),e.identity.clone())).collect::<BTreeMap<_,_>>(),
-            "pending":self.entries.iter().filter(|(_,e)|e.pending).map(|(n,_)|n.clone()).collect::<Vec<_>>(),"generation":self.generation})
+            "pending":self.entries.iter().filter(|(_,e)|e.pending || e.requested || e.needs_full).map(|(n,_)|n.clone()).collect::<Vec<_>>(),"generation":self.generation})
     }
 }
 
@@ -119,10 +154,12 @@ fn is_failure(value: &Value) -> bool {
     matches!(value["status"].as_str(), Some("timeout"|"unreachable"|"error"))
 }
 fn mark_pending(value: &mut Value) {
-    if !is_failure(value) { *value=json!({"status":"testing","delay":null,"attempts":0,
+    let fresh=value["status"]=="ok" && value["measuredAt"].as_u64().is_some_and(|at|
+        crate::probe_state::now_ms().saturating_sub(at)<crate::probe_state::FRESH_MS);
+    if !is_failure(value) && !fresh { *value=json!({"status":"testing","delay":null,"attempts":0,
         "lastSuccessAt":value["lastSuccessAt"],"lastDelay":value["lastDelay"]}); }
     value["pending"]=json!(true);
-    value["delay"]=Value::Null;
+    if !fresh {value["delay"]=Value::Null;}
 }
 fn overlay_live(view: &mut Value, proxies: &Value) {
     let pending=view["pending"].as_array().cloned().unwrap_or_default();
@@ -156,25 +193,29 @@ impl Refresh {
         // only on a configuration revision, not once per result or UI read.
         if state.revision==Some(snapshot.revision) && state.context==context {return;}
         state.reconcile(identities(snapshot),context,Instant::now());
+        state.priority=snapshot.settings.servers().iter().filter(|node|
+            node["name"]==snapshot.settings.selected || crate::model::repository::node_id(node).is_some_and(|id|snapshot.settings.favorites.iter().any(|favorite|favorite==id))
+        ).filter_map(|node|node["name"].as_str().map(str::to_owned)).collect();
         state.revision=Some(snapshot.revision);
     }
     pub fn view(&self, snapshot: &ReadSnapshot, name: Option<&str>, force: bool) -> Value {
+        self.view_with_priority(snapshot,name,force,None)
+    }
+    pub fn view_with_priority(&self,snapshot:&ReadSnapshot,name:Option<&str>,force:bool,visible:Option<Vec<String>>)->Value {
         self.reconcile(snapshot);
         let mut state = self.0.lock().unwrap_or_else(|e|e.into_inner());
+        if let Some(names)=visible {state.visible=Some((Instant::now(),names.into_iter().take(32).filter(|name|state.entries.contains_key(name)).collect()));}
         state.request(name,force,Instant::now());
-        let mut view = state.view(Instant::now());
-        drop(state);
+        let now=Instant::now();
+        let mut view = state.view(now);
         if snapshot.status == "Connected" {
-            // Connected UI reads the same authoritative evidence as recovery.
-            // A scheduler cache must not resurrect success after a newer probe
-            // failure, network epoch change, or controller loss.
-            match snapshot.client.api("GET", "/proxies", None) {
-                Ok(proxies) => overlay_live(&mut view, &proxies),
-                Err(error) => {
-                    for value in view["results"].as_object_mut().unwrap().values_mut() {
-                        if !is_failure(value) { *value=json!({"status":"error","delay":null,"attempts":0,"error":error}); }
-                    }
-                }
+            // UI reads never wait for controller I/O. Missing or old evidence
+            // remains unknown, never a stale green result.
+            if let Some((_,proxies))=state.live.as_ref().filter(|(at,_)|now.saturating_duration_since(*at)<Duration::from_secs(3)) {
+                overlay_live(&mut view,proxies);
+            } else {
+                for value in view["results"].as_object_mut().unwrap().values_mut() {*value=Value::Null;}
+                view["selected"]=Value::Null;
             }
         }
         view
@@ -183,6 +224,26 @@ impl Refresh {
         self.spawn(reads,stop,Arc::new(move || {let _=app.emit("latency-updated",());}));
     }
     fn spawn(&self, reads: ReadState, stop: Arc<AtomicBool>, notify: Arc<dyn Fn()+Send+Sync>) -> std::thread::JoinHandle<()> {
+        // One observer refreshes authoritative evidence independently of UI
+        // wakeups and measurements. Catalog is never locked across network I/O.
+        let (observer,observer_reads,observer_stop,observer_notify)=(self.clone(),reads.clone(),stop.clone(),notify.clone());
+        let observer_worker=std::thread::spawn(move || {
+            while !observer_stop.load(Ordering::SeqCst) {
+                if let Ok(snapshot)=observer_reads.get() {
+                    observer.reconcile(&snapshot);
+                    if snapshot.status=="Connected" {
+                        let generation=observer.0.lock().unwrap_or_else(|e|e.into_inner()).generation;
+                        let observed=Instant::now();
+                        let result=snapshot.client.api("GET","/proxies",None);
+                        if let Ok(latest)=observer_reads.get() {observer.reconcile(&latest);}
+                        let mut state=observer.0.lock().unwrap_or_else(|e|e.into_inner());
+                        if state.generation==generation {state.live=result.ok().map(|v|(observed,v));}
+                        drop(state);observer_notify();
+                    }
+                }
+                for _ in 0..10 {if observer_stop.load(Ordering::SeqCst) {break;} std::thread::sleep(Duration::from_millis(100));}
+            }
+        });
         let refresh = self.clone();
         std::thread::spawn(move || {
             let mut last_tick = std::time::SystemTime::now();
@@ -199,7 +260,8 @@ impl Refresh {
                     }
                     if worker.is_none() && !crate::update_health::pending()
                         && matches!(snapshot.status.as_str(), "Connected"|"Disconnected"|"ProtectedPause"|"Error") {
-                        let tickets = refresh.0.lock().unwrap_or_else(|e|e.into_inner()).take(Instant::now());
+                        let connected=snapshot.status=="Connected";
+                        let tickets = refresh.0.lock().unwrap_or_else(|e|e.into_inner()).take_pass(Instant::now(),if connected {latency::DISPLAY_WORKERS}else{usize::MAX},connected);
                         if !tickets.is_empty() {
                             let (refresh,reads,stop,notify)=(refresh.clone(),reads.clone(),stop.clone(),notify.clone());
                             worker = Some(std::thread::spawn(move || {
@@ -220,7 +282,7 @@ impl Refresh {
                                 };
                                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     if snapshot.status == "Connected" {
-                                        latency::batch_stream_cancel(snapshot.client.clone(),&names,&progress,&current)
+                                        latency::batch_pass(snapshot.client.clone(),&names,tickets[0].quick,&progress,&current)
                                     } else {
                                         latency::offline_batch_stream_cancel(snapshot.settings.clone(),snapshot.binary.clone(),snapshot.directory.clone(),&names,&progress,&current)
                                     }
@@ -238,6 +300,7 @@ impl Refresh {
             // Native requests have bounded deadlines; their core/process RAII is
             // allowed to finish before this owner releases its worker.
             if let Some(worker) = worker {let _ = worker.join();}
+            let _=observer_worker.join();
         })
     }
 }
@@ -245,6 +308,29 @@ impl Refresh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ui_reads_never_contact_controller_and_expire_cached_evidence() {
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut settings=crate::model::Settings::default();
+        settings.subscriptions.push(crate::model::Subscription {source:crate::model::SubscriptionSource::Url,
+            id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),options:Default::default(),updated_at:0,error:None,
+            servers:vec![json!({"name":"a","server":"127.0.0.1","type":"socks5","port":12345})]});
+        let snapshot=ReadSnapshot {revision:0,settings,status:"Connected".into(),
+            client:crate::core::ApiClient::loopback_fixture(listener.local_addr().unwrap().port()),
+            binary:Default::default(),directory:Default::default()};
+        let refresh=Refresh::default();refresh.reconcile(&snapshot);
+        let identity=identities(&snapshot)["a"].clone();
+        let proxies=json!({"proxies":{"ATLAS":{"now":"a"},"a":{"atlasHealth":{"probeId":identity,"status":"ok","delay":42}}}});
+        refresh.0.lock().unwrap().live=Some((Instant::now(),proxies.clone()));
+        let start=Instant::now();
+        for _ in 0..100 {assert_eq!(refresh.view(&snapshot,None,false)["results"]["a"]["delay"],42);}
+        assert!(start.elapsed()<Duration::from_secs(1));
+        assert!(listener.accept().is_err(),"UI read opened a controller connection");
+        refresh.0.lock().unwrap().live=Some((Instant::now()-Duration::from_secs(4),proxies));
+        assert!(refresh.view(&snapshot,None,false)["results"]["a"].is_null());
+        refresh.invalidate();assert!(refresh.0.lock().unwrap().live.is_none());
+    }
     #[test]
     #[ignore = "75-second real-network scheduler acceptance; encrypted input opened read-only, isolated core only"]
     fn real_network_cycles() {
@@ -306,13 +392,32 @@ mod tests {
         assert!(c.take(now+Duration::from_secs(120)).is_empty());
     }
     #[test]
-    fn startup_navigation_manual_and_many_ticks_share_one_queue() {
+    fn manual_restart_retires_old_results_and_coalesces_clicks_into_one_fresh_batch() {
         let now=Instant::now();let mut c=catalog(now);let work=c.take(now);assert_eq!(work.len(),2);
         for i in 0..1000 {c.request(None,true,now+Duration::from_secs(i));assert!(c.take(now+Duration::from_secs(i)).is_empty());}
         assert_eq!(c.entries.len(),2);
-        assert!(c.accept(&work[0],&json!({"status":"ok","delay":1501}),now,100));
-        assert_eq!(c.view(now)["results"]["a"]["delay"],1501);
-        assert_eq!(c.view(now)["pending"].as_array().unwrap().len(),1);
+        assert!(!c.current(&work[0]));
+        assert!(!c.accept(&work[0],&json!({"status":"ok","delay":1501}),now,100));
+        assert_eq!(c.view(now)["pending"].as_array().unwrap().len(),2);
+        c.batch_running=false;
+        let fresh=c.take(now+Duration::from_secs(1000));assert_eq!(fresh.len(),2);
+        assert_ne!(fresh[0].attempt,work[0].attempt);
+        assert!(!c.accept(&work[0],&json!({"status":"ok","delay":1}),now,101));
+        for job in &fresh {assert!(c.accept(job,&json!({"status":"ok","delay":42}),now,102));}
+        assert_eq!(c.view(now)["pending"].as_array().unwrap().len(),0);
+    }
+    #[test]
+    fn restarting_one_node_keeps_other_tickets_and_clears_stale_success() {
+        let now=Instant::now();let mut c=catalog(now);let first=c.take(now);
+        c.accept(&first[0],&json!({"status":"ok","delay":25}),now,100);
+        c.request(Some("a"),true,now);
+        assert!(c.view(now)["results"]["a"]["delay"].is_null());
+        assert!(c.current(&first[1]));
+        assert!(c.accept(&first[1],&json!({"status":"ok","delay":35}),now,101));
+        c.batch_running=false;let fresh=c.take(now);
+        assert_eq!(fresh.len(),1);assert_eq!(fresh[0].name,"a");
+        c.request(Some("a"),true,now);
+        assert!(!c.accept(&fresh[0],&json!({"status":"ok","delay":40}),now,102));
     }
     #[test]
     fn successive_cycles_failure_retry_and_expiry_use_controlled_time() {

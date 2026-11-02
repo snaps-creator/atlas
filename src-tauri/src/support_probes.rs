@@ -9,6 +9,40 @@ fn error_chain(error: &(dyn Error + 'static)) -> String {
     while let Some(e) = source { parts.push(e.to_string()); source = e.source(); }
     parts.join(" -> ")
 }
+fn failed_addresses(failure: &Value) -> Vec<std::net::SocketAddr> {
+    let pattern=regex::Regex::new(r"(?:dial tcp |--> )(\[[0-9a-fA-F:]+\]|[0-9.]+):([0-9]+)").unwrap();
+    let mut addresses=Vec::new();
+    for line in failure["logs"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if !line.contains("error:") {continue;}
+        for capture in pattern.captures_iter(line) {
+            if let Ok(address)=format!("{}:{}",&capture[1],&capture[2]).parse::<std::net::SocketAddr>() {
+                if !address.ip().is_loopback() && !addresses.contains(&address) {addresses.push(address);}
+                if addresses.len()>=6 {return addresses;}
+            }
+        }
+    }
+    addresses
+}
+pub(crate) fn failed_endpoint_checks(failure: &Value) -> Value {
+    let addresses=failed_addresses(failure);
+    let started=crate::model::now();
+    let results=std::thread::scope(|scope| {
+        let workers:Vec<_>=addresses.iter().map(|address|scope.spawn(move || {
+            let start=Instant::now();let result=std::net::TcpStream::connect_timeout(address,Duration::from_secs(3));
+            match result {Ok(socket)=>json!({"endpoint":address.to_string(),"tcpConnected":true,"localAddress":socket.local_addr().ok().map(|a|a.to_string()),"elapsedMs":start.elapsed().as_millis()}),
+                Err(error)=>json!({"endpoint":address.to_string(),"tcpConnected":false,"elapsedMs":start.elapsed().as_millis(),"errorKind":format!("{:?}",error.kind()),"osError":error.raw_os_error(),"error":error.to_string()})}
+        })).collect();
+        workers.into_iter().map(|w|w.join().unwrap_or_else(|_|json!({"error":"TCP probe panicked"}))).collect::<Vec<_>>()
+    });
+    let routes=if addresses.is_empty() {json!({"skipped":"No numeric failed endpoints were captured"})} else {
+        let ips=addresses.iter().map(|a|format!("'{}'",a.ip())).collect::<Vec<_>>().join(",");
+        let script=format!("$ErrorActionPreference='Stop'; @({ips}) | ForEach-Object {{ Find-NetRoute -RemoteIPAddress $_ | Select-Object InterfaceAlias,InterfaceIndex,IPAddress,DestinationPrefix,NextHop,RouteMetric }} | ConvertTo-Json -Depth 4");
+        let mut command=std::process::Command::new("powershell.exe");command.args(["-NoProfile","-NonInteractive","-Command",&script]);
+        json!({"text":crate::support_report::run_bounded(command,Duration::from_secs(12)).unwrap_or_else(|e|e)})
+    };
+    json!({"startedAt":started,"completedAt":crate::model::now(),"failureAt":failure["at"],"results":results,"routeLookup":routes,
+        "scope":"Current Windows default path, possibly through active TUN/WFP. TCP handshake only, not TLS or proxy authentication. Compare with incident time; this is not an independent ISP bypass and a timeout cannot identify the blocking party."})
+}
 fn http(endpoint: &str, proxy: bool) -> Value {
     http_with(endpoint,proxy.then_some("http://127.0.0.1:17890"),Duration::from_secs(6))
 }
@@ -134,6 +168,9 @@ pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
     // Query a bounded set of nodes individually. Unlike /group/delay this does
     // not ForceSet AUTO's selection. Include last failed and working histories.
     let resolver = client.as_ref().filter(|_|Instant::now()<deadline).map(upstream_dns);
+    // Explicit export only: one bounded transfer, no fallback to a direct client.
+    let transfer=client.as_ref().map(|c|crate::transfer_probe::run(&c.mixed_proxy_url(),deadline))
+        .unwrap_or_else(||json!({"outcome":"skipped","reason":"no_core_client"}));
     let node_tests = client.map(|c| {
         if Instant::now() >= deadline { return json!({"error":"Export deadline reached before node tests","tested":0}); }
         match c.api("GET","/proxies",None) {
@@ -167,13 +204,19 @@ pub fn run(client: Option<ApiClient>, deadline: Instant) -> Value {
         }
         Err(e) => json!({"error":e,"tested":0}),
     }}).unwrap_or_else(||json!({"error":"No captured core client; node probes skipped","tested":0}));
-    json!({"startedAt":started_at,"completedAt":crate::model::now(),"http":http_results,"localDns":local_dns,"upstreamDns":resolver,"nodeTests":node_tests,
+    json!({"startedAt":started_at,"completedAt":crate::model::now(),"http":http_results,"transfer":transfer,"localDns":local_dns,"upstreamDns":resolver,"nodeTests":node_tests,
         "scope":"Windows path obeys active TUN/WFP/rules; it is NOT an independent physical bypass. Mixed proxy obeys Atlas rules. HTTP success need not imply every VPN node works."})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn endpoint_probes_use_only_bounded_numeric_failed_peers() {
+        let failure=json!({"logs":["[TCP] --> 194.87.119.7:443 error: dial tcp 194.87.119.7:443: i/o timeout",
+            "[TCP] --> 127.0.0.1:9999 error: refused","[TCP] --> arbitrary.example:443 error: failed"]});
+        assert_eq!(failed_addresses(&failure),vec!["194.87.119.7:443".parse::<std::net::SocketAddr>().unwrap()]);
+    }
     use std::io::{Read,Write};
     #[test]
     fn dns_failures_are_classified_without_claiming_every_timeout_is_nxdomain() {

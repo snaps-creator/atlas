@@ -44,6 +44,10 @@ pub fn launch(root: &Path, autostart: bool) -> Result<(), String> {
     // switch the selected payload between verification and process creation.
     // The desktop takes its own admission lease during setup after we release it.
     let transaction = Transaction::open(root)?;
+    if crate::update_bootstrap::deferred_matches(root,&transaction) {
+        drop(transaction);
+        return crate::update_install::elevated(&root.join("AtlasUpdater.exe"),"--activate-prepared");
+    }
     if !launchable(transaction.journal.stage) {
         // An interrupted update (including reboot) is reconciled through the
         // same supervisor. Release its mutex before the elevated helper opens it.

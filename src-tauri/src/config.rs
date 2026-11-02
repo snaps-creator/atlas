@@ -30,6 +30,8 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         return Err("Интервал проверки серверов должен быть от 30 секунд до 60 минут".into());
     }
     let mut proxies = s.servers();
+    let internal: std::collections::HashSet<_>=proxies.iter().filter(|n|crate::transport_guard::is_variant(n))
+        .filter_map(|n|n["name"].as_str().map(str::to_owned)).collect();
     let probe_proxies:Vec<_>=proxies.iter().filter_map(|n|n.get("atlas-probe").filter(|v|v.is_object()).cloned()).collect();
     let xray=proxies.iter().any(|n|n["type"]=="xray" || n["atlas-xray-bridge"]==true);
     // Shape-only validation. Runtime preparation supplies actual authenticated
@@ -37,7 +39,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
     for node in &mut proxies {
         if node["type"]=="xray" {*node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":9});}
         if let Some(fields) = node.as_object_mut() {
-            for key in ["atlas-xray-bridge", "extraParams", "atlas", "atlas-probe"] { fields.remove(key); }
+            for key in ["atlas-xray-bridge", "extraParams", "atlas", "atlas-probe", crate::transport_guard::MARKER] { fields.remove(key); }
         }
     }
     if proxies.is_empty() {
@@ -74,7 +76,7 @@ pub fn generate(s: &Settings, secret: &str) -> Result<String, String> {
         }
     }
     let mut selection = vec![s.selected.clone(), "AUTO".into(), "FAILOVER".into()];
-    selection.extend(names.clone());
+    selection.extend(names.iter().filter(|n|!internal.contains(*n)).cloned());
     let mut seen = std::collections::HashSet::new();
     selection.retain(|n| seen.insert(n.clone()));
     // Probe-only adapters never enter selectors or the subscription list.
