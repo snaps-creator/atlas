@@ -66,6 +66,7 @@ export type Snapshot = {
   refreshingSubscriptions?: string[];
   buildId?: string;
   revision?: number;
+  diagnosticEpoch?: number;
   settings: Settings;
   status: string;
   running: boolean;

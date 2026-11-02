@@ -8,10 +8,18 @@ export function matchingLatencies(snapshot: LatencySnapshot, identities: Record<
 // The backend owns probes. These reads only deliver current results, including
 // after a hidden WebView resumes; no React timer starts a competing network pass.
 export function startLatencyPolling(read:()=>Promise<LatencySnapshot>, publish:(value:LatencySnapshot)=>void) {
-  let stopped=false, pending=false, again=false;
+  let stopped=false, pending=false, again=false, lastRead=-Infinity;
+  let scheduled: ReturnType<typeof setTimeout> | undefined;
   async function wake() {
     if (stopped) return;
     if (pending) {again=true;return;}
+    const wait=250-(Date.now()-lastRead);
+    if (wait>0) {
+      scheduled ??= setTimeout(()=>{scheduled=undefined;void wake();},wait);
+      return;
+    }
+    if (scheduled) {clearTimeout(scheduled);scheduled=undefined;}
+    lastRead=Date.now();
     pending=true;
     try {const value=await read();if (!stopped) publish(value);}
     catch { /* The existing application status channel reports IPC failures. */ }
@@ -19,5 +27,5 @@ export function startLatencyPolling(read:()=>Promise<LatencySnapshot>, publish:(
   }
   void wake();
   const timer=setInterval(()=>void wake(),1000);
-  return {wake,stop:()=>{stopped=true;clearInterval(timer);}};
+  return {wake,stop:()=>{stopped=true;clearInterval(timer);if(scheduled)clearTimeout(scheduled);}};
 }

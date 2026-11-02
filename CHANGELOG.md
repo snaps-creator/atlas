@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.2.3 (local, unpublished)
+
+- Run up to 32 server checks concurrently, with a two-second discovery pass and full ten-second retries for nodes that need more time.
+- Prioritize requested, selected, favorite and visible nodes; refresh healthy results without waiting for the entire catalogue.
+- Preserve still-fresh measurements during refresh without extending their age. Keep existing visible status labels.
+- Verify slow healthy nodes, bounded concurrency, service admission and background refresh without an open server page.
+
+## 3.2.2 (local, unpublished)
+
+- Continue initial AUTO searches across connection attempts instead of repeating the same failed subset.
+- Preserve complete LAN incident evidence and subscription refresh outcomes; collect and save finished reports to Downloads.
+- View and manage rules and subscriptions on LAN peers with explicit write permission and revision checks.
+- Support deferred local activation and replacement of a matching, unactivated prepared update without stopping the current session.
+
 ## 3.0.4 (unpublished)
 
 - Preserve controller HTTP timeout evidence while allowing bounded aggregation time for group health checks.

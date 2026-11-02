@@ -18,6 +18,7 @@ mod probe_state;
 #[cfg(test)]
 mod probe_integration_tests;
 mod resilient_selection;
+mod path_quality;
 mod model;
 mod network_guard;
 mod recovery;
@@ -25,6 +26,7 @@ mod network_change;
 mod portable;
 mod published_state;
 mod process_stop;
+mod command_queue;
 mod query_jobs;
 mod query_admission;
 mod rule_probe;
@@ -34,14 +36,19 @@ mod session_cleanup;
 mod storage;
 mod subscriptions;
 mod xray_config;
+mod transport_guard;
 mod xray_runtime;
 mod subscription_options;
 mod subscription_refresh;
+mod subscription_evidence;
+mod service_check;
+mod network_ping;
 mod recovery_notification;
 #[cfg(test)]
 mod site_checks;
 mod support_report;
 mod support_probes;
+mod transfer_probe;
 mod incident_history;
 mod interface_evidence;
 mod lan_diagnostics;
@@ -71,6 +78,7 @@ struct App {
     published: published_state::PublishedState,
     reads: published_state::ReadState,
     diagnostic_access: support_report::Access,
+    service_checks: Arc<service_check::Coordinator>,
     cancellation: cancellation::Cancellation,
     settings: Settings,
     store: storage::Store,
@@ -129,6 +137,7 @@ impl App {
         value["recovery"] = if running {self.recovery.clone()} else {Value::Null};
         value["refreshingSubscriptions"] = json!(subscription_refresh::active());
         value["revision"] = json!(self.revision);
+        value["diagnosticEpoch"] = json!(self.service_checks.epoch());
         self.published.set(value.clone());
         value
     }
@@ -891,6 +900,9 @@ async fn request_inner(
         return Err("Atlas завершает работу".into());
     }
     if action == "diagnostics_export" {
+        let last_failure=app.state::<published_state::ReadState>().get().ok()
+            .and_then(|s|std::fs::read_to_string(s.directory.join("last-session-failure.json")).ok())
+            .and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
         // Export must remain usable while connect/apply holds the application lock.
         let tun_interface = network_guard::tun_diagnostic();
         let (context, client, secrets) = match shared.try_lock() {
@@ -903,13 +915,13 @@ async fn request_inner(
                     "activeCheckIntervalSeconds":10,"autoSearchPingMs":a.settings.auto_search_ping_ms,
                     "error":a.error,"logs":a.logs,"tunInterface":tun_interface,
                     "competingVpn":network_guard::competing_route_diagnostic(),
-                    "connectionConfiguration":support_report::configuration_evidence(&a.settings),
+                    "connectionConfiguration":support_report::configuration_evidence(&a.settings),"lastSessionFailure":last_failure,
                     "uiPoolHealth":payload.as_ref().and_then(|v|v.get("poolHealth"))});
                 (serde_json::to_string_pretty(&context).map_err(|e| e.to_string())?, Some(a.core.client()), secrets)
             }
             Err(_) => match app.state::<support_report::Access>().get() {
                 Some(cached) => (json!({"stateRead":"cached: application lock busy","capturedAt":cached.captured_at,
-                    "revision":cached.revision,"connectionConfiguration":cached.configuration,
+                    "revision":cached.revision,"connectionConfiguration":cached.configuration,"lastSessionFailure":last_failure,
                     "publishedState":app.state::<published_state::PublishedState>().get(),
                     "tunInterface":tun_interface}).to_string(),Some(cached.client),cached.secrets),
                 None => ("Atlas занят: кэш диагностической сессии недоступен. Снимок Windows собирается независимо.".into(),None,Vec::new()),
@@ -961,39 +973,43 @@ async fn request_inner(
             .await
             .map_err(|e| e.to_string())?;
     }
+    if action == "site_checks_begin" {
+        return Ok(json!(app.state::<Arc<service_check::Coordinator>>().begin()));
+    }
+    if action == "site_checks_cancel" {
+        let generation = payload.as_ref().and_then(|p|p["generation"].as_u64()).ok_or("Нет номера проверки")?;
+        app.state::<Arc<service_check::Coordinator>>().cancel(generation);
+        return Ok(Value::Null);
+    }
     if action == "site_check" {
         let id = payload
             .as_ref()
             .and_then(|p| p["id"].as_str())
             .ok_or("Нет сервиса")?;
-        let url = match id {
-            "chatgpt" => "https://chatgpt.com",
-            "grok" => "https://grok.com",
-            "gemini" => "https://gemini.google.com",
-            "youtube" => "https://www.youtube.com",
-            "telegram" => "https://web.telegram.org",
-            _ => return Err("Неизвестный сервис".into()),
-        };
+        let url = service_check::endpoint(id).ok_or("Неизвестный сервис")?;
+        let service_id = id.to_owned();
+        let generation = payload.as_ref().and_then(|p|p["generation"].as_u64()).ok_or("Нет номера проверки")?;
+        let revision = payload.as_ref().and_then(|p|p["revision"].as_u64()).ok_or("Нет версии настроек")?;
         let reads = app.state::<published_state::ReadState>().inner().clone();
+        let captured = reads.get()?;
+        if captured.status != "Connected" || captured.revision != revision {
+            return Err("Подключение или настройки изменились. Повторите проверку.".into());
+        }
+        let context = captured.client.context_id();
+        let port = captured.client.diagnostic_proxy_port();
+        let coordinator = app.state::<Arc<service_check::Coordinator>>().inner().clone();
+        if payload.as_ref().and_then(|p|p["epoch"].as_u64()) != Some(coordinator.epoch()) {
+            return Err("Сетевая сессия изменилась. Повторите проверку.".into());
+        }
+        let permit = coordinator.acquire(generation)?;
         return tauri::async_runtime::spawn_blocking(move || {
-            {
-                let a = reads.get()?;
-                if a.status != "Connected" {
-                    return Err("Сначала подключите Atlas".into());
-                }
-            }
-            let client = reqwest::blocking::Client::builder()
-                .proxy(reqwest::Proxy::all("http://127.0.0.1:17890").map_err(|e| e.to_string())?)
-                .timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build().map_err(|e| e.to_string())?;
-            let start = std::time::Instant::now();
-            match client.get(url).send() {
-                Ok(response) => Ok(json!({"ok":response.status().is_success(),"ms":start.elapsed().as_millis(),"status":response.status().as_u16()})),
-                Err(error) => Ok(json!({"ok":false,"ms":null,"status":null,
-                    "errorKind":if error.is_timeout() {"timeout"} else {"network"},
-                    "error":error.to_string()})),
-            }
+            let _permit = permit;
+            let result = json!(network_ping::run(url, port, revision, || {
+                coordinator.current(generation) && reads.get().is_ok_and(|a|
+                    a.revision == revision && a.status == "Connected" && a.client.context_id() == context)
+            }));
+            incident_history::record("site_rtt",json!({"service":service_id,"result":result}),&[]);
+            Ok(result)
         }).await.map_err(|e| e.to_string())?;
     }
     if action == "rule_probe" {
@@ -1061,27 +1077,31 @@ async fn request_inner(
             return Err("Сервер отсутствует в подписках".into());
         }
         let name=name.map(str::to_owned);
+        let visible=payload.as_ref().and_then(|p|p["priority"].as_array()).map(|names|names.iter().take(32).filter_map(Value::as_str).map(str::to_owned).collect());
         let refresh=app.state::<latency_refresh::Refresh>().inner().clone();
         return tauri::async_runtime::spawn_blocking(move ||
-            Ok(refresh.view(&snapshot,name.as_deref(),action != "latency_state")))
+            Ok(refresh.view_with_priority(&snapshot,name.as_deref(),action != "latency_state",visible)))
             .await.map_err(|e|e.to_string())?;
     }
     if action == "refresh_due" {
         subscription_refresh::wake();
         return Ok(Value::Null);
     }
-    if matches!(action.as_str(), "subscription_add" | "subscription_refresh") {
+    if matches!(action.as_str(), "subscription_add" | "subscription_refresh" | "subscription_replace") {
         let captured = app.state::<published_state::ReadState>().get()?;
         return tauri::async_runtime::spawn_blocking(move || {
             let p = payload.unwrap_or(Value::Null);
             let id = p["id"].as_str().map(str::to_owned).unwrap_or_else(||uuid::Uuid::new_v4().to_string());
             let _lease = subscription_refresh::Lease::take(&id).ok_or("Эта подписка уже обновляется")?;
+            let mut attempt=subscription_evidence::Attempt::start(&id,&action);
+            let result=(|| -> Result<Value,String> {
             let entry = keyring::Entry::new("AtlasVPN", &id).map_err(|_|"Хранилище Windows недоступно")?;
             let adding = action == "subscription_add";
+            let replacing = action == "subscription_replace";
             let source=if adding {
                 serde_json::from_value(p["source"].clone()).map_err(|_|"Укажите источник подписки")?
             } else {captured.settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка не найдена")?.source};
-            let url = if adding { p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned() }
+            let url = if adding || replacing { p["url"].as_str().ok_or("Введите HTTPS URL")?.to_owned() }
                 else { entry.get_password().map_err(|_|"Ссылка подписки отсутствует в хранилище Windows")? };
             if source==SubscriptionSource::Url {subscription_options::https_url(&url)?;}
             else if !url.trim().starts_with("vless://") {return Err("Введите один VLESS-ключ".into());}
@@ -1090,6 +1110,9 @@ async fn request_inner(
                 .map(|s|s.options.clone()).unwrap_or_default();
             let downloaded = subscriptions::download(&url, captured.status == "Connected", &options);
             let mut a = shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
+            if p["remoteRevision"].as_u64().is_some_and(|revision|revision!=a.revision) {
+                return Err("Настройки уже изменились. Обновите список и повторите действие.".into());
+            }
             if app.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("Atlas завершает работу".into());
             }
@@ -1099,7 +1122,10 @@ async fn request_inner(
                 return Err("Подписка уже изменена; результат загрузки не применён".into());
             }
             match downloaded {
-                Ok(nodes) => a.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned), adding.then_some(entry),source)?,
+                Ok(nodes) => {
+                    let result=a.install_subscription(id, url, nodes, p["name"].as_str().map(str::to_owned), (adding || replacing).then_some(entry),source);
+                    result?;
+                }
                 Err(error) => {
                     if let Some(sub) = a.settings.subscriptions.iter_mut().find(|s|s.id == id) { sub.error=Some(error.clone()); }
                     let settings = a.settings.clone();
@@ -1109,6 +1135,9 @@ async fn request_inner(
                 }
             }
             Ok(a.snapshot())
+            })();
+            attempt.finish(if result.is_ok(){"applied"}else{"failed"},result.as_ref().err().map(String::as_str));
+            result
         }).await.map_err(|e|e.to_string())?;
     }
     let settings_change = if action == "save" {
@@ -1120,6 +1149,8 @@ async fn request_inner(
     } else { None };
     tauri::async_runtime::spawn_blocking(move || {
         let _settings_change = settings_change;
+        let admission=app.state::<command_queue::Queue>();
+        let _permit=admission.acquire(&action,std::time::Duration::from_secs(240),None)?;
         let queued=std::time::Instant::now();
         // Only mutations are serialized. Readers use ReadState and never wait
         // for this lock; queued mutations do not fail just because another runs.
@@ -1132,7 +1163,11 @@ async fn request_inner(
         let command_id=format!("{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
         incident_history::record("command_started",json!({"id":command_id,"action":action,
             "waitedMs":waited_ms,"revision":a.revision}),&[]);
-        let result = a.dispatch(&app, &action, payload.unwrap_or(Value::Null));
+        let payload=payload.unwrap_or(Value::Null);
+        if payload["remoteRevision"].as_u64().is_some_and(|revision|revision!=a.revision) {
+            return Err("Настройки уже изменились. Обновите список и повторите действие.".into());
+        }
+        let result = a.dispatch(&app, &action, payload);
         incident_history::record("command_completed",json!({"id":command_id,"action":action,
             "waitedMs":waited_ms,"executionMs":started.elapsed().as_millis(),
             "success":result.is_ok(),"error":result.as_ref().err(),"revision":a.revision}),&[]);
@@ -1142,6 +1177,36 @@ async fn request_inner(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+fn remote_management(app: &tauri::AppHandle, request: &Value) -> Result<Value,String> {
+    let operation=request["operation"].as_str().ok_or("Нет операции")?;
+    if operation!="view" {
+        let snapshot=app.state::<published_state::ReadState>().get()?;
+        let revision=request["payload"]["revision"].as_u64().ok_or("Нет версии настроек")?;
+        if revision!=snapshot.revision {return Err("Настройки уже изменились. Обновите список и повторите действие.".into());}
+        let (action,payload)=if operation=="rules_save" {
+            let groups:Vec<model::RuleGroup>=serde_json::from_value(request["payload"]["groups"].clone()).map_err(|_|"Некорректный список правил")?;
+            if groups.len()>512 || groups.iter().map(|g|g.rules.len()).sum::<usize>()>20000 {return Err("Слишком много правил".into());}
+            let mut settings=snapshot.settings.clone();settings.groups=groups;
+            ("save",json!({"revision":revision,"settings":settings}))
+        } else {
+            let action=match operation {
+                "subscription_add"=>"subscription_add","subscription_replace"=>"subscription_replace",
+                "subscription_rename"=>"subscription_rename","subscription_refresh"=>"subscription_refresh",
+                "subscription_delete"=>"subscription_delete","subscription_user_agent"=>"subscription_user_agent",
+                _=>return Err("Неизвестная операция удалённого управления".into())
+            };
+            let mut payload=request["payload"].clone();payload["remoteRevision"]=json!(revision);
+            // Addition creates an identity on the target, never replaces an arbitrary source.
+            if operation=="subscription_add" {payload.as_object_mut().ok_or("Нет параметров")?.remove("id");}
+            (action,payload)
+        };
+        tauri::async_runtime::block_on(Box::pin(request_inner(app.clone(),app.state::<Shared>(),action.into(),Some(payload))))?;
+        incident_history::record("lan_settings_changed",json!({"operation":operation}),&[]);
+    }
+    let published=app.state::<published_state::PublishedState>().get();
+    Ok(json!({"revision":published["revision"],"status":published["status"],
+        "groups":published["settings"]["groups"],"subscriptions":published["settings"]["subscriptions"]}))
 }
 fn persist_window_hidden(app:&tauri::AppHandle,hidden:bool) {
     let visibility=app.state::<WindowVisibility>().0.clone();
@@ -1164,6 +1229,7 @@ pub fn run() {
     if let Err(error) = shell_identity::process() { eprintln!("Atlas identity: {error}"); }
     tauri::Builder::default()
         .manage(window_activation::Activation::default())
+        .manage(command_queue::Queue::default())
         .manage(ManualRestart(std::sync::atomic::AtomicBool::new(false)))
         .runtime(tauri_runtime_cef::Cef::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1220,6 +1286,8 @@ pub fn run() {
             app.manage(published.clone());
             let reads = published_state::ReadState::default();
             app.manage(reads.clone());
+            let service_checks = Arc::new(service_check::Coordinator::default());
+            app.manage(service_checks.clone());
             let diagnostic_access = support_report::Access::default();
             app.manage(diagnostic_access.clone());
             let cancellation = cancellation::Cancellation::default();
@@ -1230,6 +1298,7 @@ pub fn run() {
                 published,
                 reads,
                 diagnostic_access,
+                service_checks,
                 cancellation,
                 settings,
                 store,
@@ -1246,8 +1315,11 @@ pub fn run() {
             app.manage(shared.clone());
             let shutdown: ShuttingDown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.manage(shutdown.clone());
+            subscription_evidence::init(&dir);
             let lan=lan_diagnostics::Lan::new(dir.clone(),app.state::<support_report::Access>().inner().clone(),
                 app.state::<published_state::PublishedState>().inner().clone());
+            let remote_app=app.handle().clone();
+            lan.set_manager(move |payload| remote_management(&remote_app,payload));
             lan.start(shutdown.clone());
             app.manage(lan);
             {
@@ -1477,7 +1549,10 @@ pub fn run() {
                         || handle.state::<ShuttingDown>().load(std::sync::atomic::Ordering::SeqCst) { break; }
                     if update_health::pending() {continue;}
                     let network_changed = uplink.tick();
-                    if network_changed {handle.state::<latency_refresh::Refresh>().invalidate();}
+                    if network_changed {
+                        handle.state::<latency_refresh::Refresh>().invalidate();
+                        handle.state::<Arc<service_check::Coordinator>>().invalidate();
+                    }
                     // Query the service without holding the mutation lock. A
                     // result from an earlier revision cannot affect a new session.
                     let observed=handle.state::<published_state::ReadState>().get().ok()
@@ -1489,10 +1564,14 @@ pub fn run() {
                         a.recovery=recovery.unwrap_or(Value::Null);
                         match result {
                             Ok((running,session))=>{
-                                if probe_session.as_ref().is_some_and(|previous|previous!=&session) {handle.state::<latency_refresh::Refresh>().invalidate();}
+                                if probe_session.as_ref().is_some_and(|previous|previous!=&session) {
+                                    handle.state::<latency_refresh::Refresh>().invalidate();
+                                    a.service_checks.invalidate();
+                                }
                                 probe_session=Some(session);a.control_error=None;Some(running)
                             },
                             Err(error)=>{
+                                a.service_checks.invalidate();
                                 if a.control_error.as_ref()!=Some(&error) {
                                     a.log("WARN",&format!("Проверка состояния службы: {error}"));
                                 }

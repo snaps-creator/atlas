@@ -138,6 +138,7 @@ fn receive_cancellable(file: &mut File, timeout: Duration, running: Option<&std:
     serde_json::from_slice(&data).map_err(|_| "Некорректный ответ сетевой службы".into())
 }
 pub struct Broker {
+    admission: crate::command_queue::Queue,
     pipe: Mutex<Option<File>>,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -216,7 +217,7 @@ impl Broker {
                 nonblocking(&file)?;
                 receive_service_ready(&mut file, running)?;
                 return Ok(Self {
-                    pipe: Mutex::new(Some(file)),
+                    admission: Default::default(), pipe: Mutex::new(Some(file)),
                 });
             }
             if Instant::now() >= deadline {
@@ -253,6 +254,7 @@ impl Broker {
     }
     pub fn call_cancellable(&self, op: &str, payload: Value, running: Option<&std::sync::atomic::AtomicBool>) -> Result<Value, String> {
         let queued=Instant::now();
+        let _permit=self.admission.acquire(op, Duration::from_secs(2), running)?;
         let request_id=uuid::Uuid::new_v4().to_string();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut slot = loop {
@@ -472,12 +474,20 @@ fn allowed_api(method: &str, path: &str) -> bool {
                 "url" => v == crate::latency::DISPLAY_URL || crate::latency::ENDPOINTS.contains(&v.as_ref()),
                 "timeout" => v.parse::<u64>().is_ok_and(|n| n <= 10000),
                 "expected" => v == "204" || v == "200",
-                  "atlas_probe" => v == "1",
+                "atlas_probe" | "atlas_quick" => v == "1",
                 _ => false,
             });
         }
     }
     false
+}
+#[cfg(test)]
+#[test]
+fn discovery_paths_pass_service_admission_with_only_supported_flags() {
+    let base=format!("/proxies/node/delay?timeout=2000&expected=204&atlas_probe=1&url={}",crate::latency::encode_name(crate::latency::DISPLAY_URL));
+    assert!(allowed_api("GET",&format!("{base}&atlas_quick=1")));
+    assert!(!allowed_api("GET",&format!("{base}&atlas_quick=2")));
+    assert!(!allowed_api("GET",&format!("{base}&unknown=1")));
 }
 struct PipeWatch {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -695,7 +705,7 @@ impl HealthState {
             let s = settings.as_ref().unwrap();
             let restarted = core.start(s)
                 .and_then(|_| guard.as_ref().ok_or_else(|| "Защита сети недоступна".to_owned())?.install(&core.binary))
-                .and_then(|_| confirm_route(&core.client(), s, &crate::latency::ENDPOINTS));
+                .and_then(|_| confirm_route(&core.client(), &core.directory, s, &crate::latency::ENDPOINTS));
             if restarted.is_ok() {
                 *configured = true;
                 *session_id = Some(uuid::Uuid::new_v4());
@@ -775,7 +785,9 @@ fn path_verdict(results: impl IntoIterator<Item=Result<Value,String>>) -> Option
     if failures>=2 && !uncertain { Some(false) } else { None }
 }
 
-fn confirm_route(client: &crate::core::ApiClient, settings: &Settings, controls: &[&str]) -> Result<Option<String>, String> {
+fn confirm_route(client: &crate::core::ApiClient, directory: &std::path::Path, settings: &Settings, controls: &[&str]) -> Result<Option<String>, String> {
+    let runtime_settings=crate::transport_guard::runtime_settings(settings);
+    let settings=&runtime_settings;
     let proxies = client.api("GET", "/proxies", None)?;
     let name = if matches!(settings.selected.as_str(), "AUTO" | "FAILOVER") {
         proxies["proxies"][settings.selected.as_str()]["now"].as_str()
@@ -790,9 +802,9 @@ fn confirm_route(client: &crate::core::ApiClient, settings: &Settings, controls:
     }
     let blocked = settings.servers().iter().filter(|n|n["name"] == name)
         .map(crate::resilient_selection::node_key).collect();
-    let alternatives = crate::resilient_selection::verify(client, settings, &blocked, controls);
+    let alternatives = crate::resilient_selection::verify_progressive(client, settings, &blocked, controls, Some(&directory.join("startup-search.json")));
     let candidate = alternatives["candidate"].as_str()
-        .ok_or("Ни один из первых резервных узлов не подтвердил доступность; подключение остаётся в защищённой паузе")?;
+        .ok_or("Проверенные резервные узлы не подтвердили доступность; следующая попытка продолжит поиск по каталогу")?;
     let group = settings.selected.as_str();
     client.api("PUT", &format!("/proxies/{group}"), Some(json!({"name":candidate})))?;
     if client.api("GET", &format!("/proxies/{group}"), None)?["now"] != candidate {
@@ -812,7 +824,7 @@ fn confirm_session(core: &mut Core, guard: &network_guard::Guard, settings: &Set
             Err(_) => thread::sleep(Duration::from_millis(100)),
         }
     }
-    confirm_route(&core.client(), settings, &crate::latency::ENDPOINTS).map(|_| ())
+    confirm_route(&core.client(), &core.directory, settings, &crate::latency::ENDPOINTS).map(|_| ())
 }
 fn abandon_session(core: &mut Core, guard: &mut Option<network_guard::Guard>,
     configured: &mut bool, active_settings: &mut Option<Settings>, reason: String) -> Result<Value, String> {
@@ -823,6 +835,8 @@ fn abandon_session(core: &mut Core, guard: &mut Option<network_guard::Guard>,
         crate::support_report::collect_secrets(&serde_json::to_value(settings).unwrap_or(Value::Null), &mut secrets);
     }
     let evidence = json!({"at":crate::model::now(),"stage":"session_abandon_before_cleanup",
+        "tun":crate::network_guard::tun_diagnostic(),"coreRunning":core.running(),
+        "proxies":core.client().api("GET","/proxies",None).map(|v|crate::support_report::proxy_evidence(&v)).unwrap_or_else(|e|json!({"error":e})),
         "reason":reason,"logs":logs.iter().rev().take(256).collect::<Vec<_>>(),
         "failures":crate::support_report::failure_evidence(&logs)});
     let path = core.directory.join("last-session-failure.json");
@@ -909,13 +923,20 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                 }
                 let jobs: Vec<_> = paths.into_iter().map(|path| {
                     let client = core.client();
-                    match queries.start_keyed(true, Some(path.clone()), move |cancelled|
+                    match queries.start_fresh_delay(path.clone(), move |cancelled|
                         client.api_cancellable("GET", &path, None, Some(&cancelled))) {
                         Ok(id) => json!({"id":id}),
                         Err(error) => json!({"error":error}),
                     }
                 }).collect();
                 Ok(json!(jobs))
+            }
+            "delay_cancel" => {
+                let ids: Vec<String> = serde_json::from_value(payload["ids"].clone())
+                    .map_err(|_| "Нет проверок")?;
+                if ids.len() > crate::latency::DISPLAY_WORKERS { return Err("Слишком много проверок".into()); }
+                for id in ids { queries.cancel_delay(&id); }
+                Ok(json!({}))
             }
             "delay_results" => {
                 let ids: Vec<String> = serde_json::from_value(payload["ids"].clone())
@@ -967,7 +988,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                     ExistingSessionAction::Reconcile => {
                     let previous = active_settings.clone().ok_or("Нет активной конфигурации службы")?;
                     core.preflight_verified(&s, |probe|
-                        confirm_route(&probe.client(), &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
+                        confirm_route(&probe.client(), &probe.directory, &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
                     // The desktop may have restarted with newer persisted
                     // settings than the still-running service. Reconcile the
                     // existing core transactionally instead of rejecting the
@@ -1039,7 +1060,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                         Err(_) => thread::sleep(Duration::from_millis(100)),
                     }
                 }
-                if let Err(error) = confirm_route(&core.client(), &s, &crate::latency::ENDPOINTS) {
+                if let Err(error) = confirm_route(&core.client(), &core.directory, &s, &crate::latency::ENDPOINTS) {
                         explicit_stop = true;
                         return abandon_session(core, guard, configured, active_settings,
                             format!("Путь через сервер не подтверждён: {error}"));
@@ -1071,7 +1092,7 @@ fn run_channel(mut pipe: File, state: &mut Controller, desktop_owner_pid: u32) -
                     return Ok(json!({"running":true,"policyUpdated":true}));
                 }
                 core.preflight_verified(&s, |probe|
-                    confirm_route(&probe.client(), &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
+                    confirm_route(&probe.client(), &probe.directory, &s, &crate::latency::ENDPOINTS).map(|_| ()))?;
                 queries.invalidate();
                 *network_epoch = network_epoch.wrapping_add(1);
                 recovery.configuration_changed();
@@ -1431,9 +1452,38 @@ mod tests {
     }
 
     #[test]
+    fn restarted_batch_releases_pending_probe_without_stopping_service() {
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let (mut server,client)=pipe_pair();
+        let broker=Broker {admission:Default::default(),pipe:Mutex::new(Some(client))};
+        let (finished,acknowledged)=std::sync::mpsc::channel();
+        let worker=thread::spawn(move || {
+            let request=receive(&mut server,Duration::from_secs(3)).unwrap();
+            assert_eq!(request["op"],"delay_many");
+            send(&mut server,&json!({"result":[{"id":"old"}]})).unwrap();
+            let request=receive(&mut server,Duration::from_secs(3)).unwrap();
+            assert_eq!(request["op"],"delay_results");
+            send(&mut server,&json!({"result":[{"id":"old","done":false}]})).unwrap();
+            let request=receive(&mut server,Duration::from_secs(3)).unwrap();
+            assert_eq!(request["op"],"delay_cancel");
+            assert_eq!(request["payload"]["ids"],json!(["old"]));
+            send(&mut server,&json!({"result":{}})).unwrap();
+            acknowledged.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let current=AtomicBool::new(true);
+        let result=crate::latency::service_batch_stream_cancel(&broker,&["node".into()],
+            crate::latency::DISPLAY_URL,crate::latency::DISPLAY_TIMEOUT_MS,
+            &|_,value| {assert_eq!(value["status"],"testing");current.store(false,Ordering::SeqCst);},
+            &|_|current.load(Ordering::SeqCst)).unwrap();
+        assert_eq!(result,json!({}));
+        assert!(broker.alive());
+        finished.send(()).unwrap();worker.join().unwrap();
+    }
+
+    #[test]
     fn batch_transport_refills_before_slow_reply_and_preserves_every_result() {
         let (mut server, client) = pipe_pair();
-        let broker = Broker { pipe: Mutex::new(Some(client)) };
+        let broker = Broker { admission: Default::default(), pipe: Mutex::new(Some(client)) };
         let count = crate::latency::DISPLAY_WORKERS + 3;
         let names: Vec<_> = (0..count).map(|i|format!("node-{i}")).collect();
         let (consumed, acknowledged) = std::sync::mpsc::channel();
@@ -1507,7 +1557,7 @@ mod tests {
         let (server, client) = pipe_pair();
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let _watch = PipeWatch::start(&server, running.clone()).unwrap();
-        let broker = std::sync::Arc::new(Broker { pipe: Mutex::new(Some(client)) });
+        let broker = std::sync::Arc::new(Broker { admission: Default::default(), pipe: Mutex::new(Some(client)) });
         let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker_broker = broker.clone();
         let worker_cancel = cancellation.clone();
@@ -1596,7 +1646,7 @@ mod tests {
             }
         });
         let broker = std::sync::Arc::new(Broker {
-            pipe: Mutex::new(Some(client)),
+            admission: Default::default(), pipe: Mutex::new(Some(client)),
         });
         let workers: Vec<_> = (0..8)
             .map(|i| {
@@ -1639,7 +1689,7 @@ mod tests {
 #[test]
 fn busy_channel_is_not_reported_as_a_crashed_core() {
     let broker = Broker {
-        pipe: Mutex::new(None),
+        admission: Default::default(), pipe: Mutex::new(None),
     };
     let lock = broker.pipe.lock().unwrap();
     assert!(broker.alive());

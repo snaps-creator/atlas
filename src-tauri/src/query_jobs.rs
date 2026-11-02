@@ -12,6 +12,15 @@ pub struct QueryJobs {
     epoch: u64,
 }
 impl QueryJobs {
+    /// Release only this caller's URL-test subscription. An operational read or
+    /// a second subscriber to the same work must survive a manual batch restart.
+    pub fn cancel_delay(&mut self, id: &str) {
+        if !self.jobs.get(id).is_some_and(|job|job.delay) { return; }
+        let job=self.jobs.remove(id).unwrap();
+        if !self.jobs.values().any(|other|Arc::ptr_eq(&job.work,&other.work)) {
+            job.work.cancelled.store(true,Ordering::SeqCst);
+        }
+    }
     /// A selector change invalidates route observations, not URL tests of
     /// concrete nodes. Group tests depend on the selection and are cancelled.
     pub fn selection_changed(&mut self, node_paths: &HashSet<String>) {
@@ -36,12 +45,19 @@ impl QueryJobs {
         self.start_keyed(delay, None, query)
     }
     pub fn start_keyed(&mut self, delay: bool, key: Option<String>, query: impl FnOnce(Arc<AtomicBool>) -> Reply + Send + 'static) -> Result<String, String> {
+        self.start_work(delay, key, true, query)
+    }
+    /// A new display cycle must not subscribe to a probe started before it.
+    pub fn start_fresh_delay(&mut self, key: String, query: impl FnOnce(Arc<AtomicBool>) -> Reply + Send + 'static) -> Result<String, String> {
+        self.start_work(true, Some(key), false, query)
+    }
+    fn start_work(&mut self, delay: bool, key: Option<String>, reuse: bool, query: impl FnOnce(Arc<AtomicBool>) -> Reply + Send + 'static) -> Result<String, String> {
         self.jobs.retain(|_, job| {
             let keep = job.started.elapsed() < Duration::from_secs(45);
             if !keep { job.work.cancelled.store(true, Ordering::SeqCst); }
             keep
         });
-        let shared = key.as_ref().and_then(|key| self.jobs.values()
+        let shared = key.as_ref().filter(|_|reuse).and_then(|key| self.jobs.values()
             .find(|job| job.delay == delay && job.key.as_ref() == Some(key)
                 && job.work.state.lock().is_ok_and(|state| state.completed.is_none()))
             .map(|job| (job.started, job.work.clone())));
@@ -101,6 +117,48 @@ impl Drop for QueryJobs {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn fresh_display_cycle_does_not_reuse_another_callers_inflight_probe() {
+        let mut jobs=QueryJobs::default();
+        let (started,entered)=mpsc::channel();let (resume,waiting)=mpsc::channel();
+        let previous=jobs.start_keyed(true,Some("node".into()),move |_| {
+            started.send(()).unwrap();let _=waiting.recv();Ok(serde_json::json!({"delay":900}))
+        }).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (started,entered)=mpsc::channel();
+        let fresh=jobs.start_fresh_delay("node".into(),move |_| {
+            started.send(()).unwrap();Ok(serde_json::json!({"delay":7}))
+        }).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!Arc::ptr_eq(&jobs.jobs[&previous].work,&jobs.jobs[&fresh].work));
+        assert_eq!(jobs.jobs[&fresh].key.as_deref(),Some("node"));
+        jobs.cancel_delay(&fresh);
+        assert!(!jobs.jobs[&previous].work.cancelled.load(Ordering::SeqCst));
+        resume.send(()).unwrap();
+    }
+    #[test]
+    fn manual_cancel_releases_only_its_subscription_and_last_cancel_stops_the_worker() {
+        let mut jobs=QueryJobs::default();
+        let (entered,started)=mpsc::channel();let (resume,waiting)=mpsc::channel();
+        let first=jobs.start_keyed(true,Some("node".into()),move |cancelled| {
+            entered.send(cancelled).unwrap();let _=waiting.recv();Ok(Value::Null)
+        }).unwrap();
+        let flag=started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second=jobs.start_keyed(true,Some("node".into()),|_|panic!("duplicate")).unwrap();
+        let operational=jobs.start(false,|_|Ok(Value::Null)).unwrap();
+        jobs.cancel_delay(&operational);assert!(jobs.jobs.contains_key(&operational));
+        jobs.cancel_delay(&first);assert!(!flag.load(Ordering::SeqCst));
+        assert!(jobs.poll(&first).is_err());
+        jobs.cancel_delay(&second);assert!(flag.load(Ordering::SeqCst));
+        assert!(jobs.poll(&second).is_err());
+        let fresh=jobs.start_keyed(true,Some("node".into()),|_|Ok(serde_json::json!({"delay":7}))).unwrap();
+        assert_ne!(fresh,first);resume.send(()).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop {
+            if let Some(result)=jobs.poll(&fresh).unwrap(){assert_eq!(result["delay"],7);break;}
+            assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     #[test]
     fn selecting_route_keeps_node_probe_but_cancels_group_and_route_reads() {
         let mut jobs = QueryJobs::default();

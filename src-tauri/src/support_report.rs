@@ -27,13 +27,18 @@ impl Access {
         if let Some(cached) = cached.as_mut().filter(|v|v.revision == revision) {
             cached.client = client;
             cached.captured_at = crate::model::now();
+            cached.configuration["subscriptionStatus"]=crate::subscription_evidence::summary(settings);
             return;
         }
         let mut secrets = Vec::new();
         if let Ok(value) = serde_json::to_value(settings) { collect_secrets(&value,&mut secrets); }
         *cached = Some(Capture {revision,captured_at:crate::model::now(),client,secrets,configuration:configuration_evidence(settings)});
     }
-    pub fn get(&self) -> Option<Capture> { self.0.try_read().ok().and_then(|v|v.clone()) }
+    pub fn get(&self) -> Option<Capture> {
+        self.0.try_read().ok().and_then(|v|v.clone()).map(|mut capture| {
+            crate::subscription_evidence::refresh_attempts(&mut capture.configuration["subscriptionStatus"]);capture
+        })
+    }
 }
 
 pub(crate) fn privileged_snapshot() -> Result<String, String> {
@@ -132,7 +137,7 @@ impl Recorder {
     }
 }
 
-pub(crate) fn automatic_incident(client: crate::core::ApiClient, secrets: Vec<String>, revision: u64) {
+pub(crate) fn automatic_incident(client: crate::core::ApiClient, secrets: Vec<String>, revision: u64) -> Value {
     let before = core_snapshot(Some(&client));
     let deadline = Instant::now() + Duration::from_secs(60);
     let (active, privileged, windows) = std::thread::scope(|scope| {
@@ -148,8 +153,13 @@ pub(crate) fn automatic_incident(client: crate::core::ApiClient, secrets: Vec<St
     });
     crate::incident_history::record("incident_summary",serde_json::json!({"revision":revision,"startedAt":before["startedAt"],
         "completedAt":crate::model::now(),"failures":before["logs"]["evidence"],"http":active["http"],"upstreamDns":active["upstreamDns"]}),&secrets);
+    let after=core_snapshot(Some(&client));
     crate::incident_history::record("automatic_incident",serde_json::json!({"revision":revision,"before":before,
-        "active":active,"privileged":privileged,"windows":windows,"after":core_snapshot(Some(&client))}),&secrets);
+        "active":active,"privileged":privileged,"windows":windows,"after":after}),&secrets);
+    let parts=serde_json::Map::from_iter([("before".into(),before),("active".into(),active),
+        ("privileged".into(),privileged),("windows".into(),json!({"text":windows})),("after".into(),after)]);
+    redact_value(&json!({"revision":revision,"completedAt":crate::model::now(),"observations":conclusions(&parts),
+        "coverage":diagnostic_coverage(&parts),"evidence":parts}),&secrets)
 }
 fn core_snapshot(client: Option<&crate::core::ApiClient>) -> Value {
     let Some(c) = client else { return serde_json::json!({"error":"No captured core session"}); };
@@ -227,7 +237,7 @@ pub(crate) fn configuration_evidence(settings: &crate::model::Settings) -> Value
         }).collect();
         serde_json::json!({"name":sub.name,"source":sub.source,"updatedAt":sub.updated_at,"nodes":nodes})
     }).collect();
-    serde_json::json!({"subscriptions":subscriptions,"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
+    serde_json::json!({"subscriptions":subscriptions,"subscriptionStatus":crate::subscription_evidence::summary(settings),"routingMode":settings.routing_mode,"defaultRoute":settings.default_route,
         "compiledRules":crate::rules::compile(settings).ok(),"dns":settings.dns,"tunStack":settings.tun_stack,
         "meaning":"Endpoints and transport settings, not credentials. Matching names do not imply matching endpoints."})
 }
@@ -472,7 +482,7 @@ pub(crate) fn save(
 }
 
 // Whitelist operational fields; never export node configuration or credentials.
-fn proxy_evidence(value: &Value) -> Value {
+pub(crate) fn proxy_evidence(value: &Value) -> Value {
     let mut nodes = serde_json::Map::new();
     if let Some(proxies) = value["proxies"].as_object() {
         for (name, node) in proxies {

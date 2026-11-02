@@ -9,20 +9,13 @@ import {
   Wifi,
 } from "lucide-react";
 import { request } from "./api";
-import { siteResultLabel, type SiteResult } from "./siteChecks";
+import { sites, siteResultLabel, siteResultClass, startSiteChecks, type SiteResult } from "./siteChecks";
 import type { Settings } from "./types";
 import "./dashboard.css";
 import type { TrafficSample } from "./traffic";
 const megabytes = (n: number) => `${(n / 1_000_000).toFixed(2)} МБ`;
 const kilobytesPerSecond = (n: number) =>
   `${(n / 1024).toFixed(1)} КБ/с`;
-const sites = [
-  ["chatgpt", "ChatGPT"],
-  ["grok", "Grok"],
-  ["gemini", "Gemini"],
-  ["youtube", "YouTube"],
-  ["telegram", "Telegram"],
-];
 const modes = [
   ["rule", "Правила", "Автоматический выбор маршрута по вашим правилам."],
   [
@@ -36,6 +29,15 @@ const modes = [
     "Весь трафик напрямую, без VPN. Правила не применяются.",
   ],
 ] as const;
+export function SitePingResult({ name, result, checking }: { name: string; result?: SiteResult; checking: boolean }) {
+  return <div className="site-result">
+    <Globe2 size={23} />
+    <strong>{name}</strong>
+    <span className={siteResultClass(result)} title={result?.detail ?? result?.error}>
+      {result ? siteResultLabel(result) : checking ? "Проверяем…" : "Не проверен"}
+    </span>
+  </div>;
+}
 export function DashboardTools({
   connected,
   settings,
@@ -46,6 +48,8 @@ export function DashboardTools({
   memory,
   connections,
   error,
+  revision,
+  diagnosticEpoch,
 }: {
   connected: boolean;
   settings: Settings | undefined;
@@ -56,19 +60,24 @@ export function DashboardTools({
   memory: number | null;
   connections: number;
   error: string;
+  revision?: number;
+  diagnosticEpoch?: number;
 }) {
   const [results, setResults] = useState<Record<string, SiteResult>>({});
   const [checking, setChecking] = useState(false);
   const [modeError, setModeError] = useState("");
   const generation = useRef(0);
   const checkingRef = useRef(false);
+  const batch = useRef<ReturnType<typeof startSiteChecks> | null>(null);
   const mode = settings?.routingMode ?? "rule";
   useEffect(() => {
+    batch.current?.cancel();
     generation.current++;
     checkingRef.current = false;
     setChecking(false);
     setResults({});
     return () => {
+      batch.current?.cancel();
       generation.current++;
     };
   }, [
@@ -77,29 +86,31 @@ export function DashboardTools({
     settings?.selected,
     JSON.stringify(settings?.groups),
     settings?.defaultRoute,
+    revision,
+    diagnosticEpoch,
   ]);
   async function checkSites() {
-    if (checkingRef.current || !connected) return;
+    if (checkingRef.current || !connected || revision === undefined) return;
     checkingRef.current = true;
     const current = ++generation.current;
     setChecking(true);
     setResults({});
-    await Promise.all(
-      sites.map(async ([id]) => {
-        let result: SiteResult;
-        try {
-          result = await request<SiteResult>("site_check", { id });
-        } catch (e) {
-          result = { ok: false, ms: null, status: null, errorKind: "local", error: String(e) };
-        }
-        if (current === generation.current)
-          setResults((old) => ({ ...old, [id]: result }));
-      }),
-    );
+    const run = startSiteChecks(request, revision, diagnosticEpoch ?? 0, (id, result) => {
+      if (current === generation.current) setResults(old => ({ ...old, [id]: result }));
+    });
+    batch.current = run;
+    await run.done;
     if (current === generation.current) {
       checkingRef.current = false;
       setChecking(false);
     }
+  }
+  function cancelChecks() {
+    batch.current?.cancel();
+    generation.current++;
+    checkingRef.current = false;
+    setChecking(false);
+    setResults({});
   }
   const latest = samples.at(-1);
   const maximum = Math.max(1250, ...samples.flatMap((p) => [p.up, p.down]));
@@ -248,45 +259,20 @@ export function DashboardTools({
         <header>
           <h2 id="sites-title">
             <Wifi size={19} />
-            Доступность сайтов
+            Проверка сайтов
           </h2>
           <button
-            onClick={() => void checkSites()}
-            disabled={!connected || checking}
-            aria-label="Проверить все сайты"
+            onClick={() => checking ? cancelChecks() : void checkSites()}
+            disabled={!connected || revision === undefined}
+            aria-label={checking ? "Отменить проверку сайтов" : "Проверить все сайты"}
           >
             <RefreshCw size={15} />
-            {checking ? "Проверяем…" : "Проверить"}
+            {checking ? "Отменить" : "Проверить"}
           </button>
         </header>
         <div className="site-grid">
-          {sites.map(([id, name]) => {
-            const result = results[id];
-            return (
-              <div className="site-result" key={id}>
-                <Globe2 size={23} />
-                <strong>{name}</strong>
-                <span
-                  className={
-                    result?.ok ? "site-ok" : result ? "site-failed" : ""
-                  }
-                  title={result?.error}
-                >
-                  {result
-                    ? siteResultLabel(result)
-                    : checking
-                      ? "Проверяем…"
-                      : "Не проверен"}
-                </span>
-              </div>
-            );
-          })}
+          {sites.map(([id, name]) => <SitePingResult key={id} name={name} result={results[id]} checking={checking} />)}
         </div>
-        <p className="dashboard-note">
-          {connected
-            ? "Время HTTP-ответа, не сетевой пинг: включает установку соединения, TLS, перенаправления и ожидание ответа сайта. Ответ 403/429 может означать защиту от автоматических запросов."
-            : "Подключите Atlas, чтобы проверить доступность сервисов."}
-        </p>
       </section>
     </div>
   );

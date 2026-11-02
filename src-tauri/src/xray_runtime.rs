@@ -58,10 +58,10 @@ fn default_interface() -> Result<String,String> {
 }
 impl Prepared {
     pub fn new(settings: &Settings, mihomo: &Path, directory: &Path) -> Result<Self,String> {
-        let mut prepared=Self {settings:settings.clone(),original:settings.clone(),interface:None,binary:mihomo.with_file_name("Atlas.Xray.exe"),
+        let mut prepared=Self {settings:crate::transport_guard::runtime_settings(settings),original:settings.clone(),interface:None,binary:mihomo.with_file_name("Atlas.Xray.exe"),
             directory:directory.join(format!("xray-{}",uuid::Uuid::new_v4())),workers:vec![],reservations:vec![],secrets:vec![],cancellation:None};
         crate::support_report::collect_secrets(&serde_json::to_value(settings).map_err(|_|"Xray: настройки недоступны")?,&mut prepared.secrets);
-        let count=settings.servers().iter().filter(|n|n["type"]=="xray").count();
+        let count=prepared.settings.servers().iter().filter(|n|n["type"]=="xray").count();
         if count==0 {return Ok(prepared);}
         if count>512 {return Err("Не более 512 Xray-серверов в одной сессии".into());}
         if !prepared.binary.is_file() {return Err("В установке Atlas отсутствует Atlas.Xray.exe".into());}
@@ -114,8 +114,10 @@ impl Prepared {
                     }
                     profiles.push((config,ports));
                 }
+                let variant=node.get(crate::transport_guard::MARKER).cloned();
                 *node=json!({"name":node["name"],"type":"socks5","server":"127.0.0.1","port":port,
                     "username":user,"password":password,"udp":true,"atlas-xray-bridge":true,"atlas-probe":probe_proxy});
+                if let Some(variant)=variant {node[crate::transport_guard::MARKER]=variant;}
             }
         }
         if !simple_ports.is_empty() {
@@ -235,7 +237,7 @@ impl Runtime {
             || settings.dns.ipv6!=original.dns.ipv6 {return None;}
         if settings.mode=="tun" && default_interface().ok()!=self.prepared.interface {return None;}
         let mapped=self.prepared.settings.servers();
-        let mut result=settings.clone();
+        let mut result=crate::transport_guard::runtime_settings(settings);
         for node in result.subscriptions.iter_mut().flat_map(|s|&mut s.servers) {
             if node["type"]=="xray" {
                 *node=mapped.iter().find(|m|m["name"]==node["name"])?.clone();
@@ -322,6 +324,58 @@ impl Drop for Prepared {
 mod tests {
     use super::*;
     use std::io::{Read,Write};
+    #[test]
+    fn fallback_fragments_real_clienthello_without_changing_original_path() {
+        let mut record_counts=Vec::new();
+        // Separate listeners/process lifetimes prevent a TLS retry from the
+        // first deliberately incomplete handshake contaminating the next case.
+        for variant_index in 0..2 {
+        let target=TcpListener::bind(("127.0.0.1",0)).unwrap();
+        target.set_nonblocking(true).unwrap();
+        let port=target.local_addr().unwrap().port();
+        let node=crate::xray_config::uri(&format!("vless://00000000-0000-0000-0000-000000000001@127.0.0.1:{port}?security=tls&type=tcp&sni=fixture.example#fixture")).unwrap().unwrap();
+        let mut settings=Settings::default();settings.mode="system".into();
+        settings.subscriptions.push(crate::model::Subscription{source:Default::default(),options:Default::default(),id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,servers:vec![node]});
+        let directory=std::env::temp_dir().join(format!("atlas-fragment-test-{}",uuid::Uuid::new_v4()));
+        let binary=Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/Atlas.Core.exe");
+        let prepared=Prepared::new(&settings,&binary,&directory).unwrap();
+        assert_eq!(prepared.workers.len(),1,"fallback must share the original Xray process");
+        let mapped=prepared.settings.servers();assert_eq!(mapped.len(),2);
+        let doc:serde_json::Value=serde_yaml::from_str(&crate::config::generate(&prepared.settings,"test").unwrap()).unwrap();
+        assert!(!doc["proxy-groups"][0]["proxies"].as_array().unwrap().contains(&mapped[1]["name"]));
+        assert!(doc["proxy-groups"][1]["proxies"].as_array().unwrap().contains(&mapped[1]["name"]));
+        let mut runtime=prepared.start().unwrap();
+        assert_eq!(runtime.mapped_settings(&settings).unwrap().servers(),mapped);
+        let adapter=&mapped[variant_index];
+            let mut stream=std::net::TcpStream::connect(("127.0.0.1",adapter["port"].as_u64().unwrap() as u16)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reply=[0;2];stream.write_all(&[5,1,2]).unwrap();stream.read_exact(&mut reply).unwrap();assert_eq!(reply,[5,2]);
+            let user=adapter["username"].as_str().unwrap();let password=adapter["password"].as_str().unwrap();
+            let mut auth=vec![1,user.len() as u8];auth.extend(user.as_bytes());auth.push(password.len() as u8);auth.extend(password.as_bytes());
+            stream.write_all(&auth).unwrap();stream.read_exact(&mut reply).unwrap();assert_eq!(reply,[1,0]);
+            stream.write_all(&[5,1,0,1,127,0,0,1,0,80]).unwrap();
+            // SOCKS accepts the stream before the outbound TLS handshake finishes.
+            let mut response=[0;10];stream.read_exact(&mut response).unwrap();assert_eq!(response[1],0);
+            stream.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+            let deadline=Instant::now()+Duration::from_secs(3);
+            let (mut accepted,_)=loop {match target.accept() {Ok(pair)=>break pair,Err(_) if Instant::now()<deadline=>std::thread::sleep(Duration::from_millis(10)),Err(e)=>panic!("{e}")}};
+            accepted.set_nonblocking(false).unwrap();accepted.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut hello=Vec::new();let mut records=0;
+            loop {
+                let mut header=[0u8;5];accepted.read_exact(&mut header).unwrap();assert_eq!(header[0],22);
+                let len=u16::from_be_bytes([header[3],header[4]]) as usize;assert!(len>0 && len<=16384);
+                let mut bytes=vec![0;len];accepted.read_exact(&mut bytes).unwrap();hello.extend(bytes);records+=1;
+                assert!(records<100);
+                if hello.len()>=4 {let total=4+((hello[1] as usize)<<16)+((hello[2] as usize)<<8)+hello[3] as usize;
+                    if hello.len()>=total {assert_eq!(hello.len(),total);break;}}
+            }
+            assert_eq!(hello[0],1);assert!(hello.windows(b"fixture.example".len()).any(|v|v==b"fixture.example"));
+            record_counts.push(records);
+            println!("TLS fixture: records={records}, helloBytes={}",hello.len());
+        runtime.stop().unwrap();drop(runtime);let _=std::fs::remove_dir(directory);
+        }
+        assert_eq!(record_counts[0],1);assert!(record_counts[1]>1,"fallback must actually split TLS records");
+    }
     #[test]
     fn owned_runtime_authenticates_forwards_and_exits() {
         let mut settings=Settings::default();

@@ -12,7 +12,7 @@ export function ServerCard({ server, selected, favorite, latency, disabled, test
   latency = freshLatency(latency?.probeId !== undefined && latency.probeId !== server.probeId ? undefined : latency);
   const delay = latency && ["ok", "high_latency"].includes(latency.status) ? latency.delay : null;
   const tone = (latency?.status === "unreachable" || latency?.status === "timeout") ? "timeout" : delay == null ? "unknown" : delay < 250 ? "fast" : delay < 400 ? "medium" : "slow";
-  return <article className={`server-card ${selected ? "is-selected" : ""}`}>
+  return <article data-server-name={server.name} className={`server-card ${selected ? "is-selected" : ""}`}>
     <button className="server-card-select" onClick={onSelect} disabled={disabled} aria-pressed={selected} title={label}>
       <span className="server-card-title">
         {server.country ? <span className={`fi fi-${server.country}`} role="img" aria-label={server.country.toUpperCase()} /> : <Globe2 size={18} />}

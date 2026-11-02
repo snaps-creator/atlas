@@ -113,6 +113,7 @@
 }
 .site-result {
   display: grid;
+  align-content: start;
   justify-items: center;
   gap: 5px;
   padding: 8px 0;
@@ -126,6 +127,14 @@
 .site-result strong {
   font-size: 11px;
 }
+.site-result > span { text-align: center; }
+.site-result > span { font-variant-numeric: tabular-nums; }
+.site-result .site-speed-fast { color: #66ce97; }
+.site-result .site-speed-medium { color: #f5aa7f; }
+.site-result .site-speed-slow { color: #ff8b94; }
+[data-theme="light"] .site-result .site-speed-fast { color: #18713b; }
+[data-theme="light"] .site-result .site-speed-medium { color: #a13d0c; }
+[data-theme="light"] .site-result .site-speed-slow { color: #b42332; }
 .site-result .site-ok {
   color: #66ce97;
 }
@@ -163,7 +172,8 @@
 [data-theme="light"] .site-result .site-ok {
   color: #18713b;
 }
-[data-theme="light"] .site-failed {
+[data-theme="light"] .site-failed,
+[data-theme="light"] .site-result .site-failed {
   color: #a13d0c;
 }
 @media (max-width: 650px) {

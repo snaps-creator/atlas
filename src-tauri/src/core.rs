@@ -1249,6 +1249,7 @@ pub struct ApiClient {
     logs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 impl ApiClient {
+    pub(crate) fn diagnostic_proxy_port(&self) -> u16 { self.mixed_port }
     pub(crate) fn context_id(&self) -> String {
         use sha2::{Digest,Sha256};
         format!("{}:{:x}:{:p}",self.controller_port,Sha256::digest(self.secret.as_bytes()),
@@ -1293,6 +1294,7 @@ impl ApiClient {
             .timeout(Duration::from_millis(timeout.clamp(1500,10000))).redirect(reqwest::redirect::Policy::none()).build() else { return false; };
         client.get(endpoint).send().is_ok_and(|r|r.status().as_u16()==204)
     }
+    pub(crate) fn mixed_proxy_url(&self) -> String { format!("http://127.0.0.1:{}",self.mixed_port) }
     #[cfg(test)]
     pub(crate) fn with_probe_settings(self, settings: &Settings) -> Self {
         self.probes.lock().unwrap().configure(settings); self
@@ -1414,7 +1416,10 @@ impl ApiClient {
             }
             response["delay"].as_u64().ok_or("Ядро не вернуло задержку".into())
         })();
-        let record=self.probes.lock().unwrap().finish(&ticket,&result)?;
+        let quick=params.get("atlas_quick").is_some_and(|value|value=="1");
+        let record=if quick && result.as_ref().err().is_some_and(|e|e=="Mihomo API: HTTP 504") {
+            self.probes.lock().unwrap().defer(&ticket)?
+        } else {self.probes.lock().unwrap().finish(&ticket,&result)?};
         Ok(json!({"delay":record["delay"],"atlasProbe":record}))
     }
     fn controller_api(&self, method: &str, path: &str, body: Option<Value>,

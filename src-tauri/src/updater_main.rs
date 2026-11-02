@@ -59,6 +59,13 @@ fn run()->Result<(),String> {
     if args.len()==5 && args[1]=="--install-local" {
         return update_bootstrap::upgrade(std::path::Path::new(&args[2]),std::path::Path::new(&args[3]),std::path::Path::new(&args[4]));
     }
+    if args.len()==5 && args[1]=="--stage-local" {
+        return update_bootstrap::stage(std::path::Path::new(&args[2]),std::path::Path::new(&args[3]),std::path::Path::new(&args[4]));
+    }
+    if args.len()==2 && args[1]=="--activate-prepared" {
+        let exe=std::env::current_exe().map_err(|e|e.to_string())?;
+        return update_bootstrap::activate_prepared(exe.parent().ok_or("Missing installation root")?);
+    }
     if args.len()==3 && args[1]=="--prepare-uninstall" {return update_bootstrap::prepare_uninstall(std::path::Path::new(&args[2]));}
     if args.len()==3 && args[1]=="--uninstall-local" {return update_bootstrap::uninstall(std::path::Path::new(&args[2]));}
     if args.len()==4 && args[1]=="--activate" {

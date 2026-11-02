@@ -19,7 +19,7 @@ use std::{
 };
 
 pub const PORT: u16 = 17943;
-const LIMIT: usize = 2 * 1024 * 1024;
+const LIMIT: usize = 16 * 1024 * 1024;
 const REQUEST_AAD: &[u8] = b"atlas-lan-diagnostics/request/v1";
 const RESPONSE_AAD: &[u8] = b"atlas-lan-diagnostics/response/v1";
 const SALT: &[u8] = b"Atlas LAN diagnostics v1 password key";
@@ -39,6 +39,8 @@ struct Config {
     id: String,
     name: String,
     enabled: bool,
+    #[serde(default)]
+    allow_changes: bool,
     key: Option<[u8; 32]>,
     peers: Vec<Peer>,
 }
@@ -48,6 +50,7 @@ impl Default for Config {
             id: uuid::Uuid::new_v4().to_string(),
             name: std::env::var("COMPUTERNAME").unwrap_or("Atlas".into()),
             enabled: false,
+            allow_changes: false,
             key: None,
             peers: vec![],
         }
@@ -61,6 +64,9 @@ struct State {
     requests: HashMap<String, Instant>,
     capture_running: bool,
     capture_completed: Option<u64>,
+    capture_id: Option<String>,
+    capture_result: Option<Value>,
+    capture_error: Option<String>,
     listener_error: Option<String>,
     discovery_error: Option<String>,
     load_error: Option<String>,
@@ -71,6 +77,7 @@ pub struct Lan {
     directory: PathBuf,
     access: crate::support_report::Access,
     published: crate::published_state::PublishedState,
+    manager: Arc<Mutex<Option<Arc<dyn Fn(&Value)->Result<Value,String> + Send + Sync>>>>,
 }
 
 fn derive(password: &str) -> Result<[u8; 32], String> {
@@ -156,7 +163,10 @@ fn name(value: &str) -> Result<String, String> {
     Ok(value.into())
 }
 fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>, String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    read_frame_for(stream,limit,Duration::from_secs(8))
+}
+fn read_frame_for(stream: &mut TcpStream, limit: usize, timeout: Duration) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + timeout;
     fn read(stream: &mut TcpStream, data: &mut [u8], deadline: Instant) -> Result<(), String> {
         let mut offset = 0;
         while offset < data.len() {
@@ -227,6 +237,7 @@ impl Lan {
             directory,
             access,
             published,
+            manager: Default::default(),
             state: Arc::new(Mutex::new(State {
                 config: loaded.unwrap_or_default(),
                 sessions: HashMap::new(),
@@ -235,6 +246,9 @@ impl Lan {
                 requests: HashMap::new(),
                 capture_running: false,
                 capture_completed: None,
+                capture_id: None,
+                capture_result: None,
+                capture_error: None,
                 listener_error: None,
                 discovery_error: None,
                 load_error,
@@ -375,7 +389,7 @@ impl Lan {
             }
             s.config.key.ok_or("Не настроен пароль")?
         };
-        let request = open(&key, &read_frame(stream, 4096)?, REQUEST_AAD)?;
+        let request = open(&key, &read_frame(stream, 512*1024)?, REQUEST_AAD)?;
         let at = request["at"].as_u64().ok_or("Нет времени запроса")?;
         if crate::model::now().abs_diff(at) > 120 {
             return Err("Проверьте время на компьютерах".into());
@@ -394,57 +408,100 @@ impl Lan {
             s.requests.insert(id.into(), Instant::now());
         }
         let action = request["action"].as_str().unwrap_or("");
+        if action=="manage" {
+            if request["expectedId"].as_str()!=Some(self.state.lock().unwrap().config.id.as_str()) {
+                return write_frame(stream,&seal(&key,&json!({"id":id,"management":{"error":"По этому IP отвечает другой компьютер. Обновите список."}}),RESPONSE_AAD)?);
+            }
+            let allowed=self.state.lock().unwrap().config.allow_changes;
+            let operation=request["operation"].as_str().unwrap_or("");
+            let result=if operation!="view" && !allowed {
+                Err("На этом ПК запрещено изменение настроек по локальной сети".into())
+            } else {
+                let manager=self.manager.lock().unwrap().clone();
+                manager.ok_or_else(||"Обновите Atlas на управляемом ПК".to_owned()).and_then(|f|f(&request))
+            };
+            let value=match result {Ok(value)=>json!({"value":value,"allowChanges":allowed}),Err(error)=>json!({"error":error})};
+            return write_frame(stream,&seal(&key,&json!({"id":id,"management":value}),RESPONSE_AAD)?);
+        }
         if !matches!(action, "status" | "report" | "capture") {
             return Err("Неизвестная операция".into());
         }
         if action == "capture" {
-            self.capture();
+            if let Err(error)=self.capture() {
+                return write_frame(stream,&seal(&key,&json!({"id":id,"error":error}),RESPONSE_AAD)?);
+            }
         }
         let response = json!({"id":id,"report":self.report(action!="status")});
         write_frame(stream, &seal(&key, &response, RESPONSE_AAD)?)
     }
-    fn capture(&self) {
-        let Some(c) = self.access.get() else {
-            return;
-        };
+    fn capture(&self) -> Result<(),String> {
+        let c=self.access.get().ok_or("Состояние Atlas ещё не готово. Повторите сбор позже.")?;
         {
             let mut s = self.state.lock().unwrap();
-            if s.capture_running || Instant::now() < s.next_capture {
-                return;
-            }
+            if s.capture_running {return Ok(());}
+            if Instant::now() < s.next_capture {return Err("Повторный сбор будет доступен через минуту".into());}
             s.capture_running = true;
+            s.capture_id = Some(uuid::Uuid::new_v4().to_string());
+            s.capture_error = None;
+            s.capture_result = None;
             s.next_capture = Instant::now() + Duration::from_secs(60);
         }
         let this = self.clone();
         std::thread::spawn(move || {
-            crate::support_report::automatic_incident(c.client, c.secrets, c.revision);
+            let directory=this.directory.clone();
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let failure=std::fs::read_to_string(directory.join("last-session-failure.json")).ok()
+                    .and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+                let mut incident=crate::support_report::automatic_incident(c.client,c.secrets,c.revision);
+                incident["failedEndpointChecks"]=crate::support_probes::failed_endpoint_checks(&failure);
+                incident
+            }));
             let mut s = this.state.lock().unwrap();
             s.capture_running = false;
-            s.capture_completed = Some(crate::model::now());
+            match result {Ok(value)=>{s.capture_result=Some(value);s.capture_completed=Some(crate::model::now());},
+                Err(_)=>s.capture_error=Some("Сбор диагностики прерван. Повторите сбор.".into())}
         });
+        Ok(())
     }
     fn report(&self, detailed: bool) -> Value {
-        let (id, name, running, completed) = {
+        let (id, name, running, completed, capture_id, capture_result, capture_error, allow_changes) = {
             let s = self.state.lock().unwrap();
             (
                 s.config.id.clone(),
                 s.config.name.clone(),
                 s.capture_running,
                 s.capture_completed,
+                s.capture_id.clone(),
+                if detailed {s.capture_result.clone()}else{None},
+                s.capture_error.clone(),
+                s.config.allow_changes,
             )
         };
         let published = self.published.get();
         let mut result = json!({"deviceId":id,"name":name,"at":crate::model::now(),"version":env!("CARGO_PKG_VERSION"),
             "status":published["status"],"running":published["running"],"selected":published["settings"]["selected"],
             "captureRunning":running,"captureCompletedAt":completed});
+            result["schema"]=json!(2);
+            result["buildId"]=json!(env!("ATLAS_BUILD_ID"));
+            result["captureId"]=json!(capture_id);
+            result["captureError"]=json!(capture_error);
+            result["allowChanges"]=json!(allow_changes);
+            if detailed {result["incident"]=json!(capture_result);}
         if detailed {
-            let history = crate::incident_history::snapshot();
+            let history = crate::incident_history::snapshot_for_report();
+            let context=self.access.get();
+            result["subscriptionStatus"]=context.as_ref().map(|c|c.configuration["subscriptionStatus"].clone()).unwrap_or(json!({"error":"No published configuration"}));
+            result["configuration"]=context.as_ref().map(|c|c.configuration.clone()).unwrap_or(Value::Null);
+            result["lastSessionFailure"]=std::fs::read_to_string(self.directory.join("last-session-failure.json")).ok()
+                .and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+            result["startupSearch"]=std::fs::read_to_string(self.directory.join("startup-search.json")).ok()
+                .and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
             let mut total = 0;
             let mut entries = Vec::new();
             let mut omitted = 0;
             for entry in history["entries"].as_array().into_iter().flatten().rev() {
                 let size = entry.to_string().len();
-                if total + size > LIMIT / 2 {
+                if total + size > 1024*1024 {
                     omitted += 1;
                     continue;
                 }
@@ -453,16 +510,19 @@ impl Lan {
             }
             entries.reverse();
             result["history"] = json!({"entries":entries,"omittedEntries":omitted,"droppedEntries":history["droppedEntries"]});
+            result["coverage"]=json!({"captureComplete":!running && completed.is_some() && result["captureError"].is_null() && result["incident"].is_object(),"historyComplete":omitted==0 && history["droppedEntries"]==0,
+                "meaning":"Current capture, saved failure and subscription state are separate from the bounded event history. Windows path obeys TUN; it is not an independent physical bypass."});
         }
         let secrets = self.access.get().map(|c| c.secrets).unwrap_or_default();
-        let safe = crate::support_report::redact(&result.to_string(), &secrets);
-        let mut safe: Value = serde_json::from_str(&safe).unwrap_or_else(
-            |_| json!({"name":result["name"],"at":result["at"],"redactedReport":safe}),
-        );
+        let mut safe=crate::support_report::redact_value(&result,&secrets);
         // The generic VPN redactor masks UUIDs. This independently generated device
         // identity is public protocol metadata, not a subscription credential.
         safe["deviceId"] = result["deviceId"].clone();
+        safe["captureId"] = result["captureId"].clone();
         safe
+    }
+    pub fn set_manager(&self, manager: impl Fn(&Value)->Result<Value,String> + Send + Sync + 'static) {
+        *self.manager.lock().unwrap()=Some(Arc::new(manager));
     }
     pub fn command(&self, action: &str, payload: Value) -> Result<Value, String> {
         if action == "lan_info" {
@@ -538,7 +598,7 @@ impl Lan {
             "lan_state" => {
                 let s = self.state.lock().unwrap();
                 Ok(
-                    json!({"id":s.config.id,"name":s.config.name,"enabled":s.config.enabled,"peers":s.config.peers,"listenerError":s.listener_error,"discoveryError":s.discovery_error,"port":PORT}),
+                    json!({"id":s.config.id,"name":s.config.name,"enabled":s.config.enabled,"allowChanges":s.config.allow_changes,"peers":s.config.peers,"listenerError":s.listener_error,"discoveryError":s.discovery_error,"port":PORT}),
                 )
             }
             "lan_save" => {
@@ -546,6 +606,7 @@ impl Lan {
                 let mut c = s.config.clone();
                 c.name = name(payload["name"].as_str().unwrap_or(""))?;
                 c.enabled = payload["enabled"].as_bool().ok_or("Нет режима обмена")?;
+                if let Some(allow)=payload["allowChanges"].as_bool() {c.allow_changes=allow;}
                 self.persist(&c)?;
                 s.config = c;
                 Ok(Value::Null)
@@ -572,6 +633,12 @@ impl Lan {
                 Ok(Value::Null)
             }
             "lan_fetch" => self.fetch(&payload),
+            "lan_manage" => self.manage(&payload),
+            "lan_download" => {
+                let report=payload.get("report").ok_or("Нет отчёта")?;
+                let path=save_download(report)?;
+                Ok(json!({"path":path}))
+            }
             "lan_cached" => {
                 let id = payload["id"].as_str().ok_or("Нет ID")?;
                 uuid::Uuid::parse_str(id).map_err(|_| "Неверный ID")?;
@@ -586,6 +653,27 @@ impl Lan {
     fn fetch(&self, payload: &Value) -> Result<Value, String> {
         let address_text = payload["address"].as_str().ok_or("Нет адреса")?;
         self.fetch_from(payload, address(address_text)?)
+    }
+    fn manage(&self, payload: &Value) -> Result<Value,String> {
+        let address=address(payload["address"].as_str().ok_or("Нет адреса")?)?;
+        let key=self.state.lock().unwrap().config.key.ok_or("Не настроен пароль")?;
+        // Negotiate support before sending any write to older Atlas installations.
+        let mut status_payload=payload.clone();status_payload["statusOnly"]=json!(true);
+        let status=self.fetch(&status_payload)?;
+        if status["schema"].as_u64().unwrap_or(0)<2 {return Err("Обновите Atlas на управляемом ПК: правила и подписки по сети не поддерживаются".into());}
+        let id=uuid::Uuid::new_v4().to_string();
+        let mut stream=TcpStream::connect_timeout(&address,Duration::from_secs(3)).map_err(|e|e.to_string())?;
+        let request=json!({"id":id,"at":crate::model::now(),"action":"manage","operation":payload["operation"],
+            "expectedId":payload["expectedId"],"payload":payload["payload"]});
+        if request.to_string().len()>500*1024 {return Err("Слишком большой запрос настроек".into());}
+        write_frame(&mut stream,&seal(&key,&request,REQUEST_AAD)?)?;
+        let response=open(&key,&read_frame_for(&mut stream,LIMIT+28,Duration::from_secs(300))
+            .map_err(|e|format!("Ответ не получен: {e}. Результат изменения неизвестен; обновите список перед повтором."))?,RESPONSE_AAD)?;
+        if response["id"]!=id {return Err("Ответ относится к другому запросу".into());}
+        let result=&response["management"];
+        if let Some(error)=result["error"].as_str() {return Err(error.into());}
+        if result.get("value").is_none() {return Err("Обновите Atlas на управляемом ПК: удалённое управление не поддерживается".into());}
+        Ok(result.clone())
     }
     fn fetch_from(&self, payload: &Value, peer_address: SocketAddr) -> Result<Value, String> {
         let address_text = payload["address"].as_str().ok_or("Нет адреса")?;
@@ -618,6 +706,7 @@ impl Lan {
         if response["id"] != id {
             return Err("Ответ относится к другому запросу".into());
         }
+        if let Some(error)=response["error"].as_str() {return Err(error.into());}
         let report = &response["report"];
         let device = report["deviceId"].as_str().ok_or("Нет ID компьютера")?;
         uuid::Uuid::parse_str(device).map_err(|_| "Неверный ID компьютера")?;
@@ -662,6 +751,35 @@ impl Lan {
     }
 }
 
+fn save_download(report: &Value) -> Result<String,String> {
+    use windows_sys::Win32::{UI::Shell::{SHGetKnownFolderPath,FOLDERID_Downloads},System::Com::CoTaskMemFree};
+    use std::os::windows::ffi::OsStringExt;
+    let mut raw=std::ptr::null_mut();
+    let directory=unsafe {
+        if SHGetKnownFolderPath(&FOLDERID_Downloads,0,std::ptr::null_mut(),&mut raw)<0 || raw.is_null() {
+            return Err("Не удалось определить папку «Загрузки» Windows".into());
+        }
+        let mut len=0;while *raw.add(len)!=0 {len+=1;}
+        let path=PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw,len)));
+        CoTaskMemFree(raw.cast());path
+    };
+    save_download_to(report,&directory).map(|p|p.to_string_lossy().into_owned())
+}
+fn save_download_to(report: &Value, directory: &std::path::Path) -> Result<PathBuf,String> {
+    use std::io::Write;
+    if report["captureRunning"]==true || report["captureError"].as_str().is_some() || report["captureCompletedAt"].as_u64().is_none() || !report["incident"].is_object() {
+        return Err("Сбор ещё не завершён; неполный отчёт не сохранён".into());
+    }
+    let device=report["deviceId"].as_str().ok_or("Нет ID компьютера")?;
+    uuid::Uuid::parse_str(device).map_err(|_|"Неверный ID компьютера")?;
+    let bytes=serde_json::to_vec_pretty(report).map_err(|e|e.to_string())?;
+    if bytes.len()>LIMIT {return Err("Отчёт превышает допустимый размер".into());}
+    let path=directory.join(format!("atlas-lan-{device}-{}-{}.json",crate::model::now(),uuid::Uuid::new_v4()));
+    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e|format!("Не удалось сохранить в «Загрузки»: {e}"))?;
+    if let Err(error)=file.write_all(&bytes).and_then(|_|file.sync_all()) {drop(file);let _=std::fs::remove_file(&path);return Err(error.to_string());}
+    Ok(path)
+}
+
 fn discovery_reply(key:&[u8;32],packet:&[u8],id:&str,device_name:&str)->Option<Vec<u8>> {
     let request=open(key,packet,DISCOVER_REQUEST).ok()?;
     if !request["at"].as_u64().is_some_and(|at|crate::model::now().abs_diff(at)<=120) ||
@@ -671,6 +789,52 @@ fn discovery_reply(key:&[u8;32],packet:&[u8],id:&str,device_name:&str)->Option<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_writes_require_opt_in_and_matching_device_identity() {
+        let directory=std::env::temp_dir().join(format!("atlas-lan-management-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let host=Lan::new(directory.clone(),Default::default(),Default::default());let key=[43;32];
+        {let mut state=host.state.lock().unwrap();state.config.enabled=true;state.config.key=Some(key);}
+        let calls=Arc::new(AtomicUsize::new(0));let count=calls.clone();
+        host.set_manager(move |_| {count.fetch_add(1,Ordering::SeqCst);Ok(json!({"revision":1,"groups":[],"subscriptions":[]}))});
+        let exchange=|operation:&str,expected:Value| {
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();let remote=host.clone();
+            let worker=std::thread::spawn(move || {let (mut stream,_)=listener.accept().unwrap();remote.serve(&mut stream).unwrap();});
+            let mut stream=TcpStream::connect(address).unwrap();
+            let request=json!({"id":uuid::Uuid::new_v4().to_string(),"at":crate::model::now(),"action":"manage","operation":operation,"expectedId":expected,"payload":{}});
+            write_frame(&mut stream,&seal(&key,&request,REQUEST_AAD).unwrap()).unwrap();
+            let response=open(&key,&read_frame(&mut stream,LIMIT+28).unwrap(),RESPONSE_AAD).unwrap();worker.join().unwrap();response
+        };
+        let id=json!(host.state.lock().unwrap().config.id);
+        assert!(exchange("rules_save",id.clone())["management"]["error"].is_string());assert_eq!(calls.load(Ordering::SeqCst),0);
+        assert!(exchange("view",id.clone())["management"]["value"].is_object());assert_eq!(calls.load(Ordering::SeqCst),1);
+        host.state.lock().unwrap().config.allow_changes=true;
+        assert!(exchange("rules_save",json!(uuid::Uuid::new_v4().to_string()))["management"]["error"].is_string());assert_eq!(calls.load(Ordering::SeqCst),1);
+        assert!(exchange("rules_save",id)["management"]["value"].is_object());assert_eq!(calls.load(Ordering::SeqCst),2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn downloads_reject_incomplete_capture_and_never_overwrite_a_report() {
+        let directory=std::env::temp_dir().join(format!("atlas-lan-download-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&directory).unwrap();
+        let mut report=json!({"deviceId":uuid::Uuid::new_v4().to_string(),"captureRunning":true,"captureCompletedAt":1,"incident":{"test":"ready"}});
+        assert!(save_download_to(&report,&directory).is_err());
+        report["captureRunning"]=json!(false);
+        let first=save_download_to(&report,&directory).unwrap();let second=save_download_to(&report,&directory).unwrap();assert_ne!(first,second);
+        assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(first).unwrap()).unwrap(),report);
+        report["deviceId"]=json!("../../escape");assert!(save_download_to(&report,&directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn complete_incident_is_exported_separately_from_history() {
+        let directory=std::env::temp_dir().join(format!("atlas-lan-incident-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&directory).unwrap();
+        let host=Lan::new(directory.clone(),Default::default(),Default::default());
+        {let mut state=host.state.lock().unwrap();state.capture_completed=Some(123);state.capture_id=Some("capture-id".into());state.capture_result=Some(json!({"evidence":{"windows":{"text":"full capture"}}}));}
+        let report=host.report(true);
+        assert_eq!(report["incident"]["evidence"]["windows"]["text"],"full capture");assert_eq!(report["captureId"],"capture-id");
+        assert_eq!(report["coverage"]["captureComplete"],true);
+        assert!(report["subscriptionStatus"]["error"].is_string());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn discovery_returns_only_authenticated_names_and_correlates_nonce() {
         let key=[7;32];let id=uuid::Uuid::new_v4().to_string();

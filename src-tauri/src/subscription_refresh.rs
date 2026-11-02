@@ -81,6 +81,7 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                 let (shared,reads,stop,tx)=(shared.clone(),reads.clone(),stop.clone(),tx.clone());
                 std::thread::spawn(move || {
                     let started=std::time::Instant::now();
+                    let mut attempt=crate::subscription_evidence::Attempt::start(&id,trigger);
                     incident_history::record("subscription_refresh_started",json!({"subscription":id,"trigger":trigger}),&[]);
                     let captured=reads.get();
                     let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(),String> {
@@ -93,12 +94,13 @@ pub(crate) fn start(shared: Shared, reads: ReadState, stop: Arc<AtomicBool>, don
                         let mut a=shared.lock().map_err(|_|"Состояние Atlas недоступно")?;
                         if stop.load(Ordering::SeqCst) { return Err("Atlas завершает работу".into()); }
                         if !subscriptions::refresh_is_current(before.settings.subscriptions.iter().find(|s|s.id==id),a.settings.subscriptions.iter().find(|s|s.id==id)) {
-                            return Ok(()); // Deleted or superseded; never recreate/overwrite it.
+                            return Err("Подписка уже изменена; загруженный результат не применён".into());
                         }
                         let source=before.settings.subscriptions.iter().find(|s|s.id==id).ok_or("Подписка удалена")?.source;
                         a.install_subscription(id.clone(),url,nodes,None,None,source)?;
                         a.snapshot(); Ok(())
                     })).unwrap_or_else(|_|Err("Обновление подписки прервано; будет повторено".into()));
+                    attempt.finish(if result.is_ok(){"completed"}else{"failed"},result.as_ref().err().map(String::as_str));
                     incident_history::record("subscription_refresh_completed",json!({"subscription":id,"trigger":trigger,
                         "elapsedMs":started.elapsed().as_millis(),"success":result.is_ok(),"error":result.as_ref().err()}),&[]);
                     if !stop.load(Ordering::SeqCst) {
@@ -139,12 +141,14 @@ fn refresh_recovery(shared: &Shared, reads: &ReadState, stop: &AtomicBool, opera
         if std::time::Instant::now()>=deadline {all_ok=false;break;}
         let results=std::thread::scope(|scope| {
             let jobs:Vec<_>=pair.iter().map(|sub|scope.spawn(move || {
+                let mut attempt=crate::subscription_evidence::Attempt::start(&sub.id,"recovery_download");
                 let result=(|| {
                     let _lease=Lease::take(&sub.id).ok_or("Подписка уже обновляется")?;
                     let url=keyring::Entry::new("AtlasVPN",&sub.id).map_err(|_|"Хранилище Windows недоступно")?
                         .get_password().map_err(|_|"Нет URL-подписки")?;
                     subscriptions::download(&url,connected,&sub.options)
                 })();
+                attempt.finish(if result.is_ok(){"downloaded"}else{"failed"},result.as_ref().err().map(String::as_str));
                 (sub.id.clone(),result)
             })).collect();
             jobs.into_iter().filter_map(|job|job.join().ok()).collect::<Vec<_>>()
@@ -163,7 +167,7 @@ fn refresh_recovery(shared: &Shared, reads: &ReadState, stop: &AtomicBool, opera
                     sub.servers=stable_names(&sub.servers,nodes,&id);
                     sub.options=downloaded.options; sub.updated_at=model::now(); sub.error=None; changed=true;
                 }
-                Err(_) => { all_ok=false; sub.error=Some("Автоматическое обновление подписки не выполнено".into()); }
+                Err(error) => { all_ok=false; sub.error=Some(error); }
             }
         }
     }

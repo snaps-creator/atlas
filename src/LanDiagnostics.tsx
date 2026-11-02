@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { download, request } from "./api";
 import "./lan-diagnostics.css";
+import { collectAndDownload } from "./lanCapture";
+import { LanManagement } from "./LanManagement";
 
 type Peer = {
   id: string;
@@ -13,6 +15,7 @@ type State = {
   id: string;
   name: string;
   enabled: boolean;
+  allowChanges?: boolean;
   peers: Peer[];
   listenerError?: string;
   discoveryError?: string;
@@ -27,6 +30,9 @@ type Report = {
   version?: string;
   captureRunning?: boolean;
   captureCompletedAt?: number;
+  captureId?: string;
+  captureError?: string;
+  schema?: number;
   history?: unknown;
 };
 export function LanDiagnostics() {
@@ -40,6 +46,9 @@ export function LanDiagnostics() {
     [busy, setBusy] = useState(false),
     [report, setReport] = useState<Report>();
   const [tigerEggOpen, setTigerEggOpen] = useState(false);
+  const [capturing, setCapturing] = useState<string>();
+  const [savedPath, setSavedPath] = useState("");
+  const [managedPeer, setManagedPeer] = useState<Peer>();
   const [cached, setCached] = useState(false),
     [online, setOnline] = useState<Record<string, boolean>>({});
   const [discovered, setDiscovered] = useState<Peer[]>([]);
@@ -122,6 +131,22 @@ export function LanDiagnostics() {
       if (liveToken.current === t) setOnline((v) => ({ ...v, [p.id]: false }));
       throw e;
     }
+  }
+  async function captureAndSave(p: Peer) {
+    const session = liveToken.current;
+    setCapturing(p.id); setSavedPath("");
+    try {
+      const result = await collectAndDownload(
+        (capture, statusOnly) => call<Report>("lan_fetch", { address: p.address, expectedId: p.id, capture, statusOnly }),
+        async report => {
+          const saved = await call<{ path: string }>("lan_download", { report });
+          setSavedPath(saved.path);
+        },
+        () => liveToken.current === session,
+      );
+      setReport(result); setCached(false);
+      await refresh();
+    } finally { setCapturing(undefined); }
   }
   useEffect(() => {
     if (!token) return;
@@ -301,6 +326,14 @@ export function LanDiagnostics() {
         17944 для поиска, только локальная сеть. Компьютер должен быть включён,
         Atlas — запущен; подключение VPN не обязательно.
       </p>
+      <label className="lan-toggle">
+        <input type="checkbox" checked={state?.allowChanges ?? false} disabled={busy || !state}
+          onChange={e => { const allowChanges = e.target.checked; void run(async () => {
+            await call("lan_save", { name: localName, enabled: state?.enabled, allowChanges }); await refresh();
+          }); }} />
+        Разрешить изменение настроек по локальной сети
+      </label>
+      <p className="footnote">Компьютеры с общим паролем смогут менять правила и подписки этого ПК при включённом обмене. Ссылки и ключи не показываются в списке.</p>
       <button
         disabled={busy}
         onClick={() =>
@@ -412,10 +445,11 @@ export function LanDiagnostics() {
             }
             onCapture={() =>
               void run(async () => {
-                await fetchPeer(p, true);
-                await refresh();
+                await captureAndSave(p);
               })
             }
+            capturing={capturing === p.id}
+            onManage={() => setManagedPeer(p)}
             onCached={() =>
               void run(async () => {
                 setReport(await call<Report>("lan_cached", { id: p.id }));
@@ -432,6 +466,8 @@ export function LanDiagnostics() {
           />
         ))}
       </div>
+      <p role="status">{capturing ? "Собираем диагностику. Готовый отчёт автоматически сохранится в «Загрузки»." : savedPath ? `Отчёт сохранён: ${savedPath}` : ""}</p>
+      {managedPeer && <LanManagement key={managedPeer.id} peer={managedPeer} token={token} onClose={() => setManagedPeer(undefined)} />}
       {!state?.peers.length && (
         <p>
           Компьютеры ещё не добавлены. Включите обмен в Atlas на другом ПК и
@@ -452,12 +488,13 @@ export function LanDiagnostics() {
           <p>
             Выбранный сервер: {report.selected ?? "—"}.{" "}
             {report.captureRunning
-              ? "Подробная диагностика собирается. Обновите отчёт примерно через минуту."
+              ? "Подробная диагностика ещё собирается. Этот отчёт пока неполный."
               : report.captureCompletedAt
                 ? `Последний сбор: ${new Date(report.captureCompletedAt * 1000).toLocaleString()}`
                 : ""}
           </p>
           <button
+            disabled={report.captureRunning === true}
             onClick={() =>
               download(`atlas-lan-${report.deviceId}-${report.at}.json`, report)
             }
@@ -529,6 +566,8 @@ function PeerRow({
   onCapture,
   onCached,
   onRemove,
+  onManage,
+  capturing,
 }: {
   peer: Peer;
   busy: boolean;
@@ -538,6 +577,8 @@ function PeerRow({
   onCapture: () => void;
   onCached: () => void;
   onRemove: () => void;
+  onManage: () => void;
+  capturing: boolean;
 }) {
   const [name, setName] = useState(peer.name);
   useEffect(() => setName(peer.name), [peer.name]);
@@ -571,8 +612,9 @@ function PeerRow({
           Открыть отчёт
         </button>
         <button disabled={busy} onClick={onCapture}>
-          Собрать диагностику сейчас
+          {capturing ? "Собирается…" : "Собрать и скачать"}
         </button>
+        <button disabled={busy} onClick={onManage}>Правила и подписки</button>
         <button disabled={busy} onClick={onCached}>
           Последний сохранённый
         </button>

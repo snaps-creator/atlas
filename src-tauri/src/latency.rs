@@ -7,7 +7,8 @@ use std::path::PathBuf;
 pub const DISPLAY_URL: &str = "http://cp.cloudflare.com/generate_204";
 pub const TUNNEL_URL: &str = "https://cp.cloudflare.com/generate_204";
 pub const DISPLAY_TIMEOUT_MS: u64 = 10000;
-pub(crate) const DISPLAY_WORKERS: usize = 64;
+pub(crate) const DISCOVERY_TIMEOUT_MS: u64 = 2000;
+pub(crate) const DISPLAY_WORKERS: usize = 32;
 /// Opaque identity of actual node parameters, independent of UI preferences,
 /// selected route and subscription refresh timestamps. Never expose credentials.
 pub fn node_identity(node: &Value) -> String {
@@ -21,9 +22,32 @@ pub fn batch_stream(client: ApiClient, names: &[String], progress: &(dyn Fn(&str
 pub(crate) fn batch_stream_cancel(client: ApiClient, names: &[String], progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str) -> bool + Sync)) -> Result<Value,String> {
     display_batch_stream_cancel(client,names,DISPLAY_URL,DISPLAY_TIMEOUT_MS,progress,current)
 }
+pub(crate) fn batch_pass(client: ApiClient, names: &[String], quick: bool,
+    progress: &(dyn Fn(&str,&Value)+Sync), current: &(dyn Fn(&str)->bool+Sync)) -> Result<Value,String> {
+    display_batch_pass(client,names,DISPLAY_URL,if quick {DISCOVERY_TIMEOUT_MS}else{DISPLAY_TIMEOUT_MS},quick,progress,current)
+}
+#[cfg(test)]
+pub(crate) fn fixture_pass(client:ApiClient,names:&[String],timeout:u64,quick:bool,progress:&(dyn Fn(&str,&Value)+Sync))->Result<Value,String> {
+    display_batch_pass(client,names,DISPLAY_URL,timeout,quick,progress,&|_|true)
+}
+#[cfg(test)]
+pub(crate) fn fixture_full(client:&ApiClient,names:&[String],timeout:u64,workers:usize,progress:&(dyn Fn(&str,&Value)+Sync))->Value {
+    let order=discovery_order_with_workers(names,&Value::Null,DISPLAY_URL,workers);
+    run_display_batch_with_workers(&order,workers,&|name|serde_json::to_value(display_probe(client,name,DISPLAY_URL,timeout)).unwrap(),progress)
+}
 pub(crate) fn offline_batch_stream_cancel(settings: Settings, binary: PathBuf, parent: PathBuf, names: &[String],
     progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str) -> bool + Sync)) -> Result<Value,String> {
-    with_offline_core(settings,binary,parent,|client|batch_stream_cancel(client,names,progress,current))
+    with_offline_core(settings,binary,parent,|client| {
+        let first=display_batch_pass(client.clone(),names,DISPLAY_URL,DISCOVERY_TIMEOUT_MS,true,
+            &|name,value| {if value["retryFull"]!=true {progress(name,value);}},current)?;
+        let retry:Vec<_>=names.iter().filter(|name|first[*name]["retryFull"]==true && current(name)).cloned().collect();
+        let mut results=first.as_object().cloned().unwrap_or_default();
+        if !retry.is_empty() {
+            let full=display_batch_stream_cancel(client,&retry,DISPLAY_URL,DISPLAY_TIMEOUT_MS,progress,current)?;
+            results.extend(full.as_object().cloned().unwrap_or_default());
+        }
+        Ok(Value::Object(results))
+    })
 }
 
 /// Run a disposable, unprivileged Mihomo instance for URL tests while Atlas
@@ -76,16 +100,24 @@ fn display_batch_stream(client: ApiClient, names: &[String], endpoint: &str, tim
 }
 fn display_batch_stream_cancel(client: ApiClient, names: &[String], endpoint: &str, timeout: u64,
     progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str)->bool + Sync)) -> Result<Value,String> {
+    display_batch_pass(client,names,endpoint,timeout,false,progress,current)
+}
+fn display_batch_pass(client: ApiClient, names: &[String], endpoint: &str, timeout: u64, quick: bool,
+    progress: &(dyn Fn(&str,&Value)+Sync), current: &(dyn Fn(&str)->bool+Sync)) -> Result<Value,String> {
     let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
     let names = discovery_order(names, &proxies, endpoint);
     if let Some(broker) = client.broker_client() {
-        return service_batch_stream_cancel(&broker, &names, endpoint, timeout, progress,current);
+        return service_batch_pass(&broker, &names, endpoint, timeout, quick, progress,current);
     }
     // The caller already queues the full list. Publish only starts and results.
     Ok(discover_batch(&names, timeout, &|name, deadline| {
         if !current(name) {return TestResult {evidence:Default::default(),status:"cancelled".into(),delay:None,attempts:0,error:None};}
         progress(name,&json!({"status":"testing","delay":null,"attempts":0}));
-        display_probe(&client, name, endpoint, deadline)
+        if quick {
+            client.api("GET",&display_pass_path(name,endpoint,deadline,true),None)
+                .and_then(certified_record).and_then(|v|serde_json::from_value(v).map_err(|e|e.to_string()))
+                .unwrap_or_else(|e|failed_result(e,crate::probe_state::now_ms()))
+        } else {display_probe(&client, name, endpoint, deadline)}
     }, &|name,result| {if current(name) {progress(name,result);}}))
 }
 
@@ -96,8 +128,12 @@ pub(crate) fn service_batch_stream(broker: &crate::broker::Broker, names: &[Stri
     progress: &(dyn Fn(&str, &Value) + Sync)) -> Result<Value,String> {
     service_batch_stream_cancel(broker,names,endpoint,timeout,progress,&|_|true)
 }
-fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String], endpoint: &str, timeout: u64,
+pub(crate) fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String], endpoint: &str, timeout: u64,
     progress: &(dyn Fn(&str, &Value) + Sync), current: &(dyn Fn(&str)->bool + Sync)) -> Result<Value,String> {
+    service_batch_pass(broker,names,endpoint,timeout,false,progress,current)
+}
+fn service_batch_pass(broker: &crate::broker::Broker, names: &[String], endpoint: &str, timeout: u64, quick: bool,
+    progress: &(dyn Fn(&str,&Value)+Sync), current: &(dyn Fn(&str)->bool+Sync)) -> Result<Value,String> {
     use std::time::{Duration, Instant};
     let mut next = 0;
     let mut pending = std::collections::BTreeMap::<String,(String,Instant)>::new();
@@ -112,11 +148,16 @@ fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String],
         results.insert(name.to_owned(), value);
     };
     while next < names.len() || !pending.is_empty() {
+        let cancelled:Vec<_>=pending.iter().filter(|(_, (name,_))|!current(name)).map(|(id,_)|id.clone()).collect();
+        if !cancelled.is_empty() {
+            broker.call("delay_cancel",json!({"ids":cancelled}))?;
+            for id in &cancelled { pending.remove(id); }
+        }
         let end = (next + DISPLAY_WORKERS - pending.len()).min(names.len());
         if end > next {
             let admitted:Vec<_> = names[next..end].iter().filter(|name|current(name)).collect();
             if admitted.is_empty() {next=end;continue;}
-            let paths: Vec<_> = admitted.iter().map(|name|display_path(name, endpoint, timeout)).collect();
+            let paths: Vec<_> = admitted.iter().map(|name|display_pass_path(name, endpoint, timeout,quick)).collect();
             let jobs = crate::query_admission::retry_busy(Instant::now()+Duration::from_secs(5), ||
                 broker.call("delay_many", json!({"paths":paths})))?;
             let jobs = jobs.as_array().filter(|jobs|jobs.len()==admitted.len()).ok_or("Некорректный ответ очереди проверок")?;
@@ -147,7 +188,7 @@ fn service_batch_stream_cancel(broker: &crate::broker::Broker, names: &[String],
             publish(&name, Err("Проверка сервера превысила время ожидания".into()));
         }
         if !pending.is_empty() && (next == names.len() || pending.len() == DISPLAY_WORKERS) {
-            std::thread::sleep(Duration::from_millis(30));
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
     Ok(Value::Object(results))
@@ -276,6 +317,10 @@ fn certified_result(client: &ApiClient, name: &str, endpoint: &str, timeout: u64
 }
 fn display_path(name: &str, endpoint: &str, timeout: u64) -> String {
     format!("/proxies/{}/delay?timeout={timeout}&expected=204&atlas_probe=1&url={}", encode_name(name), encode_name(endpoint))
+}
+fn display_pass_path(name:&str,endpoint:&str,timeout:u64,quick:bool)->String {
+    let mut path=display_path(name,endpoint,timeout);
+    if quick {path.push_str("&atlas_quick=1");}path
 }
 fn certified_record(response: Value) -> Result<Value,String> {
     let record = &response["atlasProbe"];
@@ -464,7 +509,7 @@ mod tests {
     fn discovery_samples_subscription_tails_and_prioritizes_known_working_nodes() {
         let names: Vec<_> = (0..174).map(|i|format!("node-{i}")).collect();
         let cold = discovery_order(&names, &Value::Null, DISPLAY_URL);
-        assert_eq!(&cold[..6], &["node-0", "node-3", "node-6", "node-9", "node-12", "node-15"]);
+        assert_eq!(&cold[..8], &["node-0", "node-6", "node-12", "node-18", "node-24", "node-30", "node-36", "node-42"]);
         let mut sorted = cold.clone(); sorted.sort();
         let mut expected = names.clone(); expected.sort(); assert_eq!(sorted, expected);
         let proxies = json!({"proxies":{
@@ -564,7 +609,7 @@ mod tests {
             let names:Vec<_>=(0..174).map(|i|i.to_string()).collect();
             let names=discovery_order(&names,&Value::Null,DISPLAY_URL);
             discover_batch(&names,DISPLAY_TIMEOUT_MS,&|name,_| {
-                if name!="60" {
+                if name!="168" {
                     let deadline=std::time::Instant::now()+Duration::from_secs(5);
                     while !worker_release.load(Ordering::SeqCst) && std::time::Instant::now()<deadline {
                         std::thread::sleep(Duration::from_millis(5));
@@ -577,7 +622,7 @@ mod tests {
         let still_waiting=!worker.is_finished();
         released.store(true,Ordering::SeqCst);
         let results=worker.join().unwrap();
-        assert_eq!(first.unwrap(),"60");
+        assert_eq!(first.unwrap(),"168");
         assert!(still_waiting);
         assert_eq!(results.as_object().unwrap().len(),174);
     }
