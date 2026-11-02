@@ -89,7 +89,10 @@ fn compare_bounded_policies_on_silent_and_responding_nodes() {
         measurements.push(json!({"workers":workers,"phased":workers!=8,"fullMs":start.elapsed().as_millis(),"firstSuccessMs":first.into_inner().unwrap(),"maxConcurrentDelay":peak.load(Ordering::SeqCst),"healthy":ok,"timeout":failed}));
     }
     stop.store(true,Ordering::SeqCst);server.join().unwrap();
-    let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("artifacts/fast-ping-benchmark.json");std::fs::write(path,serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
+    let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("artifacts/fast-ping-benchmark.json");
+    // Clean CI checkouts do not contain the ignored artifacts directory.
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path,serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
     println!("PING_BENCH {}",json!(measurements));
     assert!(measurements[2]["firstSuccessMs"].as_u64().unwrap()<measurements[0]["firstSuccessMs"].as_u64().unwrap()/2);
     assert!(measurements[2]["fullMs"].as_u64().unwrap()<measurements[0]["fullMs"].as_u64().unwrap());
