@@ -1,11 +1,11 @@
 {
   "version": "3.3.1",
-  "exeSha256": "1d1adacc3ef841e318a1d70abbd663e5915a29b6cc40b34867b8aa4dc2328fa4",
-  "helperSha256": "1c779e6ea421c92abe3cc4641e1e57c61ec1c2811cea43159a01258a9a666893",
+  "exeSha256": "534cd0833fc8f38218b5ac7878075caefcc5a0616096092c74478879c357733f",
+  "helperSha256": "507f14a321282228d5507569be3fefd5871a3d0acb0a88f160d13219e7206ef7",
   "sources": [
     {
       "path": "scripts/build-root-installer.ps1",
-      "sha256": "e5b23ae7e1ee49bb1798dff973a991dd2c355d70cc427650df7cea627c6d78a6"
+      "sha256": "ab056eae687eb4dec3209c45a67985d2795b5eb1b09102252b8938b7213ef760"
     },
     {
       "path": "scripts/root-installer/build.rs",
@@ -73,7 +73,7 @@
     },
     {
       "path": "src-tauri/src/update_install.rs",
-      "sha256": "cce46de458eed7e1a7786cbc9633bebf0128f768051280a8312a3ef24ee76201"
+      "sha256": "b5ff2288e270b9773a2e87b5a2c027b91ca25101edf57510a454610273c5e549"
     },
     {
       "path": "src-tauri/src/update_integrity.rs",

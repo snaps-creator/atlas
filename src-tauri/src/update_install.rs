@@ -26,6 +26,13 @@ async fn metadata(client:&reqwest::Client,url:&str,limit:usize)->Result<Vec<u8>,
     }
     Ok(bytes)
 }
+async fn cancellable_metadata(client:&reqwest::Client,url:&str,limit:usize,cancel:&AtomicBool)->Result<Vec<u8>,String>{
+    if cancel.load(Ordering::SeqCst){return Err("Download cancelled".into());}
+    tokio::select! {
+        result=metadata(client,url,limit)=>result,
+        _=async {while !cancel.load(Ordering::SeqCst){tokio::time::sleep(Duration::from_millis(50)).await;}}=>Err("Download cancelled".into()),
+    }
+}
 pub fn elevated(executable:&Path,arguments:&str)->Result<(),String>{
     use std::os::windows::{ffi::OsStrExt,io::{FromRawHandle,OwnedHandle}};
     use windows_sys::Win32::{UI::Shell::*,System::Threading::*,Foundation::*};
@@ -102,8 +109,8 @@ fn setup_inner(cancel:&AtomicBool)->Result<(),String>{
         let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|"Update runtime failed")?;
         let client=crate::update_download::client()?;
         let base="https://github.com/snaps-creator/atlas/releases/latest/download";
-        let bytes=rt.block_on(metadata(&client,&format!("{base}/update-manifest.json"),1024*1024))?;
-        let signature=String::from_utf8(rt.block_on(metadata(&client,&format!("{base}/update-manifest.json.sig"),4096))?).map_err(|_|"Invalid manifest signature encoding")?;
+        let bytes=rt.block_on(cancellable_metadata(&client,&format!("{base}/update-manifest.json"),1024*1024,cancel))?;
+        let signature=String::from_utf8(rt.block_on(cancellable_metadata(&client,&format!("{base}/update-manifest.json.sig"),4096,cancel))?).map_err(|_|"Invalid manifest signature encoding")?;
         let verified=crate::update_integrity::manifest(&bytes,&signature,key)?;
         let manifest=verified.data();
         if stable(&manifest.version)?<stable(env!("CARGO_PKG_VERSION"))? || manifest.schema!=2 || manifest.installer_kind.as_deref()!=Some("transactional-v1") {
@@ -126,6 +133,27 @@ fn setup_inner(cancel:&AtomicBool)->Result<(),String>{
 }
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn cancelling_metadata_does_not_wait_for_a_stalled_server(){
+        use std::{io::Read,net::TcpListener};
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move||{
+            let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut buffer=[0;2048];let _=stream.read(&mut buffer);
+            // Never send HTTP headers; the downloader must cancel its request.
+            while stream.read(&mut buffer).is_ok_and(|n|n>0){}
+        });
+        let cancel=AtomicBool::new(false);
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let start=std::time::Instant::now();
+        let result=rt.block_on(async {
+            let client=reqwest::Client::builder().no_proxy().build().unwrap();let url=format!("http://{address}/manifest");
+            let request=cancellable_metadata(&client,&url,1024,&cancel);
+            let trigger=async {tokio::time::sleep(Duration::from_millis(150)).await;cancel.store(true,Ordering::SeqCst);};
+            tokio::join!(request,trigger).0
+        });
+        assert_eq!(result.unwrap_err(),"Download cancelled");assert!(start.elapsed()<Duration::from_secs(2));
+        server.join().unwrap();
+    }
     #[test]fn only_canonical_newer_stable_releases_are_downloaded(){
         assert!(newer("2.4.3","2.4.2").is_ok());
         for value in ["2.4.2","2.4.1","2.04.3","2.4.3/evil","2.4.3-alpha.1","https://other","2.4","2.4.3.4"]{assert!(newer(value,"2.4.2").is_err());}

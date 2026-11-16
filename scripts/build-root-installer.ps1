@@ -10,10 +10,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Root installer native verifier build failed' }
 $helper=Join-Path $env:CARGO_TARGET_DIR 'release/AtlasSetupHost.exe'
 $generated=Join-Path $env:CARGO_TARGET_DIR 'BootstrapPayload.cs'
 $hash=(Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash.ToLowerInvariant()
-[IO.File]::WriteAllText($generated,('internal static class BootstrapPayload { internal const string Sha256 = "'+$hash+'"; }'))
+$version=(Get-Content package.json -Raw | ConvertFrom-Json).version
+$assembly='using System.Reflection; [assembly:AssemblyTitle("Atlas Setup")] [assembly:AssemblyProduct("Atlas")] [assembly:AssemblyVersion("'+$version+'.0")] [assembly:AssemblyFileVersion("'+$version+'.0")] [assembly:AssemblyInformationalVersion("'+$version+'")] '
+[IO.File]::WriteAllText($generated,($assembly+'internal static class BootstrapPayload { internal const string Sha256 = "'+$hash+'"; }'))
 $compiler=Join-Path $env:SystemRoot 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 & $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll `
-    ('/out:'+(Join-Path $repo 'Install Atlas.exe')) ('/resource:'+$helper+',AtlasSetupHost.exe') $generated (Join-Path $PSScriptRoot 'root-installer/Program.cs')
+    ('/out:'+(Join-Path $repo 'Install Atlas.exe')) ('/win32icon:'+(Join-Path $repo 'src-tauri/icons/icon.ico')) ('/resource:'+$helper+',AtlasSetupHost.exe') $generated (Join-Path $PSScriptRoot 'root-installer/Program.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Root installer window build failed' }
 $sources=@('src-tauri/src/updater_main.rs','src-tauri/tauri.conf.json','scripts/root-installer/Program.cs','scripts/root-installer/Cargo.toml','scripts/root-installer/Cargo.lock','scripts/root-installer/build.rs','scripts/build-root-installer.ps1')
 foreach ($match in [regex]::Matches([IO.File]::ReadAllText((Join-Path $repo 'src-tauri/src/updater_main.rs')),'(?m)^mod ([a-z_]+);')) {

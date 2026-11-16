@@ -12,6 +12,7 @@ foreach ($source in $record.sources) {
     }
 }
 $exe=Join-Path $repo 'Install Atlas.exe'
+if ((Get-Item -LiteralPath $exe).VersionInfo.ProductVersion -ne $version) { throw 'Root EXE product version differs from the release' }
 if ((Get-Item -LiteralPath $exe).Length -ge 25MB) { throw 'Root installer exceeds the direct-download size budget' }
 if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $record.exeSha256) { throw 'Root installer checksum differs' }
 $process=Start-Process -FilePath $exe -ArgumentList '--verify' -WindowStyle Hidden -PassThru
