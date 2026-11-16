@@ -4,6 +4,13 @@ pub struct UpdateLock(HANDLE);
 impl Drop for UpdateLock {fn drop(&mut self){unsafe{ReleaseMutex(self.0);CloseHandle(self.0);}}}
 impl UpdateLock {
     pub fn acquire(timeout_ms:u32)->Result<Self,String> {Self::named("Global\\Atlas.Update.Transaction.v1",timeout_ms)}
+    pub fn acquire_operation()->Result<Self,String>{Self::operation_named("Global\\Atlas.Update.Transaction.v1")}
+    fn operation_named(name:&str)->Result<Self,String>{
+        // Startup and service admission share this mutex. A short hand-off is
+        // not a concurrent update: let it finish before inspecting state.
+        // Ownership stays exclusive; a stuck owner still fails after 30 seconds.
+        Self::named(name,30_000)
+    }
     /// An abandoned mutex is permission to recover, never permission to start a
     /// VPN session. Inspect persistent authority while retaining the mutex.
     pub fn admit_session()->Result<Self,String>{
@@ -58,6 +65,34 @@ fn session_stage(journal:&serde_json::Value,directory:&str)->Result<(),String>{
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn update_waits_for_startup_handoff_without_overlapping_owners() {
+        use std::{sync::mpsc,time::Duration};
+        let name=format!("Local\\Atlas.Update.Handoff.{}",uuid::Uuid::new_v4());
+        let startup=UpdateLock::named(&name,0).unwrap();
+        let (ready_tx,ready_rx)=mpsc::channel();let (done_tx,done_rx)=mpsc::channel();
+        let waiter=std::thread::spawn(move||{
+            ready_tx.send(()).unwrap();
+            let operation=UpdateLock::operation_named(&name);
+            done_tx.send(operation.is_ok()).unwrap();
+            drop(operation);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(100)),Err(mpsc::RecvTimeoutError::Timeout)));
+        drop(startup);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+    }
+    #[test] fn busy_owner_is_never_bypassed_after_a_bounded_wait() {
+        use std::time::{Duration,Instant};
+        let name=format!("Local\\Atlas.Update.Busy.{}",uuid::Uuid::new_v4());
+        let owner=UpdateLock::named(&name,0).unwrap();let other=name.clone();
+        std::thread::spawn(move||{
+            let started=Instant::now();
+            assert!(UpdateLock::named(&other,100).is_err());
+            assert!(started.elapsed()>=Duration::from_millis(90));
+        }).join().unwrap();
+        drop(owner);assert!(UpdateLock::named(&name,0).is_ok());
+    }
     #[test] fn concurrent_thread_cannot_enter_and_drop_releases_lock() {
         let name=format!("Local\\Atlas.Update.Test.{}",uuid::Uuid::new_v4());
         let lock=UpdateLock::named(&name,0).unwrap();let other=name.clone();

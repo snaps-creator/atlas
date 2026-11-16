@@ -1,7 +1,7 @@
 {
   "version": "3.3.1",
-  "exeSha256": "534cd0833fc8f38218b5ac7878075caefcc5a0616096092c74478879c357733f",
-  "helperSha256": "507f14a321282228d5507569be3fefd5871a3d0acb0a88f160d13219e7206ef7",
+  "exeSha256": "3b784834af65bbbebea28b044a19386af407c9c2645ce9c8ab89418821d6ccff",
+  "helperSha256": "03297d71c8a87106e7861345332c074b8ff168708cef97c6b31f7d29e1a113bc",
   "sources": [
     {
       "path": "scripts/build-root-installer.ps1",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src-tauri/src/update_bootstrap.rs",
-      "sha256": "fdd673e5a5423ebdd26548d523f83adc63ab73ea878d57e8b67050b40509cb95"
+      "sha256": "3a9d48944adf672abb2626fccb046b7fb4c616742b88a18d5c592d71b37b25a5"
     },
     {
       "path": "src-tauri/src/update_bundle.rs",
@@ -85,7 +85,7 @@
     },
     {
       "path": "src-tauri/src/update_lock.rs",
-      "sha256": "399f6a278fc0c2403941ea5fb25df4157e4d4ae29b43294313022a2879aa66e6"
+      "sha256": "9236df1eb133d73ae952aeea13e187dd5b6a6ff7016f98fa0b691493e00c4f82"
     },
     {
       "path": "src-tauri/src/update_log.rs",
@@ -117,7 +117,7 @@
     },
     {
       "path": "src-tauri/src/updater_main.rs",
-      "sha256": "b1c452c070764a1a98d3372b5aa55d7eeec3e430483eeb9d156bfa1038b060d9"
+      "sha256": "ab5bd63e947ec44cc0217612ce88a99264ab0260d393d35efcd6a3d59430f982"
     },
     {
       "path": "src-tauri/src/windows.rs",

@@ -73,6 +73,7 @@ fn run()->Result<(),String> {
         let executable=std::env::current_exe().map_err(|e|e.to_string())?;
         let root=executable.parent().ok_or("Missing updater installation")?;
         let manifest=signed_manifest(std::path::Path::new(&args[2]),std::path::Path::new(&args[3]))?;
+        let _lease=update_lock::UpdateLock::acquire_operation()?;
         let mut transaction=update_transaction::Transaction::open(root)?;
         if manifest.data().payload()?!=transaction.journal.candidate || manifest.data().sha256!=transaction.journal.expected_artifact_hash {
             return Err("Prepared transaction differs from signed update metadata".into());
@@ -88,6 +89,7 @@ fn run()->Result<(),String> {
     if args.len()==2 && args[1]=="--recover" {
         let executable=std::env::current_exe().map_err(|e|e.to_string())?;
         let root=executable.parent().ok_or("Missing updater installation")?;
+        let _lease=update_lock::UpdateLock::acquire_operation()?;
         let mut transaction=update_transaction::Transaction::open(root)?;
         let mut host=update_windows::Windows::prepare(&transaction,update_user::database()?)?;
         update_supervisor::recover(&mut transaction,&mut host)?;

@@ -23,7 +23,7 @@ fn main() {
         return;
     }
     let result = if args.len() == 3 && args[1] == "--prepare-install" {
-        update_lock::UpdateLock::acquire(0).and_then(|_lock| maintenance::prepare(std::path::Path::new(&args[2])))
+        update_lock::UpdateLock::acquire_operation().and_then(|_lock| maintenance::prepare(std::path::Path::new(&args[2])))
     } else {
         Err("Expected --inspect or --prepare-install <installation directory>".into())
     };
