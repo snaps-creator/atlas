@@ -1,11 +1,11 @@
 {
   "version": "3.3.1",
-  "exeSha256": "3b784834af65bbbebea28b044a19386af407c9c2645ce9c8ab89418821d6ccff",
-  "helperSha256": "03297d71c8a87106e7861345332c074b8ff168708cef97c6b31f7d29e1a113bc",
+  "exeSha256": "729d7000e75d621930f88efb772ad9bf9208c7d023986d779266972700f42747",
+  "helperSha256": "2a91d587193c629d266c82934591ce9501917d2201d5b344cc75f1322a0366a1",
   "sources": [
     {
       "path": "scripts/build-root-installer.ps1",
-      "sha256": "ab056eae687eb4dec3209c45a67985d2795b5eb1b09102252b8938b7213ef760"
+      "sha256": "40a4bc0c9ac2280fdf8871166d6cc5619c6c5ae5d265010520b68efc3e583a56"
     },
     {
       "path": "scripts/root-installer/build.rs",
