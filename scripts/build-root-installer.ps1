@@ -5,9 +5,17 @@ Set-Location -LiteralPath $repo
 . (Join-Path $PSScriptRoot 'initialize-msvc.ps1')
 $env:CARGO_TARGET_DIR=[IO.Path]::GetFullPath((Join-Path $repo $TargetDirectory))
 $env:CARGO_INCREMENTAL='0'
-cargo build --locked --offline --release --manifest-path scripts/root-installer/Cargo.toml --bin AtlasSetupHost
-if ($LASTEXITCODE -ne 0) { throw 'Root installer native verifier build failed' }
-$helper=Join-Path $env:CARGO_TARGET_DIR 'release/AtlasSetupHost.exe'
+$previousRustFlags=$env:RUSTFLAGS
+try {
+    # This helper runs before the full package can provide the VC++ runtime.
+    # https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes
+    $env:RUSTFLAGS=($previousRustFlags+' -C target-feature=+crt-static').Trim()
+    cargo build --locked --offline --release --target x86_64-pc-windows-msvc --manifest-path scripts/root-installer/Cargo.toml --bin AtlasSetupHost
+    if ($LASTEXITCODE -ne 0) { throw 'Root installer native verifier build failed' }
+} finally { $env:RUSTFLAGS=$previousRustFlags }
+$helper=Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/AtlasSetupHost.exe'
+node (Join-Path $PSScriptRoot 'verify-root-helper.cjs') $helper
+if ($LASTEXITCODE -ne 0) { throw 'Root helper requires a non-Windows runtime' }
 $generated=Join-Path $env:CARGO_TARGET_DIR 'BootstrapPayload.cs'
 $hash=(Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash.ToLowerInvariant()
 $version=(Get-Content package.json -Raw | ConvertFrom-Json).version
