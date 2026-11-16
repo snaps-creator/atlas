@@ -5,6 +5,27 @@ on:
 permissions:
   contents: read
 jobs:
+  installer-context:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/t/native-context
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Initialize native compiler
+        shell: pwsh
+        run: ./scripts/initialize-msvc.ps1
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: scripts/root-installer -> ../../t/native-context
+      - name: Test production native installer code without waiting for CEF
+        run: cargo test --locked --manifest-path scripts/root-installer/Cargo.toml --bin AtlasSetupHost
+      - name: Exercise different accounts and elevated Explorer
+        run: ./scripts/test-alternate-installer-user.ps1 -ManifestPath scripts/root-installer/Cargo.toml -Binary AtlasSetupHost
+      - name: Verify real limited child process
+        run: cargo test --locked --manifest-path scripts/root-installer/Cargo.toml --bin AtlasSetupHost -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
   release-readiness:
     uses: ./.github/workflows/updater-readiness.yml
   test:

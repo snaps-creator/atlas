@@ -1,3 +1,4 @@
+param([string]$ManifestPath='src-tauri/Cargo.toml',[string]$Binary='AtlasUpdater')
 $ErrorActionPreference = 'Stop'
 # Account creation is confined to disposable CI; never alter workstation users.
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') {
@@ -20,9 +21,9 @@ try {
         -WorkingDirectory "$env:SystemRoot\System32" `
         -ArgumentList '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 300"'
     $env:ATLAS_TEST_DESKTOP_PID = [string]$profileProcess.Id
-    cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::credential_elevation_uses_desktop_account --ignored
+    cargo test --locked --manifest-path $ManifestPath --bin $Binary -- --exact update_user::tests::credential_elevation_uses_desktop_account --ignored
     if ($LASTEXITCODE -ne 0) { throw 'Alternate-user installer regression failed' }
-    cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::elevated_shell_is_reduced_before_desktop_launch --ignored
+    cargo test --locked --manifest-path $ManifestPath --bin $Binary -- --exact update_user::tests::elevated_shell_is_reduced_before_desktop_launch --ignored
     if ($LASTEXITCODE -ne 0) { throw 'Elevated-shell installer regression failed' }
 } finally {
     Remove-Item Env:ATLAS_TEST_DESKTOP_PID -ErrorAction SilentlyContinue

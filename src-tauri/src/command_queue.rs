@@ -10,7 +10,8 @@ fn priority(op: &str) -> u8 {
     match op {
         "stop" | "disconnect" | "quit" => 0,
         "start" | "connect" | "apply" | "select" | "save" => 1,
-        "delay" | "delay_many" | "delay_results" => 3,
+        // Reads and probe submissions/results share FIFO admission. Continuous
+        // status polling must not starve the very replies that release jobs.
         _ => 2,
     }
 }
@@ -43,6 +44,25 @@ impl Drop for Permit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_polling_cannot_overtake_an_already_waiting_probe_result() {
+        let queue=std::sync::Arc::new(Queue::default());
+        let active=queue.acquire("query",Duration::from_secs(5),None).unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let q=queue.clone();let first=tx.clone();
+        let probe=std::thread::spawn(move || {let _p=q.acquire("delay_results",Duration::from_secs(5),None).unwrap();first.send("probe").unwrap();});
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while queue.state.lock().unwrap().waiting.len()!=1 {assert!(Instant::now()<deadline);std::thread::yield_now();}
+        let mut readers=Vec::new();
+        for _ in 0..16 {
+            let q=queue.clone();let tx=tx.clone();
+            readers.push(std::thread::spawn(move || {let _p=q.acquire("query",Duration::from_secs(5),None).unwrap();tx.send("read").unwrap();}));
+        }
+        while queue.state.lock().unwrap().waiting.len()!=17 {assert!(Instant::now()<deadline);std::thread::yield_now();}
+        drop(active);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),"probe");
+        probe.join().unwrap();for reader in readers {reader.join().unwrap();}
+    }
     #[test]
     fn stop_overtakes_64_queued_probes_without_interrupting_active_frame() {
         let queue=std::sync::Arc::new(Queue::default());

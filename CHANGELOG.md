@@ -7,6 +7,7 @@
 - Add a directly downloadable `Install Atlas.exe` in the repository root, backed by the existing signed transactional release verifier.
 - Exercise real 3.2.3 upgrades, reinstall and clean install with another administrator; preserve the original user's settings and credentials.
 - Align download documentation and version manifests with 3.3.1.
+- Keep fresh server checks visible across slow status reads; cancel orphaned probe jobs and recover polling after stalled IPC without restarting Atlas.
 
 ## 3.2.3 (local, unpublished)
 

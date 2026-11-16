@@ -1392,8 +1392,7 @@ impl ApiClient {
         let endpoint=params.get("url").ok_or("Не указан URL проверки")?;
         let timeout=params.get("timeout").and_then(|s|s.parse::<u64>().ok()).unwrap_or(10000).min(10000);
         let ticket=self.probes.lock().unwrap().begin(&name,endpoint)?;
-        let gate=ticket.gate.clone();
-        let _serial=gate.lock().map_err(|_|"Проверка сервера недоступна")?;
+        let _serial=ticket.acquire(cancelled)?;
         if !self.probes.lock().unwrap().current(&ticket) {return Err("CANCELLED: проверка устарела".into());}
         let result=(|| {
             crate::probe_state::validate_route(&ticket.node)?;

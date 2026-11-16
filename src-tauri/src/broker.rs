@@ -1452,6 +1452,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_batch_poll_cancels_submitted_jobs_before_returning() {
+        let (mut server,client)=pipe_pair();
+        let broker=Broker {admission:Default::default(),pipe:Mutex::new(Some(client))};
+        let worker=thread::spawn(move || {
+            assert_eq!(receive(&mut server,Duration::from_secs(3)).unwrap()["op"],"delay_many");
+            send(&mut server,&json!({"result":[{"id":"pending"}]})).unwrap();
+            assert_eq!(receive(&mut server,Duration::from_secs(3)).unwrap()["op"],"delay_results");
+            send(&mut server,&json!({"result":null})).unwrap();
+            let cancel=receive(&mut server,Duration::from_secs(3)).unwrap();
+            assert_eq!(cancel["op"],"delay_cancel");assert_eq!(cancel["payload"]["ids"],json!(["pending"]));
+            send(&mut server,&json!({"result":{}})).unwrap();
+        });
+        let result=crate::latency::service_batch_stream(&broker,&["node".into()],
+            crate::latency::DISPLAY_URL,1000,&|_,_|{});
+        assert_eq!(result.unwrap_err(),"Некорректный ответ проверок");worker.join().unwrap();
+    }
+    #[test]
     fn restarted_batch_releases_pending_probe_without_stopping_service() {
         use std::sync::atomic::{AtomicBool,Ordering};
         let (mut server,client)=pipe_pair();
