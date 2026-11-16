@@ -74,6 +74,13 @@ jobs:
         # The background timer must cross the previous 30-second expiry in real
         # time too; ordinary scheduler tests use controlled monotonic time.
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact latency_refresh::tests::real_timer_cycles_without_a_page --ignored
+      - name: Repeat startup search across a fresh service client
+        shell: pwsh
+        run: |
+          1..5 | ForEach-Object {
+            cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact resilient_selection::tests::startup_search_reaches_ninth_node_after_a_fresh_service_client --nocapture
+            if ($LASTEXITCODE -ne 0) { throw "Startup search regression failed on attempt $_" }
+          }
       - name: Verify actual restricted desktop process
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
       - name: Verify installation with another administrator and elevated Explorer
