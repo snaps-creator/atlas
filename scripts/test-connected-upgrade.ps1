@@ -1,5 +1,5 @@
 param([Parameter(Mandatory=$true)][string]$Installer,[switch]$LegacyBaseline,[string]$PreviousInstaller,
-    [ValidateSet('2.4.2','3.0.1','3.0.2','3.0.3','3.0.4')][string]$BaselineVersion='2.4.2')
+    [ValidateSet('2.4.2','3.0.1','3.0.2','3.0.3','3.0.4','3.2.3')][string]$BaselineVersion='2.4.2')
 $ErrorActionPreference = 'Stop'
 # Never run this acceptance on a user's workstation: it creates a real Wintun
 # adapter and installs a service. GitHub's disposable Windows job is required.
@@ -9,7 +9,7 @@ if (Get-NetAdapter -Name Atlas-TUN -ErrorAction SilentlyContinue) { throw 'Runne
 $repo = Split-Path $PSScriptRoot -Parent
 $candidate = (Resolve-Path -LiteralPath $Installer).Path
 $fixture = Join-Path $env:RUNNER_TEMP ('atlas-connected-upgrade-' + [guid]::NewGuid().ToString('N'))
-$installRoot = Join-Path $fixture 'installed'
+$installRoot = Join-Path $fixture $(if ($BaselineVersion -eq '3.2.3') { 'installed custom path' } else { 'installed' })
 New-Item -ItemType Directory -Path $fixture | Out-Null
 # WFP is a normal Windows prerequisite. Hosted CI images may stop BFE;
 # explicitly prepare it only on this guarded, disposable test machine.
@@ -121,9 +121,23 @@ function Recovery-Root {
     return $installRoot
 }
 function Install-Checked([string]$path) {
-    $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
-    if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installer exceeded three minutes' }
-    if ($process.ExitCode -ne 0) {
+    $otherAdmin=$BaselineVersion -eq '3.2.3' -and $path -eq $candidate
+    $registered=(Get-ItemProperty -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas' -Name InstallLocation -ErrorAction SilentlyContinue).InstallLocation
+    $useRegistered=$path -eq $candidate -and [bool]$registered
+    if ($useRegistered -and $registered -ne $installRoot) { throw 'Registered fixture location differs from the owned installation' }
+    if ($otherAdmin) {
+        $result=& (Join-Path $PSScriptRoot 'invoke-other-admin-installer.ps1') -Installer $path -InstallRoot $installRoot -OutputDirectory $fixture -UseRegisteredLocation:$useRegistered
+        $installerExit=$result.exitCode
+    } else {
+        $arguments=@('/S','/UPDATE')
+        if (-not $useRegistered) { $arguments+="/D=$installRoot" }
+        $process = Start-Process -FilePath $path -ArgumentList $arguments -WindowStyle Hidden -PassThru
+        $handle=$process.Handle
+        if (-not $process.WaitForExit(180000)) { throw 'Installer exceeded three minutes' }
+        $process.WaitForExit()
+        $installerExit=$process.ExitCode
+    }
+    if ($installerExit -ne 0) {
         Write-Output "Failed installer: $path; expected installation: $installRoot"
         foreach ($logName in @('atlas-transactional-install.log','atlas-install-recovery.log')) {
             $nativeLog = Join-Path $env:TEMP $logName
@@ -171,7 +185,22 @@ function Install-Checked([string]$path) {
         if ($transactional -and $journal.candidate.id -match '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,99}$') {
             Diagnose-RestrictedHelper (Join-Path $installRoot ('versions/' + $journal.candidate.id + '/AtlasMaintenance.exe'))
         }
-        throw "Installer failed: $($process.ExitCode)"
+        throw "Installer failed: $installerExit"
+    }
+    if ($useRegistered) {
+        $committed=Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+        if ($committed.stage -ne 'Committed') { throw 'Upgrade without /D did not commit in the registered directory' }
+        Write-Output 'PASS: installer reused its registered location without /D, matching in-app and manual update discovery.'
+    }
+    if ($otherAdmin) {
+        $committed=Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+        $state=Get-Content -LiteralPath (Join-Path $installRoot ('state-'+$committed.transaction_id+'/windows.json')) -Raw | ConvertFrom-Json
+        $expectedSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $expectedDatabase=Join-Path $env:LOCALAPPDATA 'net.atlasvpn.desktop/atlas.db'
+        if ($committed.stage -ne 'Committed' -or $state.user_sid -ne $expectedSid -or $state.database -ne $expectedDatabase) {
+            throw 'Credential elevation lost the desktop user or settings identity'
+        }
+        Write-Output 'PASS: real installer with another administrator committed for the original desktop user and database.'
     }
 }
 $previousVersion = if ($PreviousInstaller) { '2.4.3' } elseif ($LegacyBaseline) { '2.2.3-alpha.47.1' } else { $BaselineVersion }

@@ -1,0 +1,131 @@
+{
+  "version": "3.3.1",
+  "exeSha256": "3b784834af65bbbebea28b044a19386af407c9c2645ce9c8ab89418821d6ccff",
+  "helperSha256": "03297d71c8a87106e7861345332c074b8ff168708cef97c6b31f7d29e1a113bc",
+  "sources": [
+    {
+      "path": "scripts/build-root-installer.ps1",
+      "sha256": "ab056eae687eb4dec3209c45a67985d2795b5eb1b09102252b8938b7213ef760"
+    },
+    {
+      "path": "scripts/root-installer/build.rs",
+      "sha256": "41a067f139a31f0ec30d3f3dabcc025b9d9ff70619ed3bf10995de125ae21493"
+    },
+    {
+      "path": "scripts/root-installer/Cargo.lock",
+      "sha256": "dbd9e46a140d4b3ca10c173fef173645521acb2856f9e462a8352110034766f0"
+    },
+    {
+      "path": "scripts/root-installer/Cargo.toml",
+      "sha256": "45e1fb9f82c6f7e7748b379cb96f44de5d7540511becd407ddf5bf0c7d9da532"
+    },
+    {
+      "path": "scripts/root-installer/Program.cs",
+      "sha256": "5874583eb1bc02c657cdbc68580bfb820e8e2928e358e2f0799e5a3cc088bf0a"
+    },
+    {
+      "path": "src-tauri/src/lan_policy.rs",
+      "sha256": "a0cf66eb02638947e3f734b1a63e577e254813163f1692ca290de664c35f1338"
+    },
+    {
+      "path": "src-tauri/src/maintenance.rs",
+      "sha256": "77c6d044889134d96f1f1379882a3d47b7b9c0f1ae6f0711157824c4dbe57b2a"
+    },
+    {
+      "path": "src-tauri/src/network_guard.rs",
+      "sha256": "2334da5541143858eaf578205e6c91c95037eac01cf8eb873900f397dba42b1d"
+    },
+    {
+      "path": "src-tauri/src/shell_identity.rs",
+      "sha256": "681229e2532749aa9dee4ea59c5c25dc40059557f74f08b9df9263b84430ccba"
+    },
+    {
+      "path": "src-tauri/src/uninstall_hive.rs",
+      "sha256": "24e9b0af8c78a71b0030b30516f3032aa8f7a6786c255e2c146debc595e246e6"
+    },
+    {
+      "path": "src-tauri/src/uninstall_startup.rs",
+      "sha256": "488b0ea95c0e105bd26473b87104c18d70049ae4f34c9e51a697289a79e1b95f"
+    },
+    {
+      "path": "src-tauri/src/update_bootstrap.rs",
+      "sha256": "3a9d48944adf672abb2626fccb046b7fb4c616742b88a18d5c592d71b37b25a5"
+    },
+    {
+      "path": "src-tauri/src/update_bundle.rs",
+      "sha256": "32c30ec959e27bc224defc2d4b488e0f290449ea27b5f15dfc206a5ee777331f"
+    },
+    {
+      "path": "src-tauri/src/update_candidate.rs",
+      "sha256": "5db1dfa762f867e7ec7c59fc284cbb4d47fe2c242e1b5e03a3ddc7bf49a1b4c6"
+    },
+    {
+      "path": "src-tauri/src/update_data.rs",
+      "sha256": "840d4709c4bb85e06efd80047e901a8ff383559c4dcb9ca7ee8f603b1b3083b5"
+    },
+    {
+      "path": "src-tauri/src/update_download.rs",
+      "sha256": "71e479d5c9cbba9f292da77f6cd7835916a41325db4abb366456168eae5a6278"
+    },
+    {
+      "path": "src-tauri/src/update_health.rs",
+      "sha256": "9a1cdec33bc60c15fa45a72fae4e3198452dcdc1362086650840b26d141da80e"
+    },
+    {
+      "path": "src-tauri/src/update_install.rs",
+      "sha256": "b5ff2288e270b9773a2e87b5a2c027b91ca25101edf57510a454610273c5e549"
+    },
+    {
+      "path": "src-tauri/src/update_integrity.rs",
+      "sha256": "ef102def2253771ae540be1d630737d69d41cbcc9d04f20771aa41eedda55c8a"
+    },
+    {
+      "path": "src-tauri/src/update_launcher.rs",
+      "sha256": "c825ad4973da4a739db48c778148f3155de05d1e0b8b2860162c0ecd0cccf9c5"
+    },
+    {
+      "path": "src-tauri/src/update_lock.rs",
+      "sha256": "9236df1eb133d73ae952aeea13e187dd5b6a6ff7016f98fa0b691493e00c4f82"
+    },
+    {
+      "path": "src-tauri/src/update_log.rs",
+      "sha256": "96db827a85bded4307d8937f3b57e59331639b265b4c67df488e2c9d8dee6a9c"
+    },
+    {
+      "path": "src-tauri/src/update_process.rs",
+      "sha256": "cc1537805ab8240e7e0253e1bd9d26708fe53d7a8aa2d3b27494474c335cd74d"
+    },
+    {
+      "path": "src-tauri/src/update_service.rs",
+      "sha256": "3016338aa41c539e85c028b0c76de5fb7b0f30236440b2fed023abff87472428"
+    },
+    {
+      "path": "src-tauri/src/update_supervisor.rs",
+      "sha256": "ab7be86b14c74052be75c4c369a6744bb94134b79a793dd093ddb647e80ac7cd"
+    },
+    {
+      "path": "src-tauri/src/update_transaction.rs",
+      "sha256": "1807a3e02a4b1dedca5a0be9e4ad5958bfd82097e889802cf1728d6b3a587f56"
+    },
+    {
+      "path": "src-tauri/src/update_user.rs",
+      "sha256": "3b9f594c6a196a5f71e96dc64e45d189eb311f64102bb96cf50ec4820914b580"
+    },
+    {
+      "path": "src-tauri/src/update_windows.rs",
+      "sha256": "a2961fa8d67a65105988d4cea5cac7f343caada571d1b6261648b8ea7a1a6efb"
+    },
+    {
+      "path": "src-tauri/src/updater_main.rs",
+      "sha256": "ab5bd63e947ec44cc0217612ce88a99264ab0260d393d35efcd6a3d59430f982"
+    },
+    {
+      "path": "src-tauri/src/windows.rs",
+      "sha256": "2a5de6950bdb3c02d1240e7e0f267c159f8426fee3c433e7d28d073aae2c3c9e"
+    },
+    {
+      "path": "src-tauri/tauri.conf.json",
+      "sha256": "746b760a526ef3b0d9b50e3c3ff345caaede1d896205eb527c3f757979eea865"
+    }
+  ]
+}

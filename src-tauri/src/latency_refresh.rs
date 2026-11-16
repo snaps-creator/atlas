@@ -165,8 +165,14 @@ fn overlay_live(view: &mut Value, proxies: &Value) {
     let pending=view["pending"].as_array().cloned().unwrap_or_default();
     let identities=view["identities"].clone();
     for (name,value) in view["results"].as_object_mut().unwrap() {
+        if value["probeId"].is_string() && value["probeId"]!=identities[name] {*value=Value::Null;}
         let record=&proxies["proxies"][name]["atlasHealth"];
-        *value=if record.is_object() && record["probeId"]==identities[name] {record.clone()} else {Value::Null};
+        // A controller snapshot may have started before this batch completed.
+        // Never let its missing/older record erase a certified streamed result.
+        let age = |v: &Value| (v["startedAt"].as_u64().or_else(||v["measuredAt"].as_u64()).unwrap_or(0),
+            v["operationId"].as_u64().unwrap_or(0));
+        if record.is_object() && record["probeId"]==identities[name]
+            && (!value.is_object() || age(record)>=age(value)) { *value=record.clone(); }
         if pending.iter().any(|n|n==name) {mark_pending(value);}
     }
     let mut selected="ATLAS";
@@ -214,7 +220,9 @@ impl Refresh {
             if let Some((_,proxies))=state.live.as_ref().filter(|(at,_)|now.saturating_duration_since(*at)<Duration::from_secs(3)) {
                 overlay_live(&mut view,proxies);
             } else {
-                for value in view["results"].as_object_mut().unwrap().values_mut() {*value=Value::Null;}
+                // Batch replies already carry service-certified evidence and
+                // expire in Catalog::view. A slow status read is not a new
+                // network generation and must not blank all measured nodes.
                 view["selected"]=Value::Null;
             }
         }
@@ -233,11 +241,10 @@ impl Refresh {
                     observer.reconcile(&snapshot);
                     if snapshot.status=="Connected" {
                         let generation=observer.0.lock().unwrap_or_else(|e|e.into_inner()).generation;
-                        let observed=Instant::now();
                         let result=snapshot.client.api("GET","/proxies",None);
                         if let Ok(latest)=observer_reads.get() {observer.reconcile(&latest);}
                         let mut state=observer.0.lock().unwrap_or_else(|e|e.into_inner());
-                        if state.generation==generation {state.live=result.ok().map(|v|(observed,v));}
+                        if state.generation==generation {state.live=result.ok().map(|v|(Instant::now(),v));}
                         drop(state);observer_notify();
                     }
                 }
@@ -308,6 +315,32 @@ impl Refresh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_batch_survives_a_stalled_observer_and_an_older_snapshot() {
+        let mut settings=crate::model::Settings::default();
+        settings.subscriptions.push(crate::model::Subscription {source:Default::default(),options:Default::default(),
+            id:"fixture".into(),name:"fixture".into(),masked_url:String::new(),updated_at:0,error:None,
+            servers:vec![json!({"name":"a","type":"socks5","server":"127.0.0.1","port":1234})]});
+        let snapshot=ReadSnapshot {revision:0,settings,status:"Connected".into(),
+            client:crate::core::ApiClient::loopback_fixture(1),binary:Default::default(),directory:Default::default()};
+        let refresh=Refresh::default();refresh.reconcile(&snapshot);
+        let now=Instant::now();let wall=crate::probe_state::now_ms();
+        let mut catalog=refresh.0.lock().unwrap();let ticket=catalog.take(now).remove(0);
+        let record=json!({"status":"ok","delay":42,"probeId":ticket.identity,"startedAt":wall,"measuredAt":wall});
+        catalog.accept(&ticket,&record,now,wall);catalog.batch_running=false;drop(catalog);
+        assert_eq!(refresh.view(&snapshot,None,false)["results"]["a"]["delay"],42);
+        let mut view=refresh.view(&snapshot,None,false);
+        overlay_live(&mut view,&json!({"proxies":{"a":{"atlasHealth":{"probeId":ticket.identity,
+            "status":"unreachable","startedAt":wall-1000,"measuredAt":wall-500}}}}));
+        assert_eq!(view["results"]["a"]["delay"],42);
+        overlay_live(&mut view,&json!({"proxies":{"a":{"atlasHealth":{"probeId":ticket.identity,
+            "status":"unreachable","delay":null,"startedAt":wall+1000,"measuredAt":wall+1100}}}}));
+        assert_eq!(view["results"]["a"]["status"],"unreachable");
+        let mut catalog=refresh.0.lock().unwrap();
+        catalog.entries.get_mut("a").unwrap().completed=Some(now-FRESH_FOR);
+        drop(catalog);assert!(refresh.view(&snapshot,None,false)["results"]["a"]["delay"].is_null());
+        refresh.invalidate();assert!(refresh.view(&snapshot,None,false)["results"]["a"]["delay"].is_null());
+    }
     #[test]
     fn ui_reads_never_contact_controller_and_expire_cached_evidence() {
         let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();

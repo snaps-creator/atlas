@@ -648,7 +648,19 @@ mod tests {
             while !stopped.load(Ordering::SeqCst) {
                 if let Ok((mut socket,_))=listener.accept() {
                     std::thread::spawn(move || {
-                        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut request=[0;4096];let size=socket.read(&mut request).unwrap_or(0);let request=String::from_utf8_lossy(&request[..size]);
+                        // TCP may split the request line and headers across reads.
+                        // Classify only a complete request, including under CI load.
+                        // Windows inherits the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        let mut request=Vec::new();let mut part=[0;1024];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            let size=socket.read(&mut part).unwrap();
+                            assert!(size>0,"Fixture received an incomplete HTTP request");
+                            request.extend_from_slice(&part[..size]);
+                            assert!(request.len()<=16*1024,"Fixture request exceeds its bound");
+                        }
+                        let request=String::from_utf8_lossy(&request);
                         let failed=request.contains("/delay?") && !request.contains("/node-08/delay?");
                         let body=if request.contains("/delay?") {json!({"delay":40})} else {
                             let proxies:serde_json::Map<_,_>=(0..12).map(|index| {
@@ -670,7 +682,7 @@ mod tests {
         let second=verify_progressive(&ApiClient::loopback_fixture(port).with_probe_settings(&settings),&settings,&HashSet::new(),&crate::latency::ENDPOINTS,Some(&cursor));
         stop.store(true,Ordering::SeqCst);worker.join().unwrap();std::fs::remove_dir_all(directory).unwrap();
         assert!(!first["candidate"].is_string());assert_eq!(first["search"]["ordinaryTested"],8);
-        assert_eq!(second["candidate"],"node-08");assert_eq!(second["search"]["offset"],8);
+        assert_eq!(second["candidate"],"node-08","first={first}; second={second}");assert_eq!(second["search"]["offset"],8);
     }
     #[test]
     fn startup_retries_reach_a_working_node_beyond_the_first_window() {

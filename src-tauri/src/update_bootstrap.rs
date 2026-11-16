@@ -35,7 +35,7 @@ fn upgrade_mode(root:&Path,source:&Path,installer:&Path,deferred:bool)->Result<(
     // the installation. A user-writable external JSON is not authority here.
     let candidate=crate::update_bundle::payload(source)?;
     let (_,artifact_hash)=crate::update_transaction::digest(installer)?;
-    let _lease=crate::update_lock::UpdateLock::acquire(0)?;
+    let _lease=crate::update_lock::UpdateLock::acquire_operation()?;
     let expected=crate::update_service::command(root)?;
     let service=if crate::update_service::Service::exists()?{Some(crate::update_service::Service::open(false)?.configuration()?)}else{None};
     if !root.join("current.json").exists() && service.as_ref().is_some_and(|s|!s.binary.eq_ignore_ascii_case(&expected)){return Err("Existing Atlas service belongs to another installation".into());}
@@ -99,6 +99,7 @@ pub fn deferred_matches(root:&Path,transaction:&Transaction)->bool {
     marker["transactionId"]==transaction.journal.transaction_id && marker["candidateId"]==transaction.journal.candidate.id
 }
 pub fn activate_prepared(root:&Path)->Result<(),String>{
+    let _lease=crate::update_lock::UpdateLock::acquire_operation()?;
     let mut transaction=Transaction::open(root)?;
     if !deferred_matches(root,&transaction) {return Err("No matching prepared local update".into());}
     transaction.journal.candidate.verify(&transaction.version_path(&transaction.journal.candidate))?;
@@ -144,7 +145,7 @@ mod deferred_tests {
 }
 
 pub fn prepare_uninstall(root:&Path)->Result<(),String>{
-    let _lease=crate::update_lock::UpdateLock::acquire(0)?;
+    let _lease=crate::update_lock::UpdateLock::acquire_operation()?;
     let mut roots=vec![root.to_path_buf()];
     if root.join("current.json").exists(){
         let transaction=Transaction::open(root)?;
@@ -160,7 +161,7 @@ pub fn uninstall(root:&Path)->Result<(),String>{
     let root=root.canonicalize().map_err(|e|e.to_string())?;
     let executable=std::env::current_exe().map_err(|e|e.to_string())?.canonicalize().map_err(|e|e.to_string())?;
     if executable.starts_with(&root){return Err("Uninstaller helper must run from its private temporary directory".into());}
-    let _lease=crate::update_lock::UpdateLock::acquire(0)?;
+    let _lease=crate::update_lock::UpdateLock::acquire_operation()?;
     let transaction=Transaction::open(&root)?;
     crate::update_transaction::validate_tree(&root)?;
     let mut files=std::collections::BTreeSet::new();

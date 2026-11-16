@@ -5,6 +5,27 @@ on:
 permissions:
   contents: read
 jobs:
+  installer-context:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/t/native-context
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Initialize native compiler
+        shell: pwsh
+        run: ./scripts/initialize-msvc.ps1
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: scripts/root-installer -> ../../t/native-context
+      - name: Test production native installer code without waiting for CEF
+        run: cargo test --locked --manifest-path scripts/root-installer/Cargo.toml --bin AtlasSetupHost
+      - name: Exercise different accounts and elevated Explorer
+        run: ./scripts/test-alternate-installer-user.ps1 -ManifestPath scripts/root-installer/Cargo.toml -Binary AtlasSetupHost
+      - name: Verify real limited child process
+        run: cargo test --locked --manifest-path scripts/root-installer/Cargo.toml --bin AtlasSetupHost -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
   release-readiness:
     uses: ./.github/workflows/updater-readiness.yml
   test:
@@ -38,6 +59,8 @@ jobs:
         run: node --test scripts/*.check.cjs
       - name: Verify release distribution contracts
         run: node --test scripts/release-distribution.check.cjs
+      - name: Verify root download entry point and its exact source inventory
+        run: ./scripts/test-root-installer.ps1
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
       - name: Repeat the real 62-node timeout regression
@@ -51,8 +74,17 @@ jobs:
         # The background timer must cross the previous 30-second expiry in real
         # time too; ordinary scheduler tests use controlled monotonic time.
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact latency_refresh::tests::real_timer_cycles_without_a_page --ignored
+      - name: Repeat startup search across a fresh service client
+        shell: pwsh
+        run: |
+          1..5 | ForEach-Object {
+            cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact resilient_selection::tests::startup_search_reaches_ninth_node_after_a_fresh_service_client --nocapture
+            if ($LASTEXITCODE -ne 0) { throw "Startup search regression failed on attempt $_" }
+          }
       - name: Verify actual restricted desktop process
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
+      - name: Verify installation with another administrator and elevated Explorer
+        run: ./scripts/test-alternate-installer-user.ps1
       - name: Verify offline user hive cleanup and release after failure
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact uninstall_hive::tests::ordinary_hive_with_distinct_acls_roundtrips_and_unloads_after_errors --ignored
       - name: Verify actual native tray input and callback

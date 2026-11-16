@@ -21,9 +21,15 @@ export function startLatencyPolling(read:()=>Promise<LatencySnapshot>, publish:(
     if (scheduled) {clearTimeout(scheduled);scheduled=undefined;}
     lastRead=Date.now();
     pending=true;
-    try {const value=await read();if (!stopped) publish(value);}
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const value=await Promise.race([read(),new Promise<never>((_,reject)=>{
+        deadline=setTimeout(()=>reject(new Error("Чтение результатов проверки превысило время ожидания")),5000);
+      })]);
+      if (!stopped) publish(value);
+    }
     catch { /* The existing application status channel reports IPC failures. */ }
-    finally {pending=false;if (again && !stopped) {again=false;void wake();}}
+    finally {clearTimeout(deadline);pending=false;if (again && !stopped) {again=false;void wake();}}
   }
   void wake();
   const timer=setInterval(()=>void wake(),1000);

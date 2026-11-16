@@ -3,17 +3,18 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const cp = require("node:child_process");
 const YAML = require("yaml");
-test("installers and split offline payloads cannot be distributed through the Git tree", () => {
+test("only the small online entry point may be distributed through the Git tree", () => {
   const r = cp.spawnSync("git", ["ls-files", "--cached"], { encoding: "utf8" });
   assert.equal(r.status, 0);
   const forbidden = r.stdout
     .split(/\r?\n/)
     .filter(
       (p) =>
-        /^(installer\/|Install Atlas\.exe$)/i.test(p) ||
-        (/\.exe(?:\.sig)?$/i.test(p) && !p.startsWith("src-tauri/resources/")),
+        /^installer\//i.test(p) ||
+        (/\.exe(?:\.sig)?$/i.test(p) && p !== "Install Atlas.exe" && !p.startsWith("src-tauri/resources/")),
     );
   assert.deepEqual(forbidden, []);
+  assert(fs.statSync("Install Atlas.exe").size < 25 * 1024 * 1024);
   assert(
     !fs.existsSync(".gitattributes") ||
       !/filter=lfs/.test(fs.readFileSync(".gitattributes", "utf8")),

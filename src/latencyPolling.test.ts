@@ -21,3 +21,17 @@ test("unmounted UI cannot accept a late response",async()=>{
   const polling=startLatencyPolling(()=>new Promise(resolve=>complete=resolve),publish);
   polling.stop();complete(value);await Promise.resolve();expect(publish).not.toHaveBeenCalled();
 });
+
+test("an unanswered IPC read cannot wedge polling and its late success cannot replace recovery",async()=>{
+  vi.useFakeTimers();let late!:(v:LatencySnapshot)=>void;
+  const read=vi.fn().mockImplementationOnce(()=>new Promise(resolve=>late=resolve)).mockResolvedValue(value);
+  const publish=vi.fn(),polling=startLatencyPolling(read,publish);
+  try {
+    await vi.advanceTimersByTimeAsync(6500);
+    expect(read.mock.calls.length).toBeGreaterThan(1);
+    expect(publish).toHaveBeenLastCalledWith(value);
+    const count=publish.mock.calls.length;
+    late({...value,generation:0});await Promise.resolve();await Promise.resolve();
+    expect(publish).toHaveBeenCalledTimes(count);
+  } finally {polling.stop();vi.useRealTimers();}
+});

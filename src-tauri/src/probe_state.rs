@@ -25,6 +25,23 @@ pub struct Ticket {
     pub node: Value,
     previous: Option<Value>,
 }
+impl Ticket {
+    pub fn acquire(&self, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<std::sync::MutexGuard<'_, ()>,String> {
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(13);
+        loop {
+            if cancelled.is_some_and(|flag|flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err("CANCELLED: проверка отменена".into());
+            }
+            match self.gate.try_lock() {
+                Ok(guard)=>return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_))=>return Err("Проверка сервера недоступна".into()),
+                Err(std::sync::TryLockError::WouldBlock)=>{},
+            }
+            if std::time::Instant::now()>=deadline {return Err("Истёк срок ожидания предыдущей проверки сервера".into());}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
 impl State {
     pub fn suspend(&mut self) -> HashMap<String,Value> {
         let nodes=std::mem::take(&mut self.nodes); self.invalidate(); nodes
@@ -164,6 +181,17 @@ pub fn validate_route(node: &Value) -> Result<(),String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_restart_does_not_wait_for_the_previous_network_probe() {
+        let mut state=State::default();state.configure(&settings(1234));
+        let first=state.begin("node","url").unwrap();let _held=first.gate.lock().unwrap();
+        let next=state.begin("node","url").unwrap();
+        let cancelled=Arc::new(std::sync::atomic::AtomicBool::new(false));let flag=cancelled.clone();
+        let worker=std::thread::spawn(move ||next.acquire(Some(&flag)).is_err());
+        cancelled.store(true,std::sync::atomic::Ordering::SeqCst);
+        assert!(worker.join().unwrap());
+        assert!(!state.current(&first));
+    }
     #[test]
     fn discovery_defers_without_publishing_a_timeout_or_renewing_success() {
         let mut state=State::default();state.configure(&settings(1234));let endpoint=crate::latency::DISPLAY_URL;

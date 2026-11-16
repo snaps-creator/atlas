@@ -104,11 +104,13 @@ fn display_batch_stream_cancel(client: ApiClient, names: &[String], endpoint: &s
 }
 fn display_batch_pass(client: ApiClient, names: &[String], endpoint: &str, timeout: u64, quick: bool,
     progress: &(dyn Fn(&str,&Value)+Sync), current: &(dyn Fn(&str)->bool+Sync)) -> Result<Value,String> {
+    if let Some(broker) = client.broker_client() {
+        // Refresh already orders service tickets by manual/selected/visible
+        // priority. Do not wait on another full controller snapshot to start.
+        return service_batch_pass(&broker, names, endpoint, timeout, quick, progress,current);
+    }
     let proxies = client.api("GET", "/proxies", None).unwrap_or(Value::Null);
     let names = discovery_order(names, &proxies, endpoint);
-    if let Some(broker) = client.broker_client() {
-        return service_batch_pass(&broker, &names, endpoint, timeout, quick, progress,current);
-    }
     // The caller already queues the full list. Publish only starts and results.
     Ok(discover_batch(&names, timeout, &|name, deadline| {
         if !current(name) {return TestResult {evidence:Default::default(),status:"cancelled".into(),delay:None,attempts:0,error:None};}
@@ -147,6 +149,7 @@ fn service_batch_pass(broker: &crate::broker::Broker, names: &[String], endpoint
         progress(name, &value);
         results.insert(name.to_owned(), value);
     };
+    let outcome = (|| -> Result<(),String> {
     while next < names.len() || !pending.is_empty() {
         let cancelled:Vec<_>=pending.iter().filter(|(_, (name,_))|!current(name)).map(|(id,_)|id.clone()).collect();
         if !cancelled.is_empty() {
@@ -183,6 +186,7 @@ fn service_batch_pass(broker: &crate::broker::Broker, names: &[String], endpoint
         }
         let expired: Vec<_> = pending.iter().filter(|(_,(_,at))|at.elapsed()>=Duration::from_secs(40))
             .map(|(id,_)|id.clone()).collect();
+        if !expired.is_empty() { broker.call("delay_cancel",json!({"ids":expired}))?; }
         for id in expired {
             let (name,_) = pending.remove(&id).unwrap();
             publish(&name, Err("Проверка сервера превысила время ожидания".into()));
@@ -191,6 +195,15 @@ fn service_batch_pass(broker: &crate::broker::Broker, names: &[String], endpoint
             std::thread::sleep(Duration::from_millis(250));
         }
     }
+    Ok(())
+    })();
+    // An IPC/admission error must release already submitted work too. Otherwise
+    // the next click competes with orphaned probes until service job expiry.
+    if !pending.is_empty() {
+        let ids:Vec<_>=pending.keys().cloned().collect();
+        let _=broker.call("delay_cancel",json!({"ids":ids}));
+    }
+    outcome?;
     Ok(Value::Object(results))
 }
 
