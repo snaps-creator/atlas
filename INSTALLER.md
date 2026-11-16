@@ -1,8 +1,8 @@
 # Установка Atlas для Windows
 
-**[Официальная загрузка — GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest)**
+**[Install Atlas.exe из корня](https://github.com/snaps-creator/atlas/raw/refs/heads/main/Install%20Atlas.exe)** · **[Полный пакет — GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest)**
 
-Для Windows 10/11 x64 скачайте из Assets полный EXE. Планируемый файл версии 3.0.1 — `Atlas-Setup-3.0.1.exe`; эта версия пока не опубликована. ZIP исходников не содержит готовый установщик.
+Для Windows 10/11 x64 скачайте `Install Atlas.exe` из корня репозитория либо полный `Atlas-Setup-3.3.1.exe` из Releases после публикации. Корневой файл загружает полный пакет и проверяет его подпись тем же нативным кодом, что и обновление внутри приложения; для него нужен интернет. Полный пакет устанавливается офлайн. Не нужно скачивать ZIP исходников или запускать команды.
 
 Один офлайн-пакет включает Atlas UI, Atlas.Service.exe (существующая служба AtlasNetworkService под SYSTEM), Mihomo, Xray с данными, CEF, AtlasMaintenance.exe и AtlasUpdater.exe, который также служит стабильным launcher. При установке отдельные зависимости из сети не скачиваются.
 
@@ -16,4 +16,4 @@
 
 `scripts/test-packaged-installer.ps1` проверяет полный пакет и CEF/службу в изолированных режимах. `scripts/test-connected-upgrade.ps1` запускается только на одноразовом GitHub Windows runner: проверяет обновление, сохранность синтетических данных, startup, rollback, reinstall и uninstall. На рабочем компьютере эти installed tests запрещены защитой самого сценария.
 
-Готовые EXE, подписи и части payload не коммитятся и не загружаются в Git LFS. Публичное распространение — только GitHub Releases. Публикация запускается вручную из main после merge и отдельного разрешения; подготовка PR ничего не публикует.
+По запросу владельца в корне хранится небольшой `Install Atlas.exe`. Полный пакет размером более 100 МиБ распространяется через Releases, без частей и Git LFS. `scripts/build-root-installer.ps1` собирает корневой файл; CI проверяет его хеш, исходники и встроенный нативный проверяющий модуль. Merge в main запускает проверяемую сборку и публикацию; подготовка PR сама по себе ничего не публикует.

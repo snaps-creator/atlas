@@ -42,6 +42,7 @@ fn run()->Result<(),String> {
         return shell_identity::stamp_shortcut(std::path::Path::new(&args[2]), &std::env::current_exe().map_err(|e|e.to_string())?);
     }
     if args.len()==3 && args[1]=="--download-install" {return update_install::run(&args[2]);}
+    if args.len()==3 && args[1]=="--download-setup" {return update_install::setup(std::path::Path::new(&args[2]));}
     if args.len()==1 || args.len()==2 && args[1]=="--autostart" {
         let executable=std::env::current_exe().map_err(|e|e.to_string())?;
         if executable.file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("Atlas.exe")) {
@@ -76,8 +77,8 @@ fn run()->Result<(),String> {
         if manifest.data().payload()?!=transaction.journal.candidate || manifest.data().sha256!=transaction.journal.expected_artifact_hash {
             return Err("Prepared transaction differs from signed update metadata".into());
         }
-        // Fail before quiescence if the desktop cannot run in its original
-        // unelevated account or the installer was elevated as another user.
+        // Fail before quiescence if the interactive user's desktop or settings
+        // cannot be reached, including elevation with another admin's credentials.
         update_user::check()?;
         let mut host=update_windows::Windows::prepare(&transaction,update_user::database()?)?;
         update_supervisor::activate(&mut transaction,&mut host)?;

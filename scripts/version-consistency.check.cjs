@@ -9,15 +9,17 @@ test("product manifests agree and candidate is newer than supported upgrade base
   const version = json("package.json").version;
   assert.match(version, /^\d+\.\d+\.\d+$/);
   const parts = version.split(".").map(Number);
-  const baseline = [3, 0, 4];
+  const baseline = [3, 2, 3];
   const difference = parts.map((v, i) => v - baseline[i]).find((v) => v !== 0);
-  assert.ok(difference > 0, "candidate must be newer than the latest supported upgrade baseline 3.0.4");
+  assert.ok(difference > 0, "candidate must be newer than the latest supported upgrade baseline 3.2.3");
   const lock = json("package-lock.json");
   for (const value of [
     lock.version,
     lock.packages[""].version,
     json("src-tauri/tauri.conf.json").version,
     json("updater-readiness.json").version,
+    json("scripts/root-installer/build.json").version,
+    read("scripts/root-installer/Cargo.toml").match(/^version = "([^"]+)"/m)[1],
     read("src-tauri/Cargo.toml").match(/^version = "([^"]+)"/m)[1],
     read("src-tauri/Cargo.lock").match(
       /name = "atlas-vpn"\r?\nversion = "([^"]+)"/,

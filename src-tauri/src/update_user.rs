@@ -1,5 +1,5 @@
-//! Launch the desktop with the same user's limited token. Split UAC tokens use
-//! the interactive shell; unsplit administrators use a verified restricted token.
+//! Launch the desktop as the interactive user, even when UAC credentials belong
+//! to another administrator. Pin that identity for launch and settings snapshots.
 //! Never fall back to an administrative desktop when token preparation fails.
 use std::{fs::File, os::windows::{ffi::OsStrExt,io::{AsRawHandle,FromRawHandle,OwnedHandle}},path::Path,ptr};
 use windows_sys::Win32::{Foundation::*, Security::*, System::{Threading::*,Pipes::CreatePipe}};
@@ -11,7 +11,7 @@ impl Process {pub fn terminate(&self){unsafe{TerminateProcess(self.as_raw_handle
 fn failure(action:&str)->String {format!("{action}: {}",std::io::Error::last_os_error())}
 fn token()->Result<OwnedHandle,String>{unsafe{
     let mut handle=ptr::null_mut();
-    if OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY|TOKEN_DUPLICATE,&mut handle)==0{return Err(failure("Cannot inspect updater user"));}
+    if OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_IMPERSONATE,&mut handle)==0{return Err(failure("Cannot inspect updater user"));}
     Ok(OwnedHandle::from_raw_handle(handle))
 }}
 fn elevation(handle:HANDLE)->Result<TOKEN_ELEVATION_TYPE,String>{unsafe{
@@ -108,10 +108,101 @@ fn sid(handle:HANDLE)->Result<String,String>{unsafe{
     LocalFree(text.cast());result
 }}
 pub fn current_sid()->Result<String,String>{sid(token()?.as_raw_handle())}
-pub fn database()->Result<std::path::PathBuf,String>{unsafe{
+fn require_desktop_account(handle:HANDLE)->Result<(),String>{unsafe{
+    let user=token_info(handle,TokenUser)?;
+    let user=&*user.as_ptr().cast::<TOKEN_USER>();
+    if [WinLocalSystemSid,WinLocalServiceSid,WinNetworkServiceSid].iter().any(|kind|IsWellKnownSid(user.User.Sid,*kind)!=0) {
+        return Err("A service account cannot be used as the desktop user".into());
+    }
+    Ok(())
+}}
+fn shell_token()->Result<Option<OwnedHandle>,String>{unsafe{
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow,GetWindowThreadProcessId};
+    let shell=GetShellWindow();
+    if shell.is_null(){return Ok(None);}
+    let mut pid=0;
+    if GetWindowThreadProcessId(shell,&mut pid)==0 || pid==0{return Err(failure("Cannot identify interactive shell"));}
+    interactive_process_token(pid).map(Some)
+}}
+struct ShellAccess {token:OwnedHandle,previous:TOKEN_PRIVILEGES}
+impl ShellAccess {
+    fn enable()->Result<Self,String>{unsafe{
+        let mut raw=ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY|TOKEN_ADJUST_PRIVILEGES,&mut raw)==0{return Err(failure("Cannot prepare interactive user access"));}
+        let mut guard=Self{token:OwnedHandle::from_raw_handle(raw),previous:std::mem::zeroed()};
+        let name:Vec<u16>="SeDebugPrivilege".encode_utf16().chain(Some(0)).collect();let mut luid=std::mem::zeroed();
+        if LookupPrivilegeValueW(ptr::null(),name.as_ptr(),&mut luid)==0{return Err(failure("Cannot resolve interactive user access"));}
+        let requested=TOKEN_PRIVILEGES{PrivilegeCount:1,Privileges:[LUID_AND_ATTRIBUTES{Luid:luid,Attributes:SE_PRIVILEGE_ENABLED}]};
+        let mut size=0;SetLastError(0);
+        let success=AdjustTokenPrivileges(guard.token.as_raw_handle(),0,&requested,std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,&mut guard.previous,&mut size);
+        if success==0 || GetLastError()!=0{return Err(failure("Cannot access another Windows user's desktop"));}
+        Ok(guard)
+    }}
+}
+impl Drop for ShellAccess {fn drop(&mut self){unsafe{
+    AdjustTokenPrivileges(self.token.as_raw_handle(),0,&self.previous,0,ptr::null_mut(),ptr::null_mut());
+}}}
+fn open_interactive_process_token(pid:u32)->Result<OwnedHandle,std::io::Error>{unsafe{
+    let process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,0,pid);
+    if process.is_null(){return Err(std::io::Error::last_os_error());}
+    let process=OwnedHandle::from_raw_handle(process);let mut handle=ptr::null_mut();
+    if OpenProcessToken(process.as_raw_handle(),TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_IMPERSONATE,&mut handle)==0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(OwnedHandle::from_raw_handle(handle))
+}}
+fn interactive_process_token(pid:u32)->Result<OwnedHandle,String>{
+    match open_interactive_process_token(pid) {
+        Ok(token)=>Ok(token),
+        Err(error) if error.raw_os_error()==Some(ERROR_ACCESS_DENIED as i32)=>{
+            // Credential elevation can require SeDebugPrivilege to inspect the
+            // other user's shell. Restore the exact previous state immediately.
+            let _access=ShellAccess::enable()?;
+            open_interactive_process_token(pid).map_err(|e|format!("Cannot inspect interactive user's token: {e}"))
+        },
+        Err(error)=>Err(format!("Cannot inspect interactive user's token: {error}")),
+    }
+}
+fn require_same_session(current:u32,desktop:u32)->Result<(),String>{
+    if current!=desktop{return Err("Desktop token belongs to another Windows session".into());}
+    Ok(())
+}
+fn select_desktop(current:OwnedHandle,shell:Option<OwnedHandle>)->Result<OwnedHandle,String>{
+    require_desktop_account(current.as_raw_handle())?;
+    // An ordinary launch belongs to its caller, including an explicit Run As.
+    if desktop_safe(current.as_raw_handle())? {return Ok(current);}
+    let selected=if let Some(shell)=shell {
+        require_same_session(session(current.as_raw_handle())?,session(shell.as_raw_handle())?)?;
+        // Credential-based UAC legitimately changes the updater SID. The shell
+        // in this Windows session, not the administrator, owns the desktop.
+        shell
+    }else if elevation(current.as_raw_handle())?==TokenElevationTypeDefault {
+        // Preserve support for unsplit administrative test/automation sessions.
+        current
+    }else{
+        return Err("Original user's interactive shell is unavailable".into());
+    };
+    require_desktop_account(selected.as_raw_handle())?;
+    if desktop_safe(selected.as_raw_handle())? {Ok(selected)}else{restricted_desktop(selected.as_raw_handle())}
+}
+fn desktop_token()->Result<&'static OwnedHandle,String>{
+    static DESKTOP:std::sync::OnceLock<Result<OwnedHandle,String>>=std::sync::OnceLock::new();
+    DESKTOP.get_or_init(||{
+        let current=token()?;
+        let shell=if desktop_safe(current.as_raw_handle())?{None}else{shell_token()?};
+        select_desktop(current,shell)
+    }).as_ref().map_err(Clone::clone)
+}
+pub fn desktop_sid()->Result<String,String>{sid(desktop_token()?.as_raw_handle())}
+pub fn database()->Result<std::path::PathBuf,String>{
+    database_for_token(desktop_token()?.as_raw_handle())
+}
+fn database_for_token(handle:HANDLE)->Result<std::path::PathBuf,String>{unsafe{
     use windows_sys::Win32::{UI::Shell::{SHGetKnownFolderPath,FOLDERID_LocalAppData},System::Com::CoTaskMemFree};
     let mut raw=ptr::null_mut();
-    if SHGetKnownFolderPath(&FOLDERID_LocalAppData,0,ptr::null_mut(),&mut raw)<0 || raw.is_null() {
+    let result=SHGetKnownFolderPath(&FOLDERID_LocalAppData,0,handle,&mut raw);
+    if result<0 || raw.is_null() {
+        CoTaskMemFree(raw.cast());
         return Err("Cannot locate original user's application data".into());
     }
     let mut length=0;while *raw.add(length)!=0{length+=1;}
@@ -122,6 +213,7 @@ pub fn database()->Result<std::path::PathBuf,String>{unsafe{
 pub fn report()->Result<serde_json::Value,String>{Ok(serde_json::json!({
     "sid":current_sid()?,"pid":std::process::id(),"elevation":elevation(token()?.as_raw_handle())?,
     "adminEnabled":admin_enabled(token()?.as_raw_handle())?,"integrity":integrity(token()?.as_raw_handle())?,"session":session(token()?.as_raw_handle())?,
+    "database":database_for_token(token()?.as_raw_handle())?,
     "version":env!("CARGO_PKG_VERSION")
 }))}
 pub fn check()->Result<serde_json::Value,String>{
@@ -151,8 +243,9 @@ pub fn check_executable(executable:&Path)->Result<serde_json::Value,String>{
             std::thread::sleep(Duration::from_millis(20));
         }
         let value:serde_json::Value=serde_json::from_slice(&bytes).map_err(|_|"User-context IPC did not return JSON")?;
-        if value["pid"]!=child.pid || value["sid"]!=current_sid()? || value["adminEnabled"]!=false ||
-            value["session"]!=session(token()?.as_raw_handle())? || !value["integrity"].as_u64().is_some_and(|level|level<=SECURITY_MANDATORY_MEDIUM_RID as u64) {
+        if value["pid"]!=child.pid || value["sid"]!=desktop_sid()? || value["adminEnabled"]!=false ||
+            value["session"]!=session(desktop_token()?.as_raw_handle())? || value["database"]!=serde_json::json!(database()?) ||
+            !value["integrity"].as_u64().is_some_and(|level|level<=SECURITY_MANDATORY_MEDIUM_RID as u64) {
             return Err("Child user identity or elevation is incorrect".into());
         }
         Ok(value)
@@ -173,37 +266,7 @@ pub fn limited(executable:&Path,args:&[&str])->Result<Option<(Process,File)>,Str
     let executable_text=executable.to_str().ok_or("Invalid desktop executable path")?;
     if executable_text.contains(['"','\0']){return Err("Invalid desktop executable path".into());}
     let directory=executable.parent().ok_or("Desktop directory missing")?;
-    unsafe {
-        // TokenLinkedToken can be identification-only. The interactive shell
-        // supplies a primary token; bind both SID and session before using it.
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow,GetWindowThreadProcessId};
-        let linked=if elevation(current.as_raw_handle())?==TokenElevationTypeDefault {
-            restricted_desktop(current.as_raw_handle())?
-        }else{
-        let shell=GetShellWindow();let mut shell_pid=0;
-        if shell.is_null() || GetWindowThreadProcessId(shell,&mut shell_pid)==0 || shell_pid==0 {
-            return Err("Original user's interactive shell is unavailable".into());
-        }
-        let shell_process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,0,shell_pid);
-        if shell_process.is_null(){return Err(failure("Cannot inspect interactive shell"));}
-        let shell_process=OwnedHandle::from_raw_handle(shell_process);
-        let mut linked=ptr::null_mut();
-        if OpenProcessToken(shell_process.as_raw_handle(),TOKEN_QUERY|TOKEN_DUPLICATE,&mut linked)==0 {
-            return Err(failure("Cannot inspect interactive user's token"));
-        }
-        let linked=OwnedHandle::from_raw_handle(linked);
-        if !desktop_safe(linked.as_raw_handle())? || sid(current.as_raw_handle())?!=sid(linked.as_raw_handle())? {
-            return Err("Desktop token does not match the original limited user".into());
-        }
-        let mut current_session=0u32;let mut shell_session=0u32;let mut size=0;
-        if GetTokenInformation(current.as_raw_handle(),TokenSessionId,(&mut current_session as *mut u32).cast(),4,&mut size)==0 ||
-            GetTokenInformation(linked.as_raw_handle(),TokenSessionId,(&mut shell_session as *mut u32).cast(),4,&mut size)==0 || current_session!=shell_session {
-            return Err("Desktop token belongs to another Windows session".into());
-        }
-        linked
-        };
-        launch_with_token(executable,directory,args,linked.as_raw_handle()).map(Some)
-    }
+    launch_with_token(executable,directory,args,desktop_token()?.as_raw_handle()).map(Some)
 }
 fn launch_with_token(executable:&Path,directory:&Path,args:&[&str],linked:HANDLE)->Result<(Process,File),String>{unsafe{
         let executable_text=executable.to_str().ok_or("Invalid desktop executable path")?;
@@ -245,6 +308,73 @@ fn launch_with_token(executable:&Path,directory:&Path,args:&[&str],linked:HANDLE
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn process_token_access_preserves_identity_and_privileges() {
+        let current=token().unwrap();
+        let before=token_info(current.as_raw_handle(),TokenPrivileges).unwrap();
+        let opened=interactive_process_token(std::process::id()).unwrap();
+        assert_eq!(sid(current.as_raw_handle()).unwrap(),sid(opened.as_raw_handle()).unwrap());
+        assert_eq!(session(current.as_raw_handle()).unwrap(),session(opened.as_raw_handle()).unwrap());
+        assert_eq!(before,token_info(current.as_raw_handle(),TokenPrivileges).unwrap());
+    }
+    #[test] fn desktop_selection_rejects_a_different_windows_session() {
+        assert!(require_same_session(1,2).is_err());
+        assert!(require_same_session(2,2).is_ok());
+    }
+    #[test] fn ordinary_launch_preserves_its_own_identity_and_profile() {
+        let current=token().unwrap();let limited=restricted_desktop(current.as_raw_handle()).unwrap();
+        let expected_sid=sid(limited.as_raw_handle()).unwrap();
+        let expected_database=database_for_token(limited.as_raw_handle()).unwrap();
+        let selected=select_desktop(limited,Some(current)).unwrap();
+        assert_eq!(sid(selected.as_raw_handle()).unwrap(),expected_sid);
+        assert_eq!(database_for_token(selected.as_raw_handle()).unwrap(),expected_database);
+        assert!(desktop_safe(selected.as_raw_handle()).unwrap());
+    }
+    #[test] #[ignore="Requires an administrative caller; mandatory separate CI invocation"]
+    fn elevated_shell_is_reduced_before_desktop_launch() {
+        assert!(admin_enabled(token().unwrap().as_raw_handle()).unwrap());
+        let selected=select_desktop(token().unwrap(),Some(token().unwrap())).unwrap();
+        assert_eq!(sid(selected.as_raw_handle()).unwrap(),current_sid().unwrap());
+        assert!(desktop_safe(selected.as_raw_handle()).unwrap());
+    }
+    #[test] #[ignore="Invoked by the alternate-user process regression"]
+    fn alternate_user_child_driver() {
+        let root=std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let expected:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("expected.json")).unwrap()).unwrap();
+        let actual=report().unwrap();
+        for key in ["sid","session","database"] {assert_eq!(actual[key],expected[key],"{key}");}
+        assert_eq!(actual["adminEnabled"],false);
+        assert!(actual["integrity"].as_u64().unwrap()<=SECURITY_MANDATORY_MEDIUM_RID as u64);
+        assert_eq!(database().unwrap(),database_for_token(token().unwrap().as_raw_handle()).unwrap());
+    }
+    #[test] #[ignore="Creates no accounts; invoked by the disposable CI account fixture"]
+    fn credential_elevation_uses_desktop_account() {
+        let current=token().unwrap();assert!(admin_enabled(current.as_raw_handle()).unwrap());
+        let pid=std::env::var("ATLAS_TEST_DESKTOP_PID").expect("CI desktop process required").parse().unwrap();
+        let before=token_info(current.as_raw_handle(),TokenPrivileges).unwrap();
+        let shell=interactive_process_token(pid).unwrap();
+        assert_eq!(before,token_info(current.as_raw_handle(),TokenPrivileges).unwrap(),"Shell access must restore administrative privileges");
+        let desktop_sid=sid(shell.as_raw_handle()).unwrap();
+        let database=database_for_token(shell.as_raw_handle()).unwrap();
+        assert_ne!(desktop_sid,sid(current.as_raw_handle()).unwrap());
+        assert_ne!(database,database_for_token(current.as_raw_handle()).unwrap());
+        let desktop_session=session(shell.as_raw_handle()).unwrap();
+        let selected=select_desktop(current,Some(shell)).unwrap();
+        assert_eq!(sid(selected.as_raw_handle()).unwrap(),desktop_sid);
+        assert_eq!(database_for_token(selected.as_raw_handle()).unwrap(),database);
+        assert!(desktop_safe(selected.as_raw_handle()).unwrap());
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+        let root=std::env::temp_dir().join(format!("atlas-alternate-user-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();let _fixture=Fixture(root.clone());
+        crate::update_windows::protect_installation(&root).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(),root.join("probe.exe")).unwrap();
+        std::fs::write(root.join("expected.json"),serde_json::json!({"sid":desktop_sid,"session":desktop_session,"database":database}).to_string()).unwrap();
+        let (child,_pipe)=launch_with_token(&root.join("probe.exe"),&root,
+            &["--exact","update_user::tests::alternate_user_child_driver","--ignored"],selected.as_raw_handle()).unwrap();
+        if unsafe{WaitForSingleObject(child.as_raw_handle(),30000)}!=WAIT_OBJECT_0{child.terminate();panic!("Alternate-user child timed out");}
+        let mut exit=1;assert_ne!(unsafe{GetExitCodeProcess(child.as_raw_handle(),&mut exit)},0);
+        assert_eq!(exit,0,"Alternate-user desktop identity/profile validation failed");
+    }
     #[test] fn restricted_token_keeps_user_and_session_without_administrative_access() {
         let current=token().unwrap();let reduced=restricted_desktop(current.as_raw_handle()).unwrap();
         assert_eq!(sid(current.as_raw_handle()).unwrap(),sid(reduced.as_raw_handle()).unwrap());

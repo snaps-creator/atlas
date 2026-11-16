@@ -88,6 +88,6 @@ incident-history.ndjson
 # Releases-only distribution; never add an offline installer to Git/LFS.
 /Atlas-Setup-*.exe
 /Atlas-Setup-*.exe.sig
-/Install Atlas.exe
+# Install Atlas.exe is the small verified online entry point requested for root downloads.
 /installer/
 /temp-*.json

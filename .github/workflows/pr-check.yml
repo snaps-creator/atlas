@@ -38,6 +38,8 @@ jobs:
         run: node --test scripts/*.check.cjs
       - name: Verify release distribution contracts
         run: node --test scripts/release-distribution.check.cjs
+      - name: Verify root download entry point and its exact source inventory
+        run: ./scripts/test-root-installer.ps1
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --bin atlas-vpn --bin AtlasMaintenance --bin AtlasUpdater
       - name: Repeat the real 62-node timeout regression
@@ -53,6 +55,8 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- --exact latency_refresh::tests::real_timer_cycles_without_a_page --ignored
       - name: Verify actual restricted desktop process
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact update_user::tests::restricted_process_runs_without_admin --ignored
+      - name: Verify installation with another administrator and elevated Explorer
+        run: ./scripts/test-alternate-installer-user.ps1
       - name: Verify offline user hive cleanup and release after failure
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --bin AtlasUpdater -- --exact uninstall_hive::tests::ordinary_hive_with_distinct_acls_roundtrips_and_unloads_after_errors --ignored
       - name: Verify actual native tray input and callback

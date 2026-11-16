@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.3.1
+
+- Bind installation, update health checks and settings snapshots to the interactive desktop user when UAC uses another administrator's credentials.
+- Reduce elevated Explorer tokens before starting Atlas; retain Windows-session and privilege checks.
+- Add a directly downloadable `Install Atlas.exe` in the repository root, backed by the existing signed transactional release verifier.
+- Exercise real 3.2.3 upgrades, reinstall and clean install with another administrator; preserve the original user's settings and credentials.
+- Align download documentation and version manifests with 3.3.1.
+
 ## 3.2.3 (local, unpublished)
 
 - Run up to 32 server checks concurrently, with a two-second discovery pass and full ten-second retries for nodes that need more time.

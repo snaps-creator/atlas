@@ -1,6 +1,6 @@
 //! Download and authenticate a complete transactional installer before UAC.
 //! Runs in the independent native helper so the installer can stop the desktop.
-use std::{path::Path,io::Write,sync::atomic::{AtomicBool,AtomicU64},time::Duration};
+use std::{path::Path,io::Write,sync::{Arc,atomic::{AtomicBool,AtomicU64,Ordering}},time::Duration};
 
 fn stable(value:&str)->Result<[u32;3],String>{
     let parts=value.split('.').map(str::parse::<u32>).collect::<Result<Vec<_>,_>>().map_err(|_|"Invalid stable update version")?;
@@ -73,6 +73,54 @@ pub fn run(version:&str)->Result<(),String>{
     })();
     if let Err(error)=&result {event("error",Some(error));}
     // Only this invocation's random private download directory is removed.
+    let _=std::fs::remove_dir_all(&root);
+    result
+}
+// The repository-root installer uses the same public key, signed manifest,
+// streaming verifier and transactional installer as an in-app update.
+pub fn setup(cancel_file:&Path)->Result<(),String>{
+    let cancel=Arc::new(AtomicBool::new(false));let done=Arc::new(AtomicBool::new(false));
+    let (watch_cancel,watch_done,path)=(cancel.clone(),done.clone(),cancel_file.to_path_buf());
+    let watcher=std::thread::spawn(move||{
+        while !watch_done.load(Ordering::SeqCst) {
+            if path.exists(){watch_cancel.store(true,Ordering::SeqCst);break;}
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let result=setup_inner(&cancel);
+    done.store(true,Ordering::SeqCst);let _=watcher.join();
+    if let Err(error)=&result {event("error",Some(error));}
+    result
+}
+fn setup_inner(cancel:&AtomicBool)->Result<(),String>{
+    let root=std::env::temp_dir().join(format!("atlas-verified-setup-{}",uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).map_err(|_|"Cannot create private setup directory")?;
+    let result=(||{
+        event("checking",None);
+        let config:serde_json::Value=serde_json::from_str(include_str!("../tauri.conf.json")).map_err(|_|"Invalid updater trust")?;
+        let key=config["plugins"]["updater"]["pubkey"].as_str().ok_or("Missing updater trust")?;
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|"Update runtime failed")?;
+        let client=crate::update_download::client()?;
+        let base="https://github.com/snaps-creator/atlas/releases/latest/download";
+        let bytes=rt.block_on(metadata(&client,&format!("{base}/update-manifest.json"),1024*1024))?;
+        let signature=String::from_utf8(rt.block_on(metadata(&client,&format!("{base}/update-manifest.json.sig"),4096))?).map_err(|_|"Invalid manifest signature encoding")?;
+        let verified=crate::update_integrity::manifest(&bytes,&signature,key)?;
+        let manifest=verified.data();
+        if stable(&manifest.version)?<stable(env!("CARGO_PKG_VERSION"))? || manifest.schema!=2 || manifest.installer_kind.as_deref()!=Some("transactional-v1") {
+            return Err("The fixed Atlas release is not published yet. Download the current full installer from GitHub Releases after publication.".into());
+        }
+        if cancel.load(Ordering::SeqCst){return Err("Download cancelled".into());}
+        event("downloading",Some(&manifest.version));
+        let installer=root.join("Atlas-Setup.exe");
+        let asset=crate::update_download::Asset{url:manifest.url.clone(),size:manifest.size,sha256:manifest.sha256.clone()};
+        rt.block_on(crate::update_download::download(&asset,&installer,cancel,&AtomicU64::new(0)))?;
+        let _pinned=crate::update_integrity::VerifiedPackage::open(&installer,verified,key)?;
+        if cancel.load(Ordering::SeqCst){return Err("Download cancelled".into());}
+        event("installing",None);
+        if cancel.load(Ordering::SeqCst){return Err("Download cancelled".into());}
+        elevated(&installer,"")?;
+        event("complete",None);Ok(())
+    })();
     let _=std::fs::remove_dir_all(&root);
     result
 }

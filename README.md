@@ -2,15 +2,15 @@
 
 ## Скачать Atlas для Windows
 
-**[Скачать последнюю опубликованную версию — GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest)**
+**[Скачать Install Atlas.exe](https://github.com/snaps-creator/atlas/raw/refs/heads/main/Install%20Atlas.exe)** · **[Полный офлайн-установщик — GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest)**
 
-Windows 10/11 x64. В Assets выберите полный EXE-установщик: он включает приложение, сетевую службу, Mihomo, Xray и CEF; отдельно загружать ядра не нужно.
+Windows 10/11 x64. `Install Atlas.exe` лежит в корне репозитория: скачайте один файл и запустите его. Он загрузит полный официальный пакет, проверит криптографическую подпись и откроет мастер установки. Для установки без интернета скачайте полный EXE из Releases: он включает приложение, службу, Mihomo, Xray и CEF.
 
-Исходники в этой ветке — **3.0.4**, релиз ещё не опубликован. После проверки и отдельного разрешения файл `Atlas-Setup-3.0.4.exe` появится в Releases. Кнопка выше открывает фактически опубликованную версию. `Source code (zip)` предназначен для разработки.
+Исходники в этой ветке — **3.3.1**. Пакет `Atlas-Setup-3.3.1.exe` появляется в Releases только после проверок сборки, установки, обновления и восстановления. До его публикации новый корневой EXE сообщит, что исправленный релиз ещё недоступен. `Source code (zip)` предназначен для разработки.
 
 **Atlas** — VPN-клиент для Windows с быстрым выбором сервера, гибкими правилами маршрутизации и понятной диагностикой соединения. Добавьте подписку, подключитесь и управляйте трафиком из одного приложения: вручную, автоматически или по правилам для конкретных сайтов и программ.
 
-Текущая версия исходников — **3.0.4**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
+Текущая версия исходников — **3.3.1**. Atlas построен на React, TypeScript, Tauri 3 + CEF и Rust; для сетевой работы использует Mihomo и Xray.
 
 [![Проверка PR](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml/badge.svg)](https://github.com/snaps-creator/atlas/actions/workflows/pr-check.yml)
 [![Публикация обновления](https://github.com/snaps-creator/atlas/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/snaps-creator/atlas/actions/workflows/release.yml)
@@ -31,7 +31,7 @@ Windows 10/11 x64. В Assets выберите полный EXE-установщ�
 
 ## Установка
 
-Скачайте полный EXE из [GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest), запустите мастер и выберите папку установки. Обновление сохраняет источники, избранное, выбранный сервер и настройки запуска. Установка выполняет переключение версии и может прервать действующее VPN-соединение. Установщик и его части не хранятся в Git или Git LFS.
+Запустите `Install Atlas.exe` из корня либо полный EXE из [GitHub Releases](https://github.com/snaps-creator/atlas/releases/latest). Один мастер поддерживает новую установку и обновление поверх существующего Atlas. Обновление сохраняет источники, избранное, выбранный сервер и настройки запуска. Переключение версии может прервать действующее VPN-соединение. Если обновление из старой версии не запускается, используйте новый EXE поверх неё, без удаления настроек.
 
 Windows может показать «Неизвестный издатель»: у установщика пока нет сертификата Authenticode. Подпись обновления Atlas и подпись издателя Windows — разные вещи. Детали установки и проверки файлов — в [INSTALLER.md](INSTALLER.md).
 

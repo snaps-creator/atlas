@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "version": "3.2.3",
+  "version": "3.3.1",
   "requiredChecks": [
     "frontend",
     "verificationContracts",

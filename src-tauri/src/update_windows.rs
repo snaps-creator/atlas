@@ -52,7 +52,7 @@ pub struct Windows {
 }
 impl Windows {
     pub fn prepare(tx:&Transaction,database:PathBuf)->Result<Self,String> {
-        let user_sid=crate::update_user::current_sid()?;
+        let user_sid=crate::update_user::desktop_sid()?;
         if database!=crate::update_user::database()? {return Err("Settings snapshot must belong to the initiating Windows user".into());}
         let directory=tx.root().join(format!("state-{}",tx.journal.transaction_id));
         std::fs::create_dir_all(&directory).map_err(|e|format!("Cannot create update snapshot directory: {e}"))?;
