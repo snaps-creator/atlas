@@ -650,6 +650,8 @@ mod tests {
                     std::thread::spawn(move || {
                         // TCP may split the request line and headers across reads.
                         // Classify only a complete request, including under CI load.
+                        // Windows inherits the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
                         socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                         let mut request=Vec::new();let mut part=[0;1024];
                         while !request.ends_with(b"\r\n\r\n") {
