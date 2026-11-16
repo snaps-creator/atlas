@@ -24,18 +24,20 @@ try {
 $exe=Join-Path $target 'debug/atlas-tray-protocol-fixture.exe'
 $root=Join-Path $repo ('temp/tray-protocol-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
+# Compile the input helper before starting the fixture's 30-second lifetime.
+# A cold Add-Type compilation can consume that entire lifetime on hosted CI.
+# Use exactly the native implementation exercised by installed acceptance.
+$source=Get-Content (Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1') -Raw
+$native=[regex]::Match($source,"@'\r?\n([\s\S]*?)\r?\n'@").Groups[1].Value
+if (-not $native) {throw 'Native tray implementation missing'}
+Add-Type -TypeDefinition $native
 $process=Start-Process -FilePath $exe -ArgumentList ('"'+$root+'"') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $root 'stderr.log')
 $null=$process.Handle
 try {
     $deadline=[DateTime]::UtcNow.AddSeconds(5)
     while (-not (Test-Path (Join-Path $root 'ready.txt')) -and [DateTime]::UtcNow -lt $deadline) {Start-Sleep -Milliseconds 50}
     Get-Content (Join-Path $root 'ready.txt') | Write-Output
-    # Exercise exactly the native implementation used by installed acceptance,
-    # against this fixture's known child PID; never bypass its installed guard.
-    $source=Get-Content (Join-Path $PSScriptRoot 'invoke-installed-tray-restart.ps1') -Raw
-    $native=[regex]::Match($source,"@'\r?\n([\s\S]*?)\r?\n'@").Groups[1].Value
-    if (-not $native) {throw 'Native tray implementation missing'}
-    Add-Type -TypeDefinition $native
+    # Use this fixture's known child PID; never bypass the installed guard.
     [AtlasTrayAcceptance]::ActivateFixtureWindow([uint32]$process.Id)
     $foregroundDeadline=[DateTime]::UtcNow.AddSeconds(2)
     while(-not [AtlasTrayAcceptance]::HasForegroundOwner([uint32]$process.Id) -and [DateTime]::UtcNow -lt $foregroundDeadline){Start-Sleep -Milliseconds 25}
