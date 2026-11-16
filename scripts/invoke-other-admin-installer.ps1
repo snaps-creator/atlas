@@ -1,4 +1,4 @@
-param([string]$Installer,[string]$InstallRoot,[string]$OutputDirectory,[switch]$Worker,[string]$Ticket)
+param([string]$Installer,[string]$InstallRoot,[string]$OutputDirectory,[switch]$UseRegisteredLocation,[switch]$Worker,[string]$Ticket)
 $ErrorActionPreference='Stop'
 if ($Worker) {
     $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
@@ -19,7 +19,9 @@ if ($Worker) {
     }
     $directory=Split-Path $Ticket -Parent
     try {
-        $process=Start-Process -FilePath $config.installer -ArgumentList @('/S','/UPDATE',('/D='+$config.installRoot)) -WindowStyle Hidden -PassThru
+        $arguments=@('/S','/UPDATE')
+        if (-not $config.useRegisteredLocation) { $arguments+=('/D='+$config.installRoot) }
+        $process=Start-Process -FilePath $config.installer -ArgumentList $arguments -WindowStyle Hidden -PassThru
         $handle=$process.Handle
         if (-not $process.WaitForExit(180000)) { throw 'Alternate administrator installer exceeded three minutes' }
         $process.WaitForExit()
@@ -38,7 +40,7 @@ $directory=Join-Path $OutputDirectory ('credential-install-'+[guid]::NewGuid().T
 New-Item -ItemType Directory -Path $directory | Out-Null
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 $ticketPath=Join-Path $directory 'ticket.json'
-[ordered]@{installer=(Resolve-Path -LiteralPath $Installer).Path;installRoot=$InstallRoot;desktopSid=$identity.User.Value;session=(Get-Process -Id $PID).SessionId} |
+[ordered]@{installer=(Resolve-Path -LiteralPath $Installer).Path;installRoot=$InstallRoot;useRegisteredLocation=[bool]$UseRegisteredLocation;desktopSid=$identity.User.Value;session=(Get-Process -Id $PID).SessionId} |
     ConvertTo-Json | Set-Content -LiteralPath $ticketPath -Encoding utf8
 $name='AtlasInst'+[guid]::NewGuid().ToString('N').Substring(0,10)
 $password=ConvertTo-SecureString ([guid]::NewGuid().ToString('N')+'!aA9') -AsPlainText -Force

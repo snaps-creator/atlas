@@ -4,8 +4,8 @@ Unicode true
 Name "Atlas"
 OutFile "@OUTPUT@"
 RequestExecutionLevel admin
-InstallDir "$PROGRAMFILES64\Atlas"
-InstallDirRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas" "InstallLocation"
+# Empty until .onInit so an explicit /D remains distinguishable and wins.
+InstallDir ""
 SetCompressor /SOLID lzma
 VIProductVersion "@VERSION@.0"
 VIAddVersionKey /LANG=1033 "ProductName" "Atlas"
@@ -25,6 +25,19 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "Atlas"
 Function .onInit
   SetRegView 64
   SetShellVarContext all
+  # InstallDirRegKey ignores SetRegView. Read the same 64-bit view we write.
+  # https://nsis.sourceforge.io/Reference/SetRegView
+  ${If} $INSTDIR == ""
+    ReadRegStr $INSTDIR HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas" "InstallLocation"
+    ${If} $INSTDIR == ""
+      SetRegView 32
+      ReadRegStr $INSTDIR HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas" "InstallLocation"
+      SetRegView 64
+    ${EndIf}
+    ${If} $INSTDIR == ""
+      StrCpy $INSTDIR "$PROGRAMFILES64\Atlas"
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 Function un.onInit
   SetRegView 64

@@ -5,6 +5,7 @@
 - Bind installation, update health checks and settings snapshots to the interactive desktop user when UAC uses another administrator's credentials.
 - Reduce elevated Explorer tokens before starting Atlas; retain Windows-session and privilege checks.
 - Wait for a bounded startup/service hand-off before update, repair or uninstall instead of falsely reporting an update already in progress.
+- Resolve the existing installation from the correct 64-bit registry view when updating without an explicit directory; retain explicit /D and legacy registry fallback.
 - Add a directly downloadable `Install Atlas.exe` in the repository root, backed by the existing signed transactional release verifier.
 - Exercise real 3.2.3 upgrades, reinstall and clean install with another administrator; preserve the original user's settings and credentials.
 - Align download documentation and version manifests with 3.3.1.

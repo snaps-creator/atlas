@@ -9,7 +9,7 @@ if (Get-NetAdapter -Name Atlas-TUN -ErrorAction SilentlyContinue) { throw 'Runne
 $repo = Split-Path $PSScriptRoot -Parent
 $candidate = (Resolve-Path -LiteralPath $Installer).Path
 $fixture = Join-Path $env:RUNNER_TEMP ('atlas-connected-upgrade-' + [guid]::NewGuid().ToString('N'))
-$installRoot = Join-Path $fixture 'installed'
+$installRoot = Join-Path $fixture $(if ($BaselineVersion -eq '3.2.3') { 'installed custom path' } else { 'installed' })
 New-Item -ItemType Directory -Path $fixture | Out-Null
 # WFP is a normal Windows prerequisite. Hosted CI images may stop BFE;
 # explicitly prepare it only on this guarded, disposable test machine.
@@ -122,11 +122,16 @@ function Recovery-Root {
 }
 function Install-Checked([string]$path) {
     $otherAdmin=$BaselineVersion -eq '3.2.3' -and $path -eq $candidate
+    $registered=(Get-ItemProperty -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Atlas' -Name InstallLocation -ErrorAction SilentlyContinue).InstallLocation
+    $useRegistered=$path -eq $candidate -and [bool]$registered
+    if ($useRegistered -and $registered -ne $installRoot) { throw 'Registered fixture location differs from the owned installation' }
     if ($otherAdmin) {
-        $result=& (Join-Path $PSScriptRoot 'invoke-other-admin-installer.ps1') -Installer $path -InstallRoot $installRoot -OutputDirectory $fixture
+        $result=& (Join-Path $PSScriptRoot 'invoke-other-admin-installer.ps1') -Installer $path -InstallRoot $installRoot -OutputDirectory $fixture -UseRegisteredLocation:$useRegistered
         $installerExit=$result.exitCode
     } else {
-        $process = Start-Process -FilePath $path -ArgumentList @('/S','/UPDATE',"/D=$installRoot") -WindowStyle Hidden -PassThru
+        $arguments=@('/S','/UPDATE')
+        if (-not $useRegistered) { $arguments+="/D=$installRoot" }
+        $process = Start-Process -FilePath $path -ArgumentList $arguments -WindowStyle Hidden -PassThru
         $handle=$process.Handle
         if (-not $process.WaitForExit(180000)) { throw 'Installer exceeded three minutes' }
         $process.WaitForExit()
@@ -181,6 +186,11 @@ function Install-Checked([string]$path) {
             Diagnose-RestrictedHelper (Join-Path $installRoot ('versions/' + $journal.candidate.id + '/AtlasMaintenance.exe'))
         }
         throw "Installer failed: $installerExit"
+    }
+    if ($useRegistered) {
+        $committed=Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+        if ($committed.stage -ne 'Committed') { throw 'Upgrade without /D did not commit in the registered directory' }
+        Write-Output 'PASS: installer reused its registered location without /D, matching in-app and manual update discovery.'
     }
     if ($otherAdmin) {
         $committed=Get-Content -LiteralPath (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
